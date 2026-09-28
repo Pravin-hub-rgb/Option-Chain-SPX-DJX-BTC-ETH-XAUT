@@ -1,0 +1,10 @@
+{
+    "refresh_interval_seconds": 0.1,
+    "poll_gap_seconds": 2,
+    "round_pause_seconds": 2,
+    "expiry_refresh_seconds": 60,
+    "spx_symbol": "SPX",
+    "djx_symbol": "DJX",
+    "default_symbol": "AAPL",
+    "data_source": "auto"
+}

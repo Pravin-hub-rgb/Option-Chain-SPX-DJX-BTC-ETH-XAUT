@@ -1,0 +1,39 @@
+KEY GENERATION - DISTRIBUTOR GUIDE
+==================================
+
+HOW TO USE (bas 2 step):
+
+  1. Double-click "KeyGen.exe"
+     -> a key (number) appears on screen
+  2. Click "Copy" -> paste it on WhatsApp -> send to everyone
+
+  That's it. Jo number screen pe dikh raha hai wahi bhejo.
+
+
+WHEN TO OPEN IT:
+
+  * New person joined -> open, copy, send (same number works everywhere)
+  * App shows "expired" -> open again, copy the number shown, send it
+  * Month changed -> program itself shows the new month's key.
+    You don't need to check any date - whatever is showing, send that.
+
+  The "Valid till" line tells when the current key stops working.
+
+  Har baar program khologe toh number apne aap badal jayega
+  (pichhle se alag) - SAB valid hain, jo dikh raha hai wahi bhejo.
+
+
+IMPORTANT - KEEP SAFE:
+
+  * KeyGen.exe is YOURS only. NEVER give it or copy it to end users.
+    (Jise ye file mil gayi, wo khud unlimited keys bana lega)
+  * Keep a backup (pen drive / cloud). Project handover ke baad ye file
+    dobara nahi milegi - kho diya toh agle month ki key koi bana nahi payega
+    aur sabke PC pe app band ho jayega.
+
+
+NOTES:
+
+  * SAME number works on every PC (alag-alag PC, ek hi key)
+  * SAME number works in BOTH tools - Delta (BTC/ETH/XAUT) and US (S&P)
+  * Number offline banta hai - internet ki zaroorat nahi

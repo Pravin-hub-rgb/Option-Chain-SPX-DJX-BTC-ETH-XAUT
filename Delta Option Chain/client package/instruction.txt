@@ -1,0 +1,62 @@
+====================================
+ HOW TO START - ONLY 2 STEPS
+====================================
+
+STEP 1:  Extract the zip file
+         (Right-click on zip -> Extract All)
+
+STEP 2:  Go inside the extracted folder
+         and double-click  OptionChain.exe
+
+THAT'S IT!
+
+  *  All 3 Excel files open automatically
+     (btc_chain.xlsx, eth_chain.xlsx, xaut_chain.xlsx)
+  *  Live data starts updating within seconds
+     (BTC, ETH, Gold/XAUT)
+  *  To stop: just close Excel
+
+
+====================================
+ COMMON QUESTIONS
+====================================
+
+Q: Excel files are ALREADY open. Can I still run OptionChain.exe?
+A: YES! Just double-click it. The tool connects to the
+   open sheets and starts updating them right away.
+
+Q: I closed Excel. How do I start again?
+A: Simply double-click OptionChain.exe again.
+   (No need to restart laptop or install anything.)
+
+Q: "Windows protected your PC" message appears?
+A: Click  "More info"  ->  "Run anyway".
+   This is normal for new programs.
+
+Q: Data is not updating?
+A: Check your internet connection.
+   Then close Excel and run OptionChain.exe again.
+
+Q: Do I need to install Python or anything else?
+A: NO. Everything is packed inside OptionChain.exe.
+   Only Microsoft Excel must be installed on the laptop.
+
+Q: "SCREEN SHARE APP DETECTED" error appears?
+A: AnyDesk / TeamViewer / similar apps are running.
+   Close them fully (right-click tray icon -> Exit),
+   then run OptionChain.exe again.
+
+Q: "Product Key" popup appears?
+A: Every month needs a new key (first run too).
+   Key stays valid till the last Friday of the
+   month - ask the owner for the current key,
+   type it in, and the tool continues.
+
+
+====================================
+ QUICK TIPS
+------------------------------------
+ Change expiry dates : edit D3 / O3 / Z3  (e.g. 02/10/2026, or dropdown)
+ Change strike count : edit A2            (e.g. 20)
+ Yellow row = ATM | Green = ITM calls | Red = ITM puts
+====================================

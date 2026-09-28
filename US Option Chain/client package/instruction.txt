@@ -1,0 +1,110 @@
+====================================
+ HOW TO START
+====================================
+
+NO PYTHON NEEDED (recommended):
+
+  1. Extract us-option-chain.zip
+  2. Double-click OptionChain.exe
+  3. THREE Excel files open + live data:
+       spx_option_chain.xlsx
+       djx_option_chain.xlsx
+       us_stock_option_chain.xlsx
+
+Or run from source (needs Python):
+
+STEP 1: Install requirements (once)
+
+    pip install -r requirements.txt
+
+STEP 2: Run
+
+    python main.py
+
+All Excel files open automatically
+and start updating.
+
+------------------------------------
+  PRODUCT KEY (monthly)
+------------------------------------
+  First run asks for product key
+  (not pre-activated).
+
+  Popup appears on first run and
+  after the month's last Friday.
+
+  Wrong key -> "try again", dialog
+  reopens. Cancel -> app closes.
+
+  Get the current key from owner.
+
+------------------------------------
+ CHANGE SYMBOL
+------------------------------------
+ STOCK FILE (us_stock_option_chain):
+   Yellow K1 -> type ticker
+   Default: AAPL
+   Label J1: "Symbol (change):"
+   e.g. AAPL, QQQ, MSFT, TSLA
+   3 blocks switch to that symbol
+
+SPX FILE (spx_option_chain):
+  K1 LOCKED to SPX (gray).
+  Label J1: "Symbol (locked):"
+  Edits reset back to SPX.
+
+DJX FILE (djx_option_chain):
+  K1 LOCKED to DJX (gray).
+  Label J1: "Symbol (locked):"
+  Edits reset back to DJX.
+
+------------------------------------
+ CHANGE EXPIRY
+------------------------------------
+  Yellow D3 / O3 / Z3 -> dropdown of
+  ALL upcoming US expiries, or type
+  DD/MM/YYYY (e.g. 25/09/2026)
+  Labels: C3 "(edit D3)" etc.
+  default = next 3; blank auto-fills
+  format = text so no ##### shown
+
+------------------------------------
+ STRIKE COUNT
+------------------------------------
+  Yellow A2 = 10  ->  10 above ATM + 10 below (21 rows)
+  Yellow A2 = 20  ->  20 above + 20 below (41 rows)
+  Yellow A2 empty ->  all (max 100 around ATM)
+  Yellow A2 > 100 ->  capped to 100
+  Label B2: "± strikes — edit A2"
+  Extra old rows auto-clear when you lower A2
+
+  YELLOW cells = editable:
+    A2 = strike count
+    D3 / O3 / Z3 = expiry dates
+    K1 = symbol (STOCK file only)
+
+  Hints:
+    J1 Symbol (change):  -> edit K1 (stock file)
+    J1 Symbol (locked):  -> SPX / DJX files (K1 fixed)
+    B2 ± strikes — edit A2
+    C3 (edit D3) | N3 (edit O3) | Y3 (edit Z3)
+
+  Expiry format TEXT: DD/MM/YYYY
+  e.g. type 25/09/2026 (or use dropdown)
+
+------------------------------------
+  COLORS
+------------------------------------
+  Yellow row = ATM (bold)
+  Green = ITM calls | Red = ITM puts
+  Blue header row | yellow = inputs
+  Money shown in $ only (USD)
+
+------------------------------------
+ STOP
+------------------------------------
+   Close Excel or press Ctrl+C in terminal
+  (EXE: close Excel or end OptionChain
+   process from Task Manager)
+
+====================================

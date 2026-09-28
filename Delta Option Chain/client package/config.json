@@ -1,0 +1,7 @@
+{
+    "refresh_interval_seconds": 0.1,
+    "oi_poll_seconds": 2,
+    "expiry_refresh_seconds": 15,
+    "spot_poll_seconds": 0.35,
+    "http_timeout_seconds": 15
+}

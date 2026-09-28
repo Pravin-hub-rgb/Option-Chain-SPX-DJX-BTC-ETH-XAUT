@@ -1,0 +1,26 @@
+# build artifacts — regenerate from source
+*.build/
+*.dist/
+*.onefile-build/
+build/
+dist/
+__pycache__/
+*.pyc
+*.spec.bak
+
+# activation state — NEVER commit (personal license)
+license.json
+kg.dat
+dxc_kg.dat
+
+# Excel lock files
+~$*.xlsx
+
+# big delivery binaries — they are rebuildable from source
+# (keeps repo small; KeyGen.exe is the exception, it IS committed)
+Delta Option Chain/client package/OptionChain.exe
+US Option Chain/client package/OptionChain.exe
+US Option Chain/source/dist/
+US Option Chain/source/build/
+DELIVERY/
+*.zip
