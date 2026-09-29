@@ -166,6 +166,57 @@ def is_index_symbol(sym):
     return clean_symbol(sym) in INDEX_SYMBOLS
 
 
+def base_root(sym):
+    """DJXW -> DJX, SPXW -> SPX. Standard (non-weekly) root of an index family.
+
+    CBOE index payloads interleave the standard chain (DJX/SPX, the "mega")
+    with the weekly chain (DJXW/SPXW, the "mini") on the same strikes. Users
+    want the standard contract, so every comparison is made against this root.
+    """
+    s = clean_symbol(sym)
+    return s[:-1] if (len(s) > 2 and s.endswith("W") and s[:-1] in INDEX_SYMBOLS) else s
+
+
+# Expiry -> set of roots seen for it in the latest payload, so the expiry
+# picker can tell a standard expiry (has the base root) from a weekly-only one.
+expiry_roots = {}
+
+
+def _note_expiry_roots(sym, rows):
+    """Record which roots exist per expiry for this symbol family."""
+    base = base_root(sym)
+    seen = expiry_roots.setdefault(base, {})
+    live = set()
+    for r in rows:
+        exp = r.get("expiry")
+        root = r.get("root") or base
+        if not exp:
+            continue
+        live.add(exp)
+        roots = seen.setdefault(exp, set())
+        roots.add(root)
+    # drop expiries no longer in the payload (e.g. after a source switch)
+    for exp in list(seen):
+        if exp not in live:
+            del seen[exp]
+
+
+def standard_expiries(sym, all_expiries):
+    """Of the available expiries, prefer ones that carry the standard root.
+
+    An index like DJX lists weekly chains (DJXW only) every few days plus
+    monthly/quarterly DJX. Sorting purely by date makes the default slots show
+    the mini weekly chain, which is what users reported seeing. Rank
+    standard-contract expiries first, then by date, so the top slots are the
+    real DJX/SPX contracts. Weekly expiries remain selectable.
+    """
+    base = base_root(sym)
+    roots = expiry_roots.get(base) or {}
+    std = [d for d in all_expiries if base in (roots.get(d) or ())]
+    weekly = [d for d in all_expiries if d not in set(std)]
+    return std + weekly
+
+
 def cboe_symbol(sym):
     """CBOE CDN path: indices use underscore prefix (_SPX, _DJX)."""
     s = clean_symbol(sym)
@@ -950,6 +1001,7 @@ def _fetch_cboe(sym):
         elif new_score > prev_score:
             by_key[k] = r
     rows = list(by_key.values())
+    _note_expiry_roots(sym, rows)
     spot = _fresher_spot(sym, safe_float(data.get("current_price")) or None)
     return spot, rows, sorted(expiries), "cboe"
 
@@ -997,7 +1049,10 @@ def _fetch_bigclawd(sym):
                     "iv": safe_float(o.get("implied_volatility")),
                     "delta": safe_float(g.get("delta")),
                     "expiry": expiry,
+                    "root": root,
                 })
+
+    _note_expiry_roots(sym, rows)
 
     spot = None
     try:
@@ -1064,7 +1119,7 @@ async def load_symbol(sym):
 
     all_known_expiries[sym] = expiries
     if active_expiries[sym] == [None, None, None]:
-        dates = available_expiries(expiries)
+        dates = available_expiries(expiries, sym)
         active_expiries[sym] = (dates[:3] + [None, None, None])[:3]
 
     # full replace — drops stale foreign-root / expired keys after source switch
@@ -1077,13 +1132,21 @@ async def load_symbol(sym):
     return {"options": rows, "n": len(rows)}
 
 
-def available_expiries(all_expiries):
+def available_expiries(all_expiries, sym=None):
+    """Expiries to offer, standard (non-weekly) contracts first.
+
+    Date order alone makes the default slots land on the weekly mini chain for
+    indices, so ordering is re-ranked by whether the expiry actually carries
+    the base root (DJX/SPX). Weekly expiries stay selectable, just not first.
+    """
     now = datetime.now()
     today = now.strftime("%Y-%m-%d")
     dates = sorted(d for d in all_expiries if d >= today)
     if now.hour >= 16 and dates and dates[0] == today:
         dates = dates[1:]
-    return dates
+    if sym is None:
+        return dates
+    return standard_expiries(sym, dates)
 
 
 async def init_symbol(sym):
@@ -1118,7 +1181,7 @@ async def expiry_roller():
         for sym in active_symbols():
             try:
                 ensure_sym_state(sym)
-                dates = available_expiries(all_known_expiries[sym])
+                dates = available_expiries(all_known_expiries[sym], sym)
                 if not dates:
                     continue
                 pinned = [active_expiries[sym][i] for i in range(3) if user_pinned[sym][i]]
@@ -1202,14 +1265,30 @@ def build_option_chain(sym, expiry, range_val=50):
         start = max(0, end - range_val * 2 - 1)
     target = set(strikes[start:end])
 
+    want = base_root(sym)
+
     def _best_by_strike(rows):
+        """Pick one contract per strike: standard root first, then quote quality.
+
+        Same strike can exist as both DJX and DJXW (or SPX/SPXW). Quality alone
+        would sometimes pick the weekly because its book looks tighter, so root
+        match dominates and quality only orders rows of the same root.
+        """
         picked = {}
         for e in rows:
             s = e["strike"]
             if s not in target:
                 continue
             prev = picked.get(s)
-            if prev is None or _quote_quality(e["bid"], e["ask"], e["oi"], e["ltp"]) > _quote_quality(
+            if prev is None:
+                picked[s] = e
+                continue
+            is_std_e = 1 if e.get("root") == want else 0
+            is_std_p = 1 if prev.get("root") == want else 0
+            if is_std_e != is_std_p:
+                if is_std_e > is_std_p:
+                    picked[s] = e
+            elif _quote_quality(e["bid"], e["ask"], e["oi"], e["ltp"]) > _quote_quality(
                 prev["bid"], prev["ask"], prev["oi"], prev["ltp"]
             ):
                 picked[s] = e
@@ -1298,7 +1377,7 @@ def find_open_book(xw, fname):
 
 
 def update_expiry_dropdowns(sym, sheet):
-    dates = available_expiries(all_known_expiries[sym])
+    dates = available_expiries(all_known_expiries[sym], sym)
     if not dates:
         return
     options = [iso_to_user(d) for d in dates]
