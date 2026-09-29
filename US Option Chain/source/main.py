@@ -1259,10 +1259,21 @@ def build_option_chain(sym, expiry, range_val=50):
     strikes = sorted(set(e["strike"] for e in filtered))
     atm_strike = min(strikes, key=lambda s: abs(s - sp))
     atm_idx = strikes.index(atm_strike)
-    start = max(0, atm_idx - range_val)
-    end = min(len(strikes), start + range_val * 2 + 1)
-    if end - start < range_val * 2 + 1:
-        start = max(0, end - range_val * 2 - 1)
+    # Some index chains span a very wide strike range with a dense listing at
+    # the money (DJX: ~42 strikes from 325..625 around a ~513 spot). Rendering
+    # the whole span buries the liquid ATM region under far-OTM strikes whose OI
+    # is legitimately 0 on every public feed, so the user only sees zeros.
+    # Key off the span relative to spot, not the strike count: RUT lists 50
+    # strikes across only ~9% of spot and its OI is fine, DJX spans ~60%.
+    window = range_val
+    if is_index_symbol(sym) and sp > 0:
+        span_pct = (strikes[-1] - strikes[0]) / float(sp)
+        if span_pct > 0.30 and len(strikes) < window * 2 + 1:
+            window = max(5, min(15, (len(strikes) - 1) // 2))
+    start = max(0, atm_idx - window)
+    end = min(len(strikes), start + window * 2 + 1)
+    if end - start < window * 2 + 1:
+        start = max(0, end - window * 2 - 1)
     target = set(strikes[start:end])
 
     want = base_root(sym)
