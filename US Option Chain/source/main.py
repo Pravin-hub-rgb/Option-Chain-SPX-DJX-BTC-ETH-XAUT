@@ -923,6 +923,11 @@ def _fetch_cboe(sym):
         })
     # CBOE packs DJX+DJXW / SPX+SPXW on same strike — keep one per (expiry,type,strike)
     want_root = clean_symbol(sym)
+    # Standard (non-weekly) root always wins over the weekly one — DJX > DJXW,
+    # SPX > SPXW. Weekly chains are often illiquid yet can show a *tighter*
+    # stale book, so scoring by quote quality first would wrongly promote the
+    # mini contract. Root match is the dominant key; quality only breaks ties
+    # when the same root appears twice.
     by_key = {}
     for r in rows:
         k = (r["expiry"], r["type"], r["strike"])
@@ -938,7 +943,11 @@ def _fetch_cboe(sym):
             1 if r.get("root") == want_root else 0,
             *_quote_quality(r["bid"], r["ask"], r["oi"], r["ltp"]),
         )
-        if new_score > prev_score:
+        if new_score[:1] != prev_score[:1]:
+            # different root (standard vs weekly) -> standard wins outright
+            if new_score[0] > prev_score[0]:
+                by_key[k] = r
+        elif new_score > prev_score:
             by_key[k] = r
     rows = list(by_key.values())
     spot = _fresher_spot(sym, safe_float(data.get("current_price")) or None)
