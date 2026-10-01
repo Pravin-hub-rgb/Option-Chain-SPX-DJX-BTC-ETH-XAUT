@@ -17,6 +17,7 @@ import math
 import os
 import platform
 import re
+import shutil
 import time
 from datetime import date, datetime, timedelta
 
@@ -180,12 +181,15 @@ def base_root(sym):
 # Expiry -> set of roots seen for it in the latest payload, so the expiry
 # picker can tell a standard expiry (has the base root) from a weekly-only one.
 expiry_roots = {}
+# base root -> expiry -> count of contracts that actually report OI > 0
+oi_roots = {}
 
 
 def _note_expiry_roots(sym, rows):
-    """Record which roots exist per expiry for this symbol family."""
+    """Record which roots exist per expiry, and whether any real OI showed up."""
     base = base_root(sym)
     seen = expiry_roots.setdefault(base, {})
+    oi = oi_roots.setdefault(base, {})
     live = set()
     for r in rows:
         exp = r.get("expiry")
@@ -195,25 +199,36 @@ def _note_expiry_roots(sym, rows):
         live.add(exp)
         roots = seen.setdefault(exp, set())
         roots.add(root)
+        if safe_float(r.get("oi")) > 0:
+            oi[exp] = oi.get(exp, 0) + 1
     # drop expiries no longer in the payload (e.g. after a source switch)
     for exp in list(seen):
         if exp not in live:
             del seen[exp]
+            oi.pop(exp, None)
 
 
 def standard_expiries(sym, all_expiries):
-    """Of the available expiries, prefer ones that carry the standard root.
+    """Rank expiries: standard contract first, then ones that actually have OI.
 
     An index like DJX lists weekly chains (DJXW only) every few days plus
     monthly/quarterly DJX. Sorting purely by date makes the default slots show
-    the mini weekly chain, which is what users reported seeing. Rank
-    standard-contract expiries first, then by date, so the top slots are the
-    real DJX/SPX contracts. Weekly expiries remain selectable.
+    the mini weekly chain, which is what users reported seeing.
+
+    Within the standard group, prefer expiries carrying real open interest:
+    CBOE sometimes lists a standard root for a near expiry but publishes OI=0
+    for every strike, which leaves the default slot full of zeros. Those are
+    still selectable, just not in the first slots. Weekly expiries follow.
     """
     base = base_root(sym)
     roots = expiry_roots.get(base) or {}
     std = [d for d in all_expiries if base in (roots.get(d) or ())]
     weekly = [d for d in all_expiries if d not in set(std)]
+
+    def has_oi(exp):
+        return bool(oi_roots.get(base, {}).get(exp))
+
+    std.sort(key=lambda d: (0 if has_oi(d) else 1,))
     return std + weekly
 
 
@@ -687,6 +702,113 @@ def is_locked_role(role):
 _template_ready = set()
 
 
+def _unmerge_all(ws):
+    """Drop every merged range on the sheet.
+
+    The layout is a plain grid (three side-by-side blocks, headers on row 4),
+    so a merged range is never intentional -- it only turns up when the user
+    merges cells by hand while tidying the sheet. Leaving one in place makes
+    openpyxl hand back read-only MergedCell objects for everything inside it,
+    and writing to those killed the app at startup. Unmerging is always safe
+    because the labels we care about are rewritten right after.
+    """
+    if not ws.merged_cells.ranges:
+        return False
+    for rng in list(ws.merged_cells.ranges):
+        try:
+            ws.unmerge_cells(str(rng))
+        except Exception:
+            pass
+    return True
+
+
+def _safe_set(ws, row, col, val):
+    """Write to a cell, skipping read-only merged leftovers instead of crashing."""
+    try:
+        cell = ws.cell(row=row, column=col)
+        if type(cell).__name__ == "MergedCell":
+            return False
+        cell.value = val
+        return True
+    except (AttributeError, ValueError, TypeError):
+        return False
+
+
+def _write_template(ws, role):
+    """(Re)write every label the tool owns. Returns True if anything changed."""
+    changed = False
+    headers = ["Call LTP", "Call Bid", "Call Ask", "Call OI", "Strike",
+               "Put OI", "Put Bid", "Put Ask", "Put LTP"]
+    for block in BLOCK_COLS:
+        for i, h in enumerate(headers):
+            r, c = 4, block["start"] + i
+            cell = ws.cell(row=r, column=c)
+            if getattr(cell, "value", None) == h:
+                continue
+            if _safe_set(ws, r, c, h):
+                changed = True
+    j1 = "Symbol (locked):" if is_locked_role(role) else "Symbol (change):"
+    if _safe_set(ws, 1, 10, j1):
+        changed = True
+    if is_locked_role(role) or not normalize_symbol(ws.cell(row=1, column=11).value):
+        if _safe_set(ws, 1, 11, default_k1(role)):
+            changed = True
+    if _safe_set(ws, 2, 2, "± strikes — edit A2"):
+        changed = True
+    for col, label in ((1, "Expiry 1"), (3, "(edit D3)"), (12, "Expiry 2"),
+                       (14, "(edit O3)"), (23, "Expiry 3"), (25, "(edit Z3)")):
+        if _safe_set(ws, 3, col, label):
+            changed = True
+    for row in (2, 3):
+        cell = ws.cell(row=row, column=10)
+        if getattr(cell, "value", None) and _safe_set(ws, row, 10, None):
+            changed = True
+    return changed
+
+
+def _rebuild_fresh(path):
+    """Last resort: swap a broken template for a clean one.
+
+    The damaged file is kept as .bak so nothing the user did is silently
+    thrown away, then an empty sheet is created for the caller to fill in.
+    Read-only attribute is cleared first -- Excel's "read-only recommended" or
+    a file copied off a locked share would otherwise make the replace fail.
+    """
+    try:
+        if os.path.exists(path):
+            try:
+                os.chmod(path, 0o666)  # drop read-only flag
+            except Exception:
+                pass
+            try:
+                shutil.copy2(path, path + ".bak")
+            except Exception:
+                pass
+            try:
+                os.remove(path)
+            except Exception as e:
+                print(f"Could not replace {os.path.basename(path)}: {e}", flush=True)
+    except Exception:
+        pass
+    from openpyxl import Workbook, load_workbook
+    fresh = path
+    try:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Chain"
+        wb.save(path)
+        return load_workbook(path)
+    except Exception as e:
+        # folder itself is read-only -> write alongside with a fresh name
+        print(f"Cannot write {os.path.basename(path)}: {e} - using alternate name", flush=True)
+        fresh = path.replace(".xlsx", "_new.xlsx")
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Chain"
+        wb.save(fresh)
+        return load_workbook(fresh)
+
+
 def ensure_excel_file(role):
     path = excel_path(role)
     if role in _template_ready and os.path.exists(path):
@@ -700,41 +822,42 @@ def ensure_excel_file(role):
         wb.save(path)
         created = True
     from openpyxl import load_workbook
-    wb = load_workbook(path)
-    ws = wb.active
-    headers = ["Call LTP", "Call Bid", "Call Ask", "Call OI", "Strike",
-               "Put OI", "Put Bid", "Put Ask", "Put LTP"]
+    wb = None
+    try:
+        wb = load_workbook(path)
+        ws = wb.active
+    except Exception as e:
+        # unreadable / corrupt workbook (truncated zip, half-written on a crash)
+        print(f"Template unreadable ({role}: {e}) - rebuilding sheet", flush=True)
+        wb = _rebuild_fresh(path)
+        ws = wb.active
     need_save = created
-    for block in BLOCK_COLS:
-        for i, h in enumerate(headers):
-            cell = ws.cell(row=4, column=block["start"] + i)
-            if cell.value != h:
-                cell.value = h
-                need_save = True
-    j1 = "Symbol (locked):" if is_locked_role(role) else "Symbol (change):"
-    if ws.cell(row=1, column=10).value != j1:
-        ws.cell(row=1, column=10, value=j1)
+    try:
+        need_save = _unmerge_all(ws) or need_save
+        need_save = _write_template(ws, role) or need_save
+    except Exception as e:
+        # anything unexpected in a file the user edited -> start clean
+        print(f"Template repair failed ({role}: {e}) - rebuilding sheet", flush=True)
+        wb = _rebuild_fresh(path)
+        ws = wb.active
+        try:
+            _write_template(ws, role)
+        except Exception as e2:
+            print(f"Fresh template still failing ({role}: {e2})", flush=True)
         need_save = True
-    k1_default = default_k1(role)
-    if is_locked_role(role) or not normalize_symbol(ws.cell(row=1, column=11).value):
-        if ws.cell(row=1, column=11).value != k1_default:
-            ws.cell(row=1, column=11, value=k1_default)
-            need_save = True
-    if ws.cell(row=2, column=2).value != "± strikes — edit A2":
-        ws.cell(row=2, column=2, value="± strikes — edit A2")
-        need_save = True
-    for col, label in ((1, "Expiry 1"), (3, "(edit D3)"), (12, "Expiry 2"),
-                       (14, "(edit O3)"), (23, "Expiry 3"), (25, "(edit Z3)")):
-        if ws.cell(row=3, column=col).value != label:
-            ws.cell(row=3, column=col, value=label)
-            need_save = True
-    # clear old unneeded hints
-    for row in (2, 3):
-        if ws.cell(row=row, column=10).value:
-            ws.cell(row=row, column=10, value=None)
-            need_save = True
     if need_save:
-        wb.save(path)
+        try:
+            wb.save(path)
+        except Exception as e:
+            print(f"Template save failed ({role}: {e}) - rebuilding sheet", flush=True)
+            wb = _rebuild_fresh(path)
+            ws = wb.active
+            try:
+                _write_template(ws, role)
+                wb.save(path)
+            except Exception as e2:
+                # last chance: leave the rebuilt sheet on disk as-is
+                print(f"Could not save labels for {role}: {e2}", flush=True)
     _template_ready.add(role)
     return path
 
