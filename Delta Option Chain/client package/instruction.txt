@@ -1,4 +1,4 @@
-====================================
+﻿====================================
  HOW TO START - ONLY 2 STEPS
 ====================================
 
@@ -40,11 +40,6 @@ A: Check your internet connection.
 Q: Do I need to install Python or anything else?
 A: NO. Everything is packed inside OptionChain.exe.
    Only Microsoft Excel must be installed on the laptop.
-
-Q: "SCREEN SHARE APP DETECTED" error appears?
-A: AnyDesk / TeamViewer / similar apps are running.
-   Close them fully (right-click tray icon -> Exit),
-   then run OptionChain.exe again.
 
 Q: "Product Key" popup appears?
 A: Every month needs a new key (first run too).

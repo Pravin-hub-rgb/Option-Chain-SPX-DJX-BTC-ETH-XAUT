@@ -127,31 +127,6 @@ def _key_check(token, variant):
     h = hashlib.sha256(f"{token}|{variant}|".encode() + _LICENSE_SECRET).hexdigest()
     return int(h[:4], 16) % 100
 
-# Remote access / screen share apps -> tool shows error and closes
-BANNED_REMOTE_TOOLS = {
-    "anydesk.exe",
-    "teamviewer.exe",
-    "teamviewer_service.exe",
-    "teamviewer_host.exe",
-    "ultraviewer.exe",
-    "rustdesk.exe",
-    "ammyyadmin.exe",
-    "ammyy_admin.exe",
-    "vncserver.exe",
-    "winvnc.exe",
-    "ultravnc.exe",
-    "tvnviewer.exe",
-    "tvnserver.exe",
-    "logmein.exe",
-    "screenconnect.clientservice.exe",
-    "remotedesktop.exe",
-    "parsec.exe",
-    "supremo.exe",
-}
-
-# set by remote_guard the moment a screen-share app is detected:
-# stops all Excel writes so no errors/popups fire while the guard is active
-_guard_firing = False
 
 _pending_date_loads = []
 _date_req_sig = {}
@@ -229,34 +204,6 @@ def show_info(msg):
         ctypes.windll.user32.MessageBoxW(0, msg, "Option Chain Tool", 0x40)
     else:
         print(msg, flush=True)
-
-
-def show_error_min5(msg):
-    """Error popup that stays on screen for AT LEAST 5 seconds (readable),
-    even if something tries to dismiss it early. Click OK to continue."""
-    if platform.system() != "Windows":
-        print(msg, flush=True)
-        return
-    import ctypes
-    import threading
-    u = ctypes.windll.user32
-
-    def _show():
-        u.MessageBoxW(0, msg, "Option Chain Tool", 0x10)
-
-    t = threading.Thread(target=_show, daemon=True)
-    t.start()
-    hwnd = 0
-    for _ in range(30):  # wait up to 3s for the dialog to appear
-        time.sleep(0.1)
-        hwnd = u.FindWindowW(None, "Option Chain Tool")
-        if hwnd:
-            break
-    if hwnd:
-        u.EnableWindow(hwnd, 0)   # block mouse/keyboard for 5s
-        time.sleep(5)
-        u.EnableWindow(hwnd, 1)   # now user can click OK
-    t.join()
 
 
 def month_end(d_year, d_month):
@@ -451,106 +398,6 @@ def ensure_license():
             return True
         show_error("Invalid product key. Please try again.")
         # loop back -> dialog reopens for another attempt
-
-
-def remote_tool_running():
-    """Return list of banned remote-access / screen-share apps running now."""
-    if platform.system() != "Windows":
-        return []
-    import ctypes
-    from ctypes import wintypes
-
-    kernel32 = ctypes.windll.kernel32
-    TH32CS_SNAPPROCESS = 0x2
-
-    class PROCESSENTRY32(ctypes.Structure):
-        _fields_ = [
-            ("dwSize", wintypes.DWORD),
-            ("cntUsage", wintypes.DWORD),
-            ("th32ProcessID", wintypes.DWORD),
-            ("th32DefaultHeapID", ctypes.POINTER(wintypes.ULONG)),
-            ("th32ModuleID", wintypes.DWORD),
-            ("cntThreads", wintypes.DWORD),
-            ("th32ParentProcessID", wintypes.DWORD),
-            ("pcPriClassBase", ctypes.c_long),
-            ("dwFlags", wintypes.DWORD),
-            ("szExeFile", ctypes.c_char * 260),
-        ]
-
-    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-    if snap == -1 or snap is None:
-        return []
-    found = set()
-    try:
-        entry = PROCESSENTRY32()
-        entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
-        if kernel32.Process32First(snap, ctypes.byref(entry)):
-            while True:
-                name = entry.szExeFile.decode(errors="ignore").lower()
-                if name in BANNED_REMOTE_TOOLS:
-                    found.add(entry.szExeFile.decode(errors="ignore"))
-                if not kernel32.Process32Next(snap, ctypes.byref(entry)):
-                    break
-    finally:
-        kernel32.CloseHandle(snap)
-    return sorted(found)
-
-
-def remote_screen_msg(found):
-    apps = ", ".join(found[:3]) if found else "Remote access software"
-    return (
-        "SCREEN SHARE APP DETECTED!\n\n"
-        f"{apps} is running on this PC.\n\n"
-        "Close all remote access / screen share apps,\n"
-        "then run OptionChain.exe again."
-    )
-
-
-def close_excel_quiet():
-    """Close Excel immediately — data must vanish from screen at once."""
-    try:
-        import xlwings as xw
-        for app in list(xw.apps):
-            for wb in list(app.books):
-                try:
-                    wb.api.Close(False)
-                except Exception:
-                    try:
-                        wb.close()
-                    except Exception:
-                        pass
-            try:
-                app.quit()
-            except Exception:
-                pass
-    except Exception:
-        pass
-    # safety net — force-kill any Excel still alive (must not stay visible)
-    try:
-        import subprocess as _sp
-        out = _sp.run(["tasklist", "/FI", "IMAGENAME eq EXCEL.EXE"],
-                      capture_output=True, text=True, timeout=5).stdout
-        if "EXCEL.EXE" in out:
-            _sp.run(["taskkill", "/IM", "EXCEL.EXE", "/F"], capture_output=True, timeout=5)
-    except Exception:
-        pass
-
-
-async def remote_guard():
-    """Poll every 1 second; screen-share app found ->
-    close Excel FIRST (data off screen instantly), then error, then exit."""
-    global _guard_firing
-    while True:
-        await asyncio.sleep(1)
-        try:
-            found = await asyncio.to_thread(remote_tool_running)
-        except Exception:
-            continue
-        if found:
-            _guard_firing = True
-            await asyncio.to_thread(close_excel_quiet)
-            show_error_min5(remote_screen_msg(found))
-            os._exit(1)
 
 
 def open_excel_files():
@@ -1200,8 +1047,6 @@ def setup_expiry_dropdown(sheet, asset):
 
 
 def write_to_excel(asset):
-    if _guard_firing:
-        return
     try:
         import xlwings as xw
     except ImportError:
@@ -1455,7 +1300,6 @@ async def main_async():
         expiry_roller("XAUT"),
         date_loader(),
         display_loop(),
-        remote_guard(),
     )
 
 
@@ -1516,11 +1360,6 @@ def kill_previous_instances():
 
 def main():
     kill_previous_instances()
-    if platform.system() == "Windows":
-        found = remote_tool_running()
-        if found:
-            show_error_min5(remote_screen_msg(found))
-            sys.exit(1)
     if not ensure_license():
         os._exit(1)
     try:

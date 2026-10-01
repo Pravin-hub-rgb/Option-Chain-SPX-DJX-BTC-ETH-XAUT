@@ -1,4 +1,4 @@
-====================================
+﻿====================================
  DELTA OPTION CHAIN - HOW TO USE
 ====================================
 
@@ -60,15 +60,6 @@ Tool runs till the last Friday of
 the month. After that the popup
 asks for the new key.
 
-------------------------------------
- SCREEN SHARE PROTECTION
-------------------------------------
-If AnyDesk / TeamViewer / similar remote
-access apps are running on this PC, the
-tool shows an error and closes itself.
-
-Close those apps first, then run
-OptionChain.exe again.
 
 ------------------------------------
  TROUBLESHOOT
