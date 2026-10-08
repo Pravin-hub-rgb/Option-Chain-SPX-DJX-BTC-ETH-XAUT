@@ -37,7 +37,8 @@ Default: today, tomorrow, day-after-tomorrow
 ------------------------------------
 Edit cell A2:
 
-  A2 empty  ->  all available strikes
+  A2 empty  ->  shows "--" (nothing renders)
+  A2 = 50   ->  50 strikes (default, 25 above + 25 below ATM)
   A2 = 20   ->  20 strikes (10 above + 10 below ATM)
   A2 = 10   ->  10 strikes (5 above + 5 below)
 

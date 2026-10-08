@@ -39,7 +39,20 @@ import config
 BASE_DIR = config.base_dir()
 
 REST_BASE = "https://api.india.delta.exchange"
+
+# Two sockets on purpose.
+#
+# INDEX_WS_URL is the documented PUBLIC host (changelog 17.04.26 migrated
+# spot_price et al here). We use it for the header index price only — that feed
+# is identical in shape and pushes every ~0.25 s.
+#
+# WS_URL is the legacy host, kept for the option chain rows because the public
+# host has no `v2/ticker` channel: it was renamed to `ticker` there and uses a
+# compact array schema (d[].q / d[].oi / d[].g) that is not documented. Decoding
+# it is a separate job; until then the legacy channel keeps working for public
+# data. Legacy public channels are slated for removal 31 Jul 2026.
 WS_URL = "wss://socket.india.delta.exchange"
+INDEX_WS_URL = "wss://public-socket.india.delta.exchange"
 
 live_data = {"BTC": {}, "ETH": {}, "XAUT": {}}
 spot_cmp = {"BTC": None, "ETH": None, "XAUT": None}
@@ -499,19 +512,71 @@ def _get_json(url, params):
 
 
 def fetch_products(asset):
+    """Products for one underlying.
+
+    NOTE: the products endpoint filters on 'underlying_asset_symbols' (plural).
+    The singular 'underlying_asset_symbol' is silently ignored and returns every
+    asset's contracts, which previously leaked ETH/XAUT symbols into BTC's expiries.
+    """
     url = f"{REST_BASE}/v2/products"
-    params = {"contract_types": "call_options,put_options", "underlying_asset_symbol": asset}
-    return _get_json(url, params)["result"]
+    params = {"contract_types": "call_options,put_options", "underlying_asset_symbols": asset}
+    out = _get_json(url, params)["result"]
+    # Belt-and-braces: never trust the filter alone.
+    clean = []
+    for p in out:
+        ua = p.get("underlying_asset") or {}
+        sym = ua.get("symbol") if isinstance(ua, dict) else p.get("underlying_asset_symbol")
+        if sym in (None, asset):
+            clean.append(p)
+    return clean
 
 
 def fetch_tickers(asset, expiry_dmy):
+    """Fetch the option chain for ONE expiry.
+
+    Delta filters on 'expiry_date' and it must be DD-MM-YYYY (sending ISO gives
+    HTTP 400). Note there is also an 'expiry' param, but the API silently IGNORES
+    it and returns every expiry at once, so it must not be used here.
+    """
     url = f"{REST_BASE}/v2/tickers"
     params = {
         "contract_types": "call_options,put_options",
         "underlying_asset_symbols": asset,
         "expiry_date": expiry_dmy,
     }
-    return _get_json(url, params)["result"]
+    rows = _get_json(url, params)["result"]
+
+    # Guard: 'success' is NOT sufficient. If the filter is silently ignored the
+    # API still returns success plus every expiry for the asset. Verify the rows
+    # really belong to the requested expiry and underlying.
+    want_suffix = _dmy_to_suffix(expiry_dmy)
+    ok = []
+    for t in rows:
+        sym = str(t.get("symbol") or "")
+        if not sym:
+            continue
+        if f"-{asset}-" not in sym:
+            continue
+        if want_suffix and not sym.endswith(want_suffix):
+            continue
+        ok.append(t)
+    if rows and not ok:
+        print(
+            f"[{asset}] expiry filter returned {len(rows)} rows but NONE match "
+            f"{expiry_dmy} (suffix {want_suffix}); discarding",
+            flush=True,
+        )
+        return []
+    return ok
+
+
+def _dmy_to_suffix(dmy):
+    """'08-10-2026' -> '081026' (the symbol suffix Delta uses)."""
+    parts = str(dmy).split("-")
+    if len(parts) == 3 and all(p.isdigit() for p in parts):
+        dd, mm, yy = parts
+        return f"{dd}{mm}{yy[2:]}"
+    return ""
 
 
 def available_expiry_dates(asset, products):
@@ -537,12 +602,11 @@ def get_default_expiries(asset, products):
 def load_expiry_tickers(asset, expiry_iso):
     expiry_dmy = iso_to_dmy(expiry_iso)
     tickers = fetch_tickers(asset, expiry_dmy)
-    n = apply_tickers(asset, tickers, expiry_iso)
-    return n
+    return apply_tickers(asset, tickers, expiry_iso)
 
 
 def apply_tickers(asset, tickers, expiry_iso):
-    """Merge ticker rows into live_data; also record symbol->expiry so new strikes render."""
+    """Merge ticker rows into live_data; record symbol->expiry so new strikes render."""
     n = 0
     for t in tickers:
         symbol = t.get("symbol", "")
@@ -569,7 +633,12 @@ def apply_tickers(asset, tickers, expiry_iso):
             live_data[asset][symbol] = entry
         else:
             live_data[asset][symbol].update(entry)
-        symbol_expiry[asset][symbol] = expiry_iso
+        if expiry_iso:
+            symbol_expiry[asset][symbol] = expiry_iso
+            if expiry_iso not in expiry_symbols[asset]:
+                expiry_symbols[asset][expiry_iso] = []
+            if symbol not in expiry_symbols[asset][expiry_iso]:
+                expiry_symbols[asset][expiry_iso].append(symbol)
         n += 1
     return n
 
@@ -605,25 +674,83 @@ async def oi_poller(asset):
         await asyncio.sleep(OI_POLL_SECONDS)
 
 
+# Perp tickers, used ONLY as a fallback for the index price. On these the
+# 'close' field is the perpetual's own last trade (~30-45 USD from the index),
+# so the website's number must never be sourced from here when a live option
+# ticker is available.
 SPOT_TICKER_SYMBOLS = {"BTC": "BTCUSD", "ETH": "ETHUSD", "XAUT": "XAUTUSD"}
+
+# Dedicated index channel. Delta pushes the index here every ~0.25 s, versus
+# ~4.9 s when it only rides along inside v2/ticker option frames (it refreshes
+# only when an option prints). Symbols come from GET /v2/indices and are NOT
+# derivable from the ticker name — XAUT's is .DEXAUTUSD, not .DEXXAUTUSD.
+INDEX_SYMBOLS = {"BTC": ".DEXBTUSD", "ETH": ".DEETHUSD", "XAUT": ".DEXAUTUSD"}
+INDEX_CHANNEL = "spot_price"
+INDEX_ASSET = {v: k for k, v in INDEX_SYMBOLS.items()}
+
+# Freshness tracking. Deliberately keyed on WebSocket RECIEVE time and on
+# spot_price changes, NOT on per-option 'timestamp' — illiquid strikes can carry
+# an old server timestamp while the index is moving, which would read as false
+# staleness.
+last_ws_recv = {"BTC": 0.0, "ETH": 0.0, "XAUT": 0.0}
+last_spot_change = {"BTC": 0.0, "ETH": 0.0, "XAUT": 0.0}
+spot_source = {"BTC": None, "ETH": None, "XAUT": None}
+STALE_AFTER_S = 3.0
+
+
+def note_ws_recv(asset):
+    """Called for every WebSocket frame touching this asset."""
+    last_ws_recv[asset] = time.time()
+
+
+def set_spot(asset, raw, source):
+    """Record the index price and when it last actually moved."""
+    if raw in (None, ""):
+        return
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return
+    if spot_cmp.get(asset) != val:
+        last_spot_change[asset] = time.time()
+    spot_cmp[asset] = val
+    spot_source[asset] = source
+
+
+def spot_age(asset):
+    """Seconds since the last WebSocket frame / last actual index move."""
+    recv = last_ws_recv.get(asset) or 0.0
+    moved = last_spot_change.get(asset) or 0.0
+    ref = max(recv, moved) if (recv or moved) else 0.0
+    if not ref:
+        return float("inf")
+    return time.time() - ref
+
+
+def spot_is_stale(asset):
+    return spot_age(asset) > STALE_AFTER_S
 
 
 async def spot_poller():
-    """Tiny 1.3 KB ticker call per asset for a near-live spot (index) price."""
+    """Fallback index price. Primary source is the WebSocket option tickers
+    (see process_frame); this only fills the gap while WS is down."""
     assets = ["BTC", "ETH", "XAUT"]
     i = 0
     while True:
         asset = assets[i % len(assets)]
         i += 1
         try:
+            # Only consult the perp if the live index feeds have not produced a price.
+            if spot_source.get(asset) in ("ws", "index-public"):
+                await asyncio.sleep(SPOT_POLL_SECONDS)
+                continue
+
             def fetch(a=asset):
                 return _get_json(f"{REST_BASE}/v2/tickers/{SPOT_TICKER_SYMBOLS[a]}", None)
 
             data = await asyncio.to_thread(fetch)
             res = data.get("result") or {}
-            sp = res.get("spot_price") or res.get("close")
-            if sp:
-                spot_cmp[asset] = safe_float(sp)
+            set_spot(asset, res.get("spot_price"), "rest-perp")
         except Exception as e:
             print(f"Spot poller error ({asset}): {e}", flush=True)
         await asyncio.sleep(SPOT_POLL_SECONDS)
@@ -712,14 +839,16 @@ def current_ws_symbols():
 
 
 async def ws_listener():
-    # Rebuild + re-send subscription whenever expiries change or after reconnect.
+    # Option chain rows — legacy host, because v2/ticker only exists there.
     retry = 1
     while True:
         try:
             async with websockets.connect(WS_URL) as ws:
                 retry = 1
                 await ws.send(json.dumps(
-                    {"type": "subscribe", "payload": {"channels": [{"name": "v2/ticker", "symbols": current_ws_symbols()}]}}
+                    {"type": "subscribe", "payload": {"channels": [
+                        {"name": "v2/ticker", "symbols": current_ws_symbols()},
+                    ]}}
                 ))
                 while True:
                     try:
@@ -727,7 +856,10 @@ async def ws_listener():
                     except asyncio.TimeoutError:
                         # keep subscription fresh for rolled/pinned expiries
                         await ws.send(json.dumps(
-                            {"type": "subscribe", "payload": {"channels": [{"name": "v2/ticker", "symbols": current_ws_symbols()}]}}
+                            {"type": "subscribe", "payload": {"channels": [
+                                {"name": "v2/ticker",
+                                 "symbols": current_ws_symbols()},
+                            ]}}
                         ))
                         continue
                     data = json.loads(message)
@@ -736,6 +868,48 @@ async def ws_listener():
                         net_note(True)
         except Exception:
             net_note(False)
+            await asyncio.sleep(retry)
+            retry = min(retry * 2, 60)
+
+
+async def index_listener():
+    """Header index price from the documented PUBLIC socket.
+
+    The index feed is the one thing that has an official public home, and it
+    arrives far faster (~0.25 s) than the copy embedded in v2/ticker option
+    frames (~4.9 s). Frames here use compact keys: {"p","sy","ts","type"}.
+    """
+    retry = 1
+    while True:
+        try:
+            async with websockets.connect(INDEX_WS_URL) as ws:
+                retry = 1
+                payload = [{"name": INDEX_CHANNEL,
+                            "symbols": [INDEX_SYMBOLS[a] for a in ("BTC", "ETH", "XAUT")]}]
+                await ws.send(json.dumps(
+                    {"type": "subscribe", "payload": {"channels": payload}}
+                ))
+                while True:
+                    try:
+                        message = await asyncio.wait_for(ws.recv(), timeout=30)
+                    except asyncio.TimeoutError:
+                        continue
+                    try:
+                        data = json.loads(message)
+                    except ValueError:
+                        continue
+                    if data.get("type") != INDEX_CHANNEL:
+                        continue
+                    # public socket uses "sy"/"p"; legacy uses "symbol"/"price"
+                    sym = data.get("sy") or data.get("symbol")
+                    px = data.get("p") if data.get("p") is not None else data.get("price")
+                    asset = INDEX_ASSET.get(sym)
+                    if asset and px is not None:
+                        note_ws_recv(asset)
+                        set_spot(asset, px, "index-public")
+                        net_note(True)
+        except Exception as e:
+            print(f"Index listener error: {e}", flush=True)
             await asyncio.sleep(retry)
             retry = min(retry * 2, 60)
 
@@ -752,15 +926,19 @@ def process_frame(data):
         asset = "XAUT"
     else:
         return
+    note_ws_recv(asset)
     if symbol in ("BTCUSDT", "ETHUSDT", "XAUTUSD"):
-        spot_cmp[asset] = data.get("close")
+        # Perp/USDT feed. Not the website's index — used only as a fallback, and
+        # only when no option ticker has spoken yet.
+        if spot_source.get(asset) not in ("ws", "index-public"):
+            set_spot(asset, data.get("spot_price") or data.get("close"), "ws-perp")
         return
     ct = data.get("contract_type", "")
     if ct not in ("call_options", "put_options"):
         return
-    sp = data.get("spot_price")
-    if sp is not None:
-        spot_cmp[asset] = safe_float(sp)
+    # PRIMARY index source: the option ticker's spot_price. This is exactly what
+    # https://www.delta.exchange/app/options_chain/ displays in its header.
+    set_spot(asset, data.get("spot_price"), "ws")
     strike_str = data.get("strike_price")
     if strike_str is None:
         return
@@ -1272,8 +1450,7 @@ def init_asset(asset):
     active_expiries_dmy[asset] = [iso_to_dmy(e) for e in active_expiries[asset]]
 
     for expiry_iso in active_expiries[asset]:
-        tickers = fetch_tickers(asset, iso_to_dmy(expiry_iso))
-        apply_tickers(asset, tickers, expiry_iso)
+        load_expiry_tickers(asset, expiry_iso)
 
 
 async def main_async():
@@ -1291,6 +1468,7 @@ async def main_async():
         return
     await asyncio.gather(
         ws_listener(),
+        index_listener(),
         spot_poller(),
         oi_poller("BTC"),
         oi_poller("ETH"),

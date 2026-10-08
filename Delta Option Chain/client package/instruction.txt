@@ -10,11 +10,15 @@ STEP 2:  Go inside the extracted folder
 
 THAT'S IT!
 
-  *  All 3 Excel files open automatically
-     (btc_chain.xlsx, eth_chain.xlsx, xaut_chain.xlsx)
-  *  Live data starts updating within seconds
-     (BTC, ETH, Gold/XAUT)
-  *  To stop: just close Excel
+*  All 3 Excel files open automatically
+      (btc_chain.xlsx, eth_chain.xlsx, xaut_chain.xlsx)
+   *  Please WAIT 1-2 MINUTES before checking.
+      The tool activates, connects to the exchange and
+      loads all three markets before the first numbers
+      appear. This is normal, not a hang.
+   *  Once the BTC price in the top-left cell starts
+      changing, everything is working
+   *  To stop: just close Excel
 
 
 ====================================
@@ -34,8 +38,21 @@ A: Click  "More info"  ->  "Run anyway".
    This is normal for new programs.
 
 Q: Data is not updating?
-A: Check your internet connection.
-   Then close Excel and run OptionChain.exe again.
+A: Wait 1-2 minutes first - it needs time to connect.
+   Still blank after 2 minutes?
+   Check your internet connection, then close Excel
+   and run OptionChain.exe again.
+
+Q: The sheets opened but everything says "--"?
+A: The top-left cell shows the BTC price. Once THAT
+   number starts changing, the chain has loaded.
+   If it never changes, run OptionChain.exe again.
+
+Q: How often does the price change?
+A: The price refreshes several times per second, but
+   the exchange itself publishes a new index value
+   every few seconds. So the number updates in steps -
+   that is the exchange, not a fault.
 
 Q: Do I need to install Python or anything else?
 A: NO. Everything is packed inside OptionChain.exe.
