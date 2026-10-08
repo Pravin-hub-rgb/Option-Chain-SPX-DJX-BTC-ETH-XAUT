@@ -615,18 +615,25 @@ def apply_tickers(asset, tickers, expiry_iso):
         ct = t.get("contract_type", "")
         if ct not in ("call_options", "put_options"):
             continue
+        # A single malformed row must never abort the whole batch: this runs on
+        # the OI poll loop, so an unhandled exception here would silently kill
+        # updates for that asset for the rest of the session.
+        strike = safe_float(t.get("strike_price"))
+        if strike <= 0:
+            continue
         sp = t.get("spot_price")
         if sp is not None:
             spot_cmp[asset] = safe_float(sp)
         ltp = safe_float(t.get("close"))
         if ltp == 0.0:
             ltp = safe_float(t.get("mark_price"))
+        quotes = t.get("quotes") or {}
         entry = {
-            "strike": int(t.get("strike_price", 0)),
+            "strike": int(strike),
             "type": "call" if ct == "call_options" else "put",
             "ltp": ltp,
-            "bid": safe_float(t.get("quotes", {}).get("best_bid")),
-            "ask": safe_float(t.get("quotes", {}).get("best_ask")),
+            "bid": safe_float(quotes.get("best_bid")),
+            "ask": safe_float(quotes.get("best_ask")),
             "oi": safe_float(t.get("oi_value_usd")),
         }
         if symbol not in live_data[asset]:
@@ -939,17 +946,18 @@ def process_frame(data):
     # PRIMARY index source: the option ticker's spot_price. This is exactly what
     # https://www.delta.exchange/app/options_chain/ displays in its header.
     set_spot(asset, data.get("spot_price"), "ws")
-    strike_str = data.get("strike_price")
-    if strike_str is None:
+    strike = safe_float(data.get("strike_price"))
+    if strike <= 0:
         return
     ltp = safe_float(data.get("close"))
     if ltp == 0.0:
         ltp = safe_float(data.get("mark_price"))
-    bid = safe_float(data.get("quotes", {}).get("best_bid"))
-    ask = safe_float(data.get("quotes", {}).get("best_ask"))
+    quotes = data.get("quotes") or {}
+    bid = safe_float(quotes.get("best_bid"))
+    ask = safe_float(quotes.get("best_ask"))
     if symbol not in live_data[asset]:
         live_data[asset][symbol] = {
-            "strike": int(strike_str),
+            "strike": int(strike),
             "type": "call" if ct == "call_options" else "put",
             "ltp": ltp, "bid": bid, "ask": ask, "oi": 0.0,
         }
