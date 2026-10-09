@@ -1723,6 +1723,43 @@ def force_usd_block_formats(sheet, block, n_rows):
         log_excel_exception("EXCEL", e, "formatting option-chain cells")
 
 
+_workbook_missing_since = None
+_workbook_missing_notice_shown = False
+
+
+def notice_workbook_missing(fname):
+    """Tell the user once when Excel is open but our workbook is not.
+
+    Without this the tool simply waits, and since it runs without a console the
+    customer sees nothing at all and assumes it has stopped working.
+    """
+    global _workbook_missing_since, _workbook_missing_notice_shown
+    now = time.monotonic()
+    if _workbook_missing_since is None:
+        _workbook_missing_since = now
+    # Excel may still be opening the workbooks it was just asked to open, so
+    # give it a moment before telling the user anything is wrong.
+    if _workbook_missing_notice_shown or now - _workbook_missing_since < 20:
+        return
+    _workbook_missing_notice_shown = True
+    try:
+        show_error(
+            "Microsoft Excel is open, but this workbook is not:\n\n"
+            f"{os.path.basename(fname)}\n\n"
+            "Open it from:\n"
+            f"{os.path.dirname(fname)}\n\n"
+            "OptionChain will start writing as soon as it is open."
+        )
+    except Exception as e:
+        print(f"Could not show workbook-missing notice: {e}", flush=True)
+
+
+def clear_workbook_missing_notice():
+    global _workbook_missing_since, _workbook_missing_notice_shown
+    _workbook_missing_since = None
+    _workbook_missing_notice_shown = False
+
+
 def _write_to_excel(role):
     try:
         import xlwings as xw
@@ -1742,6 +1779,7 @@ def _write_to_excel(role):
             )
             record_excel_connection(role, status, f"expected_workbook={path}")
             if apps_count > 0:
+                notice_workbook_missing(fname if 'role' == 'asset' else path)
                 return
             if excel_connected[role]:
                 # Excel was connected and is now gone (closed by the customer,
@@ -1765,6 +1803,7 @@ def _write_to_excel(role):
                 os._exit(1)
             return
         excel_miss_counts[role] = 0
+        clear_workbook_missing_notice()
         excel_connected[role] = True
         try:
             excel_info = (
@@ -2110,11 +2149,130 @@ async def main_async():
     )
 
 
+def _process_image_path(kernel32, pid):
+    """Full path of a running process, or None if it cannot be read."""
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not h:
+        return None
+    try:
+        size = wintypes.DWORD(32768)
+        buf = ctypes.create_unicode_buffer(size.value)
+        if not kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+            return None
+        return buf.value
+    finally:
+        kernel32.CloseHandle(h)
+
+
+def _instance_guard_log(message):
+    try:
+        path = os.path.join(BASE_DIR, "instance_guard.log")
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+    except OSError:
+        pass
+
+
+def _process_image_path(kernel32, pid):
+    """Full path of a running process, or None if it cannot be read."""
+    import ctypes
+    from ctypes import wintypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not h:
+        return None
+    try:
+        size = wintypes.DWORD(32768)
+        buf = ctypes.create_unicode_buffer(size.value)
+        if not kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+            return None
+        return buf.value
+    finally:
+        kernel32.CloseHandle(h)
+
+
+def kill_previous_instances():
+    """Stop an older copy of *this* tool so a double-click takes over cleanly.
+
+    Both tools ship an executable called OptionChain.exe, so matching on the
+    process name alone would make one tool kill the other. Only processes
+    running from this tool's own folder are stopped.
+
+    Never let this break startup: any failure is logged and ignored.
+    """
+    if platform.system() != "Windows":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        TH32CS_SNAPPROCESS = 0x2
+        my_pid = os.getpid()
+        my_dir = os.path.normcase(os.path.abspath(BASE_DIR))
+
+        class PROCESSENTRY32(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.POINTER(wintypes.ULONG)),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", ctypes.c_char * 260),
+            ]
+
+        snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if snap == -1 or snap is None:
+            _instance_guard_log(f"snapshot failed; my_dir={my_dir}")
+            return
+        try:
+            entry = PROCESSENTRY32()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
+            matches = []
+            if kernel32.Process32First(snap, ctypes.byref(entry)):
+                while True:
+                    if entry.szExeFile.decode(errors="ignore").lower() == "optionchain.exe":
+                        matches.append(int(entry.th32ProcessID))
+                    if not kernel32.Process32Next(snap, ctypes.byref(entry)):
+                        break
+        finally:
+            kernel32.CloseHandle(snap)
+
+        others = [pid for pid in matches if pid != my_pid]
+        _instance_guard_log(
+            f"pid={my_pid} dir={my_dir} matched={matches} others={others}"
+        )
+
+        for pid in others:
+            path = _process_image_path(kernel32, pid)
+            if not path:
+                _instance_guard_log(f"  pid={pid} path unreadable, left alone")
+                continue
+            other_dir = os.path.normcase(os.path.dirname(os.path.abspath(path)))
+            if other_dir != my_dir:
+                # A different tool that happens to share the file name.
+                _instance_guard_log(f"  pid={pid} other tool at {other_dir}, left alone")
+                continue
+            h = kernel32.OpenProcess(0x0001, False, pid)
+            if h:
+                kernel32.TerminateProcess(h, 1)
+                kernel32.CloseHandle(h)
+                _instance_guard_log(f"  pid={pid} stopped, this launch takes over")
+    except Exception as e:  # never block startup on this
+        _instance_guard_log(f"guard error: {type(e).__name__}: {e}")
+
 def main():
     try:
         write_startup_diagnostics()
     except OSError as e:
         show_error(f"Could not write startup diagnostics:\n{e}")
+    kill_previous_instances()
     try:
         if not ensure_license():
             os._exit(1)
