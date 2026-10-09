@@ -1999,7 +1999,6 @@ async def display_loop():
     global _excel_gone_logged
     _excel_gone_logged = False
     while True:
-        await asyncio.sleep(REFRESH)
         render_started = time.perf_counter()
         # re-check license roughly every ~60s while running
         license_tick += 1
@@ -2051,6 +2050,18 @@ async def display_loop():
             for sym in active_symbols():
                 print_chain(sym)
             print(f"Symbols {','.join(active_symbols())} | poll {POLL_GAP}s | Ctrl+C stop", flush=True)
+
+        # Sleep AFTER the work, for at least as long as the work took.
+        #
+        # The customer builds their strategy in the same Excel instance, so if
+        # writing the chains leaves no idle gap, Excel is busy whenever they try
+        # to click a cell and the workbook feels stuck. Measured with a heavy
+        # 800-row formula workbook open, one pass took ~880ms; against a 1.0s
+        # refresh that is ~88% duty cycle. Backing off to an equal amount of
+        # idle time keeps the workbook usable and lets the refresh stretch
+        # automatically when their workbook is heavy, while a light workbook
+        # still updates at the configured interval.
+        await asyncio.sleep(max(float(REFRESH), time.perf_counter() - render_started))
 
 
 async def flush_performance_metrics():

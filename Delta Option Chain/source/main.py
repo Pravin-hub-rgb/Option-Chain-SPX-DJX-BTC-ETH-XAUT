@@ -1757,7 +1757,6 @@ async def display_loop():
     global _excel_gone_logged
     _excel_gone_logged = False
     while True:
-        await asyncio.sleep(refresh)
         render_started = time.perf_counter()
         # re-check license roughly every ~60s while running
         license_tick += 1
@@ -1813,6 +1812,13 @@ async def display_loop():
                     "ALL", "refresh_overrun", render_seconds - float(refresh)
                 )
             await flush_performance_metrics()
+
+        # Sleep AFTER the work, for at least as long as the work took, so a
+        # heavy workbook open alongside the chain always leaves Excel idle for
+        # an equal stretch and stays usable for building a strategy.
+        await asyncio.sleep(
+            max(float(refresh), time.perf_counter() - render_started)
+        )
 
 
 def init_asset(asset):
