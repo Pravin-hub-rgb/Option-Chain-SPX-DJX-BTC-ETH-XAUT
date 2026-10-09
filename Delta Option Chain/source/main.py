@@ -21,6 +21,13 @@ import threading
 import time
 from datetime import datetime, timezone, timedelta, date
 
+from startup_diagnostics import (
+    append_app_exception,
+    append_connection_event,
+    append_performance_summary,
+    write_startup_diagnostics,
+)
+
 _orig_getaddrinfo = socket.getaddrinfo
 
 def _ipv4_getaddrinfo(*args, **kwargs):
@@ -35,6 +42,7 @@ import requests
 import websockets
 
 import config
+from performance_metrics import PerformanceMetrics
 
 BASE_DIR = config.base_dir()
 
@@ -149,6 +157,11 @@ _block_hidden = {}
 available_dates = {"BTC": [], "ETH": [], "XAUT": []}
 _dropdown_sig = {}
 _usd_fmt_done = {}
+_performance_metrics = PerformanceMetrics()
+_last_performance_flush = time.monotonic()
+_performance_log_error_shown = False
+_excel_connection_status = {}
+_last_excel_exception = {}
 
 MONTHS = {"JAN":"01","FEB":"02","MAR":"03","APR":"04","MAY":"05","JUN":"06",
           "JUL":"07","AUG":"08","SEP":"09","OCT":"10","NOV":"11","DEC":"12"}
@@ -217,6 +230,30 @@ def show_info(msg):
         ctypes.windll.user32.MessageBoxW(0, msg, "Option Chain Tool", 0x40)
     else:
         print(msg, flush=True)
+
+
+def record_excel_connection(asset, status, detail=""):
+    if _excel_connection_status.get(asset) == status:
+        return
+    _excel_connection_status[asset] = status
+    try:
+        append_connection_event(asset, status, detail)
+    except OSError as e:
+        print(f"Could not log Excel connection state ({asset}): {e}", flush=True)
+
+
+def log_excel_exception(asset, exc, context="Excel/COM update"):
+    now = time.monotonic()
+    signature = (type(exc).__name__, str(exc))
+    key = (asset, context)
+    previous = _last_excel_exception.get(key)
+    if previous and previous[0] == signature and now - previous[1] < 60:
+        return
+    _last_excel_exception[key] = (signature, now)
+    try:
+        append_app_exception(f"{context} for {asset}", exc)
+    except OSError as log_error:
+        print(f"Could not log {context} traceback ({asset}): {log_error}", flush=True)
 
 
 def month_end(d_year, d_month):
@@ -419,6 +456,7 @@ def open_excel_files():
     for asset in ("BTC", "ETH", "XAUT"):
         path = os.path.join(BASE_DIR, f"{asset.lower()}_chain.xlsx")
         if not os.path.exists(path):
+            record_excel_connection(asset, "workbook_file_missing", f"path={path}")
             show_error(f"File not found:\n{path}\n\nKeep this file next to OptionChain.exe and run again.")
             continue
         try:
@@ -429,6 +467,10 @@ def open_excel_files():
             os.startfile(path)
         except OSError as e:
             show_error(f"Could not open {asset.lower()}_chain.xlsx:\n{e}")
+            try:
+                append_app_exception(f"opening {asset} workbook", e)
+            except OSError as log_error:
+                print(f"Could not log workbook open failure ({asset}): {log_error}", flush=True)
 
 
 def iso_to_dmy(iso):
@@ -1095,8 +1137,8 @@ def _set_date_cell(rng, text):
     """Write date as TEXT so Excel cannot coerce it back to a serial number."""
     try:
         rng.api.NumberFormat = "@"
-    except Exception:
-        pass
+    except Exception as e:
+        log_excel_exception("EXCEL", e, "expiry date number format")
     rng.value = text
 
 
@@ -1134,26 +1176,31 @@ excel_first_attempt = {"BTC": None, "ETH": None, "XAUT": None}
 def excel_apps_count(xw):
     try:
         return len(list(xw.apps))
-    except Exception:
+    except Exception as e:
+        log_excel_exception("EXCEL", e, "enumerating Excel applications")
         return -1
 
 
 def find_open_book(xw, fname):
     target = os.path.abspath(fname).lower()
+    asset = os.path.basename(fname).split("_chain", 1)[0].upper()
     try:
         apps = list(xw.apps)
-    except Exception:
+    except Exception as e:
+        log_excel_exception(asset, e, "enumerating Excel applications")
         return None
     for app in apps:
         try:
             books = list(app.books)
-        except Exception:
+        except Exception as e:
+            log_excel_exception(asset, e, "enumerating open Excel workbooks")
             continue
         for book in books:
             try:
                 if os.path.abspath(book.fullname).lower() == target:
                     return book
-            except Exception:
+            except Exception as e:
+                log_excel_exception(asset, e, "reading open workbook path")
                 continue
     return None
 
@@ -1175,19 +1222,19 @@ def force_usd_block_formats(sheet, block, asset, bi, n_rows):
         col = get_column_letter(c0 + off)
         try:
             sheet.range(f"{col}5:{col}{end}").api.NumberFormat = "0.00"
-        except Exception:
-            pass
+        except Exception as e:
+            log_excel_exception(asset, e, f"formatting {col} price range")
     try:
         sheet.range(f"{get_column_letter(c0 + 4)}5:{get_column_letter(c0 + 4)}{end}").api.NumberFormat = "0.0#"
-    except Exception:
-        pass
+    except Exception as e:
+        log_excel_exception(asset, e, "formatting strike range")
     for off in (3, 5):
         col = get_column_letter(c0 + off)
         rng = sheet.range(f"{col}5:{col}{end}")
         try:
             rng.api.NumberFormat = "@"
-        except Exception:
-            pass
+        except Exception as e:
+            log_excel_exception(asset, e, f"formatting {col} open-interest range")
         # rewrite numeric/₹ leftovers as $ text (format now text — no new conversions)
         for r in range(5, end + 1):
             cell = sheet.range((r, c0 + off))
@@ -1213,26 +1260,29 @@ def setup_expiry_dropdown(sheet, asset):
         sheet.range((1, 34)).api.EntireColumn.Hidden = True
     except Exception as e:
         print(f"Dropdown helper write ({asset}): {e}", flush=True)
+        log_excel_exception(asset, e, "writing expiry dropdown source")
         return
     formula = f"=$AH$1:$AH${len(dates)}"
     for cell in ["D3", "O3", "Z3"][:n_blocks(asset)]:
         rng = sheet.range(cell)
         try:
             rng.api.NumberFormat = "@"  # text — stops Excel date conversion
-        except Exception:
-            pass
+        except Exception as e:
+            log_excel_exception(asset, e, f"formatting expiry input {cell}")
         try:
             rng.api.Validation.Delete()
         except Exception:
+            # Excel raises when the cell has no existing validation.
             pass
         try:
             rng.api.Validation.Add(Type=3, Formula1=formula)
             rng.api.Validation.ShowError = False  # dropdown = hint, typing still allowed
         except Exception as e:
             print(f"Dropdown error ({asset} {cell}): {e}", flush=True)
+            log_excel_exception(asset, e, f"applying expiry dropdown to {cell}")
 
 
-def write_to_excel(asset):
+def _write_to_excel(asset):
     try:
         import xlwings as xw
     except ImportError:
@@ -1244,7 +1294,9 @@ def write_to_excel(asset):
         if book is not None:
             try:
                 _ = book.name  # COM liveness check
-            except Exception:
+            except Exception as e:
+                log_excel_exception(asset, e, "checking cached workbook connection")
+                record_excel_connection(asset, "cached_book_unresponsive", str(e))
                 book = None
                 _book_sheet_cache.pop(asset, None)
         if book is None:
@@ -1253,6 +1305,12 @@ def write_to_excel(asset):
                 _book_sheet_cache[asset] = book
         if book is None:
             apps_count = excel_apps_count(xw)
+            status = (
+                "excel_running_workbook_not_found"
+                if apps_count > 0
+                else "excel_not_found"
+            )
+            record_excel_connection(asset, status, f"expected_workbook={fname}")
             if apps_count > 0:
                 return
             if excel_connected[asset]:
@@ -1271,6 +1329,7 @@ def write_to_excel(asset):
             return
         excel_miss_counts[asset] = 0
         excel_connected[asset] = True
+        record_excel_connection(asset, "connected", f"workbook={fname}")
         sheet = book.sheets[0]
 
         v = sheet.range("A2").value
@@ -1288,8 +1347,8 @@ def write_to_excel(asset):
                 b2.value = "Total strikes — edit A2"
                 b2.font.bold = True
                 b2.font.color = (89, 89, 89)
-        except Exception:
-            pass
+        except Exception as e:
+            log_excel_exception(asset, e, "updating worksheet instruction")
 
         update_user_dates(asset, book, sheet)
 
@@ -1316,9 +1375,9 @@ def write_to_excel(asset):
                         cs = get_column_letter(block["start"])
                         ce = get_column_letter(block["start"] + 8)
                         sheet.range(f"{cs}1:{ce}1000").clear()
-                        sheet.range(f"{cs}:{ce}").api.Hidden = True
-                    except Exception:
-                        pass
+                        sheet.range(f"{cs}:{ce}").api.EntireColumn.Hidden = True
+                    except Exception as e:
+                        log_excel_exception(asset, e, f"clearing unused block {bi + 1}")
                     _last_rows[(asset, bi)] = 0
                     _block_hidden[(asset, bi)] = True
                 continue
@@ -1326,9 +1385,9 @@ def write_to_excel(asset):
                 try:
                     cs = get_column_letter(block["start"])
                     ce = get_column_letter(block["start"] + 8)
-                    sheet.range(f"{cs}:{ce}").api.Hidden = False
-                except Exception:
-                    pass
+                    sheet.range(f"{cs}:{ce}").api.EntireColumn.Hidden = False
+                except Exception as e:
+                    log_excel_exception(asset, e, f"showing active block {bi + 1}")
                 _block_hidden[(asset, bi)] = False
             expiry = active_expiries[asset][bi] if bi < len(active_expiries[asset]) else None
             if not expiry:
@@ -1341,12 +1400,22 @@ def write_to_excel(asset):
                         cs = get_column_letter(block["start"])
                         ce = get_column_letter(block["start"] + 8)
                         sheet.range(f"{cs}5:{ce}1000").clear()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log_excel_exception(asset, e, f"clearing empty block {bi + 1}")
                     _last_rows[(asset, bi)] = 0
                 continue
 
-            chain, pcr = build_option_chain(asset, expiry, range_val)
+            build_started = time.perf_counter()
+            chain = None
+            try:
+                chain, pcr = build_option_chain(asset, expiry, range_val)
+            finally:
+                _performance_metrics.record(
+                    asset,
+                    "chain_build",
+                    time.perf_counter() - build_started,
+                    rows=len(chain) if chain is not None else 0,
+                )
             col_l = block["start"]
             cnt = len(chain) if chain is not None else 0
             sheet.range((1, col_l)).value = f"{asset} Spot: {sp:.2f} | {cnt} strikes"
@@ -1354,7 +1423,16 @@ def write_to_excel(asset):
             net_paint(sheet, asset, bi, col_l)
 
             if chain is not None and not chain.empty:
-                sheet.range((5, block["start"])).options(index=False, header=False).value = chain
+                write_started = time.perf_counter()
+                try:
+                    sheet.range((5, block["start"])).options(index=False, header=False).value = chain
+                finally:
+                    _performance_metrics.record(
+                        asset,
+                        "excel_range_write",
+                        time.perf_counter() - write_started,
+                        rows=cnt,
+                    )
 
                 strikes = chain["strike"].tolist()
                 n = len(strikes)
@@ -1365,35 +1443,49 @@ def write_to_excel(asset):
                         cs = get_column_letter(block["start"])
                         ce = get_column_letter(block["start"] + 8)
                         sheet.range(f"{cs}{5 + cnt}:{ce}{4 + prev_n}").clear()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log_excel_exception(asset, e, f"clearing stale rows in block {bi + 1}")
                 _last_rows[(asset, bi)] = cnt
 
-                # force USD-only formats (kills ₹ currency rendering)
-                force_usd_block_formats(sheet, block, asset, bi, cnt)
+                formatting_started = time.perf_counter()
+                try:
+                    # force USD-only formats (kills ₹ currency rendering)
+                    force_usd_block_formats(sheet, block, asset, bi, cnt)
 
-                # batched side colors: strikes sorted → <sp is prefix, >sp is suffix
-                k = bisect.bisect_left(strikes, sp)
-                if k > 0:
-                    sheet.range(f"{block['call_start']}5:{block['call_end']}{4 + k}").color = (198, 224, 180)
-                m = bisect.bisect_right(strikes, sp)
-                if m < n:
-                    sheet.range(f"{block['put_start']}{5 + m}:{block['put_end']}{4 + n}").color = (255, 200, 200)
+                    # batched side colors: strikes sorted → <sp is prefix, >sp is suffix
+                    k = bisect.bisect_left(strikes, sp)
+                    if k > 0:
+                        sheet.range(f"{block['call_start']}5:{block['call_end']}{4 + k}").color = (198, 224, 180)
+                    m = bisect.bisect_right(strikes, sp)
+                    if m < n:
+                        sheet.range(f"{block['put_start']}{5 + m}:{block['put_end']}{4 + n}").color = (255, 200, 200)
 
-                atm_strike = min(strikes, key=lambda s: abs(s - sp))
-                atm_row = strikes.index(atm_strike) + 5
-                atm_range = f"{block['atm']}{atm_row}:{block['put_end']}{atm_row}"
-                sheet.range(atm_range).color = (255, 255, 0)
+                    atm_strike = min(strikes, key=lambda s: abs(s - sp))
+                    atm_row = strikes.index(atm_strike) + 5
+                    atm_range = f"{block['atm']}{atm_row}:{block['put_end']}{atm_row}"
+                    sheet.range(atm_range).color = (255, 255, 0)
+                finally:
+                    _performance_metrics.record(
+                        asset,
+                        "excel_formatting",
+                        time.perf_counter() - formatting_started,
+                        rows=cnt,
+                    )
             else:
                 clear_start = get_column_letter(block["start"])
                 clear_end = get_column_letter(block["start"] + 8)
-                sheet.range(f"{clear_start}5:{clear_end}1000").clear()
+                try:
+                    sheet.range(f"{clear_start}5:{clear_end}1000").clear()
+                except Exception as e:
+                    log_excel_exception(asset, e, f"clearing empty chain block {bi + 1}")
                 _last_rows[(asset, bi)] = 0
 
         excel_fail_since[asset] = None
 
     except Exception as e:
         print(f"Excel error ({asset}): {e}", flush=True)
+        record_excel_connection(asset, "excel_com_error", f"{type(e).__name__}: {e}")
+        log_excel_exception(asset, e)
         now = time.time()
         if excel_fail_since[asset] is None:
             excel_fail_since[asset] = now
@@ -1406,12 +1498,44 @@ def write_to_excel(asset):
             os._exit(1)
 
 
+def write_to_excel(asset):
+    started = time.perf_counter()
+    try:
+        _write_to_excel(asset)
+    finally:
+        _performance_metrics.record(
+            asset, "excel_pass", time.perf_counter() - started
+        )
+
+
+async def flush_performance_metrics():
+    global _last_performance_flush, _performance_log_error_shown
+    now = time.monotonic()
+    if now - _last_performance_flush < 30:
+        return
+    lines = _performance_metrics.summary_lines(now)
+    try:
+        await asyncio.to_thread(append_performance_summary, lines)
+    except OSError as e:
+        if not _performance_log_error_shown:
+            show_error(
+                "Could not append performance diagnostics to startup_diag.log.\n\n"
+                "Please check that your user profile has free space and is writable.\n\n"
+                f"Details: {e}"
+            )
+            _performance_log_error_shown = True
+    else:
+        _performance_metrics.reset(now)
+        _last_performance_flush = now
+
+
 async def display_loop():
     refresh = cfg.get("refresh_interval_seconds", 0.1)
     is_linux = platform.system() != "Windows"
     license_tick = 0
     while True:
         await asyncio.sleep(refresh)
+        render_started = time.perf_counter()
         # re-check license roughly every ~60s while running
         license_tick += 1
         if license_tick >= max(1, int(60 / max(float(refresh), 0.05))):
@@ -1441,6 +1565,13 @@ async def display_loop():
         else:
             for asset in ("BTC", "ETH", "XAUT"):
                 write_to_excel(asset)
+            render_seconds = time.perf_counter() - render_started
+            _performance_metrics.record("ALL", "render_cycle", render_seconds)
+            if render_seconds > float(refresh):
+                _performance_metrics.record(
+                    "ALL", "refresh_overrun", render_seconds - float(refresh)
+                )
+            await flush_performance_metrics()
 
 
 def init_asset(asset):
@@ -1545,6 +1676,10 @@ def kill_previous_instances():
 
 
 def main():
+    try:
+        write_startup_diagnostics()
+    except OSError as e:
+        show_error(f"Could not write startup diagnostics:\n{e}")
     kill_previous_instances()
     if not ensure_license():
         os._exit(1)
