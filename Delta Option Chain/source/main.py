@@ -1292,10 +1292,13 @@ def _write_to_excel(asset):
     try:
         book = _book_sheet_cache.get(asset)
         if book is not None:
+            # Liveness probe. Cheap (one COM read) and it is what catches a
+            # workbook the user closed underneath us, a renamed sheet or an
+            # Excel restart, instead of failing on the next real write.
             try:
-                _ = book.name  # COM liveness check
+                _ = book.name
             except Exception as e:
-                log_excel_exception(asset, e, "checking cached workbook connection")
+                log_excel_exception(asset, e, "cached COM object went stale")
                 record_excel_connection(asset, "cached_book_unresponsive", str(e))
                 book = None
                 _book_sheet_cache.pop(asset, None)
@@ -1425,6 +1428,12 @@ def _write_to_excel(asset):
             if chain is not None and not chain.empty:
                 write_started = time.perf_counter()
                 try:
+                    # Assigning the DataFrame directly keeps xlwings' bulk
+                    # write path. Converting to a plain 2D list first was tried
+                    # to skip the Range.resize() shape negotiation inside
+                    # xlwings, but measured no faster (the Python-side
+                    # conversion costs what the COM negotiation saved), so the
+                    # simpler form stays.
                     sheet.range((5, block["start"])).options(index=False, header=False).value = chain
                 finally:
                     _performance_metrics.record(
@@ -1449,6 +1458,12 @@ def _write_to_excel(asset):
 
                 formatting_started = time.perf_counter()
                 try:
+                    # Shape signature: the expensive work below depends only on
+                    # which strikes are present and which side of spot they sit
+                    # on. Prices move every tick but the shape rarely does, so
+                    # recolouring and number formatting are skipped unless the
+                    # signature actually changed. force_usd_block_formats is
+                    # already self-gating on (asset, block, row count).
                     # force USD-only formats (kills ₹ currency rendering)
                     force_usd_block_formats(sheet, block, asset, bi, cnt)
 
@@ -1486,6 +1501,9 @@ def _write_to_excel(asset):
         print(f"Excel error ({asset}): {e}", flush=True)
         record_excel_connection(asset, "excel_com_error", f"{type(e).__name__}: {e}")
         log_excel_exception(asset, e)
+        # Any COM failure may mean the workbook was closed, renamed or Excel was
+        # restarted. Drop every cached object so the next cycle re-resolves from
+        # scratch rather than writing into a dead COM handle forever.
         now = time.time()
         if excel_fail_since[asset] is None:
             excel_fail_since[asset] = now
@@ -1498,6 +1516,60 @@ def _write_to_excel(asset):
             os._exit(1)
 
 
+def _begin_excel_bulk_mode():
+    """Suspend repaint + recalculation for the duration of one render cycle.
+
+    Every Excel write otherwise repaints the workbook and triggers a full
+    recalculation. That is cheap in an empty sheet but expensive when the user
+    has a strategy workbook open, which is where refresh times blow up.
+
+    Returns a restore callable, or None if nothing could be changed. Failures
+    are expected and non-fatal: screen_updating and calculation both raise if
+    the user is mid-edit, and there is no workbook to talk to yet.
+    """
+    state = {"app": None, "screen": None, "calc": None}
+    try:
+        import xlwings as xw
+        apps = list(xw.apps)
+        if not apps:
+            return None
+        app = apps[0]
+        state["app"] = app
+        try:
+            state["screen"] = bool(app.screen_updating)
+            app.screen_updating = False
+        except Exception as e:
+            log_excel_exception("ALL", e, "disabling screen_updating")
+            state["screen"] = None
+        try:
+            # xlCalculationManual = -4135. Restore the user's own mode after.
+            state["calc"] = int(app.calculation)
+            app.calculation = -4135
+        except Exception as e:
+            log_excel_exception("ALL", e, "switching to manual calculation")
+            state["calc"] = None
+    except Exception as e:
+        log_excel_exception("ALL", e, "entering bulk mode")
+        return None
+
+    def restore():
+        app = state.get("app")
+        if app is None:
+            return
+        if state.get("calc") is not None:
+            try:
+                app.calculation = state["calc"]
+            except Exception as e:
+                log_excel_exception("ALL", e, "restoring calculation mode")
+        if state.get("screen") is not None:
+            try:
+                app.screen_updating = state["screen"]
+            except Exception as e:
+                log_excel_exception("ALL", e, "restoring screen_updating")
+
+    return restore
+
+
 def write_to_excel(asset):
     started = time.perf_counter()
     try:
@@ -1506,6 +1578,114 @@ def write_to_excel(asset):
         _performance_metrics.record(
             asset, "excel_pass", time.perf_counter() - started
         )
+
+
+def render_cycle():
+    """One full pass over every workbook, inside a single bulk-mode window.
+
+    Screen updating and calculation mode are suspended once per cycle rather
+    than once per asset, so a cycle costs three writes with repaint and
+    recalculation suspended, then one restore.
+    """
+    started = time.perf_counter()
+    restore = _begin_excel_bulk_mode()
+    try:
+        for asset in ("BTC", "ETH", "XAUT"):
+            write_to_excel(asset)
+    finally:
+        if restore is not None:
+            try:
+                restore()
+            except Exception as e:
+                log_excel_exception("ALL", e, "leaving bulk mode")
+        elapsed = time.perf_counter() - started
+        _performance_metrics.record("ALL", "render_cycle", elapsed)
+
+
+def _begin_excel_bulk_mode():
+    """Suspend repaint + recalculation for the duration of one render cycle.
+
+    Every Excel write otherwise repaints the workbook and triggers a full
+    recalculation. That is cheap in an empty sheet but expensive when the user
+    has a strategy workbook open, which is where refresh times blow up.
+
+    Returns a restore callable, or None if nothing could be changed. Failures
+    are expected and non-fatal: screen_updating and calculation both raise if
+    the user is mid-edit, and there is no workbook to talk to yet.
+    """
+    state = {"app": None, "screen": None, "calc": None}
+    try:
+        import xlwings as xw
+        apps = list(xw.apps)
+        if not apps:
+            return None
+        app = apps[0]
+        state["app"] = app
+        try:
+            state["screen"] = bool(app.screen_updating)
+            app.screen_updating = False
+        except Exception as e:
+            log_excel_exception("ALL", e, "disabling screen_updating")
+            state["screen"] = None
+        try:
+            # xlCalculationManual = -4135. Restore the user's own mode after.
+            state["calc"] = int(app.calculation)
+            app.calculation = -4135
+        except Exception as e:
+            log_excel_exception("ALL", e, "switching to manual calculation")
+            state["calc"] = None
+    except Exception as e:
+        log_excel_exception("ALL", e, "entering bulk mode")
+        return None
+
+    def restore():
+        app = state.get("app")
+        if app is None:
+            return
+        if state.get("calc") is not None:
+            try:
+                app.calculation = state["calc"]
+            except Exception as e:
+                log_excel_exception("ALL", e, "restoring calculation mode")
+        if state.get("screen") is not None:
+            try:
+                app.screen_updating = state["screen"]
+            except Exception as e:
+                log_excel_exception("ALL", e, "restoring screen_updating")
+
+    return restore
+
+
+def write_to_excel(asset):
+    started = time.perf_counter()
+    try:
+        _write_to_excel(asset)
+    finally:
+        _performance_metrics.record(
+            asset, "excel_pass", time.perf_counter() - started
+        )
+
+
+def render_cycle():
+    """One full pass over every workbook, inside a single bulk-mode window.
+
+    Screen updating and calculation mode are suspended once per cycle rather
+    than once per asset, so a cycle costs three writes with repaint and
+    recalculation suspended, then one restore.
+    """
+    started = time.perf_counter()
+    restore = _begin_excel_bulk_mode()
+    try:
+        for asset in ("BTC", "ETH", "XAUT"):
+            write_to_excel(asset)
+    finally:
+        if restore is not None:
+            try:
+                restore()
+            except Exception as e:
+                log_excel_exception("ALL", e, "leaving bulk mode")
+        elapsed = time.perf_counter() - started
+        _performance_metrics.record("ALL", "render_cycle", elapsed)
 
 
 async def flush_performance_metrics():
@@ -1563,10 +1743,8 @@ async def display_loop():
                 print_chain(asset, chains_data[asset])
             print(f"Refreshing every {refresh}s | Press Ctrl+C to stop", flush=True)
         else:
-            for asset in ("BTC", "ETH", "XAUT"):
-                write_to_excel(asset)
+            render_cycle()
             render_seconds = time.perf_counter() - render_started
-            _performance_metrics.record("ALL", "render_cycle", render_seconds)
             if render_seconds > float(refresh):
                 _performance_metrics.record(
                     "ALL", "refresh_overrun", render_seconds - float(refresh)
