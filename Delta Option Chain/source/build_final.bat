@@ -16,8 +16,10 @@ copy /Y "*.xlsx" "dist\OptionChain\" >nul
 if errorlevel 1 exit /b 1
 copy /Y "config.json" "dist\OptionChain\" >nul
 if errorlevel 1 exit /b 1
-copy /Y "license.json" "dist\OptionChain\" >nul
-if errorlevel 1 exit /b 1
+REM license.json is deliberately NOT copied. It is the owner's activation file,
+REM not a client asset: shipping it would let anyone run the tool unlocked.
+REM On first run the app creates it itself once a valid product key is entered.
+if exist "dist\OptionChain\license.json" del /Q "dist\OptionChain\license.json"
 copy /Y "..\client package\README.txt" "dist\OptionChain\" >nul
 if errorlevel 1 exit /b 1
 copy /Y "..\client package\diagnose_excel_addins.ps1" "dist\OptionChain\" >nul
