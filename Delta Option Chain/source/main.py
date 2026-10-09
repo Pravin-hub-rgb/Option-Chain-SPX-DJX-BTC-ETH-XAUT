@@ -17,6 +17,7 @@ import sys
 import platform
 import re
 import socket
+import subprocess
 import threading
 import time
 from datetime import datetime, timezone, timedelta, date
@@ -1194,9 +1195,35 @@ def excel_apps_count(xw):
         return -1
 
 
+def excel_process_running():
+    """True if any EXCEL.EXE is alive, checked without touching COM.
+
+    When Excel crashes or is killed, the cached COM server is a dead reference.
+    The next `xw.apps` / `app.books` call then raises "RPC server is
+    unavailable" and takes the whole process down, after which nothing writes
+    at all. Checking the process table first lets us simply wait for the
+    customer to reopen Excel instead of dying silently.
+    """
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq EXCEL.EXE", "/NH"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception:
+        # Unknown -> assume it is alive so behaviour is unchanged.
+        return True
+    return "EXCEL.EXE" in (result.stdout or "").upper()
+
+
 def find_open_book(xw, fname):
     target = os.path.abspath(fname).lower()
     asset = os.path.basename(fname).split("_chain", 1)[0].upper()
+    if not excel_process_running():
+        # Do not touch COM at all while Excel is gone.
+        return None
     try:
         apps = list(xw.apps)
     except Exception as e:
@@ -1371,9 +1398,17 @@ def _write_to_excel(asset):
             if apps_count > 0:
                 return
             if excel_connected[asset]:
+                # Excel was connected and is now gone (closed by the customer,
+                # crashed, or restarting after an add-in prompt). Keep waiting
+                # for it to come back instead of quitting.
+                #
+                # This used to be `if excel_miss_counts[asset] >= 10:
+                # os._exit(0)`, which silently killed the EXE about 10 seconds
+                # after Excel went away. Nothing then rewrote the sheets even
+                # after the customer reopened Excel -- that was the reported
+                # "EXE writes nothing" behaviour. The miss counter is still
+                # tracked for diagnostics only.
                 excel_miss_counts[asset] += 1
-                if excel_miss_counts[asset] >= 10:
-                    os._exit(0)
                 return
             if excel_first_attempt[asset] is None:
                 excel_first_attempt[asset] = time.time()
@@ -1719,6 +1754,8 @@ async def display_loop():
     refresh = cfg.get("refresh_interval_seconds", 0.1)
     is_linux = platform.system() != "Windows"
     license_tick = 0
+    global _excel_gone_logged
+    _excel_gone_logged = False
     while True:
         await asyncio.sleep(refresh)
         render_started = time.perf_counter()
@@ -1749,7 +1786,27 @@ async def display_loop():
                 print_chain(asset, chains_data[asset])
             print(f"Refreshing every {refresh}s | Press Ctrl+C to stop", flush=True)
         else:
-            render_cycle()
+            # A dead/crashed Excel must never stop the chain. While Excel is
+            # gone we skip the COM pass and wait for it to be reopened, instead
+            # of letting the RPC failure propagate and kill the EXE.
+            excel_alive = excel_process_running()
+            if excel_alive:
+                if _excel_gone_logged:
+                    # Excel came back with freshly opened, empty workbooks, so
+                    # every cached "already written" claim is now wrong. Drop
+                    # them or the app would leave the sheets blank.
+                    _excel_gone_logged = False
+                    _block_payload.clear()
+                    _block_shape.clear()
+                    _usd_fmt_done.clear()
+                    _dropdown_sig.clear()
+                    _last_excel_exception.clear()
+                    print("Excel reopened - rewriting all sheets from scratch.", flush=True)
+                render_cycle()
+            elif not _excel_gone_logged:
+                _excel_gone_logged = True
+                print("Excel is not running - pausing writes until it is reopened.", flush=True)
+                _last_excel_exception.clear()
             render_seconds = time.perf_counter() - render_started
             if render_seconds > float(refresh):
                 _performance_metrics.record(

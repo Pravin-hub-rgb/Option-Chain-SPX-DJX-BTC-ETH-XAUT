@@ -18,6 +18,7 @@ import os
 import platform
 import re
 import shutil
+import subprocess
 import time
 from datetime import date, datetime, timedelta
 
@@ -1209,6 +1210,11 @@ async def expiry_roller():
                     changed.append((i, tgt))
                     print(f"[{sym}] slot {i + 1}: {cur or '--'} -> {tgt or '--'}", flush=True)
                 if changed:
+                    # Rolling an expiry swaps the strike ladder, so the cached
+                    # payload/shape must go or the new expiry's first write and
+                    # recolour would be skipped as "unchanged".
+                    _block_payload.clear()
+                    _block_shape.clear()
                     # write back to every open book currently showing this symbol
                     try:
                         import xlwings as xw
@@ -1246,6 +1252,11 @@ async def process_pending_dates():
                     continue
                 active_expiries[sym][i] = parsed
                 user_pinned[sym][i] = True
+                # A different expiry means a different strike ladder, so drop the
+                # cached payload/shape or the first write and the first recolour
+                # of the new expiry would be suppressed.
+                _block_payload.clear()
+                _block_shape.clear()
                 print(f"[{sym}] pinned block {i + 1} -> {parsed}", flush=True)
             except Exception as e:
                 print(f"Date pin error ({sym} {parsed}): {e}", flush=True)
@@ -1377,12 +1388,38 @@ def excel_apps_count(xw):
         return -1
 
 
+def excel_process_running():
+    """True if any EXCEL.EXE is alive, checked without touching COM.
+
+    If Excel has crashed or been killed, the cached COM server is a dead
+    reference and the next `xw.apps` / `app.books` call raises "RPC server is
+    unavailable" and can take the whole process down with it. Checking the
+    process table first means we simply stop writing and wait for the customer
+    to bring Excel back, instead of dying silently.
+    """
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq EXCEL.EXE", "/NH"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception:
+        # Unknown -> assume it is alive so behaviour is unchanged.
+        return True
+    return "EXCEL.EXE" in (result.stdout or "").upper()
+
+
 def find_open_book(xw, fname):
     target = os.path.abspath(fname).lower()
     role = next(
         (candidate for candidate, file_name in ROLE_FILES.items() if file_name.lower() in target),
         "unknown",
     )
+    if not excel_process_running():
+        # Do not touch COM at all while Excel is gone.
+        return None
     try:
         apps = list(xw.apps)
     except Exception as e:
@@ -1489,6 +1526,13 @@ def update_user_dates(sym, sheet):
 
 _sheet_fmt_done = set()
 _usd_fmt_done = set()
+# Per (role, block) payload signature. The block range write is the single most
+# expensive call in the render loop, and between ticks most rows are unchanged,
+# so an unchanged chain is skipped entirely rather than rewritten.
+_block_payload = {}
+# Per (role, block) shape signature, so ATM/ITM recolouring and number
+# formatting only run when the strike ladder actually changes.
+_block_shape = {}
 _performance_metrics = PerformanceMetrics()
 _last_performance_flush = time.monotonic()
 _performance_log_error_shown = False
@@ -1551,8 +1595,12 @@ def write_hint_labels(sheet, role="stock"):
 
 
 def format_sheet(sheet, role="stock"):
-    """Bold headers, widths, input highlights — heavy part once; hints every run."""
-    write_hint_labels(sheet, role)
+    """Bold headers, widths, input highlights ? heavy part once; hints every run."""
+    # NOTE: the hint labels used to be written here on every cycle, before the
+    # one-shot gate below. They are static text that depends only on whether the
+    # role is locked, so re-writing 10 cells plus font settings every tick cost
+    # ~107ms per sheet and dominated the render loop. They are written once in
+    # the gated block at the bottom instead.
 
     key = None
     try:
@@ -1696,9 +1744,16 @@ def _write_to_excel(role):
             if apps_count > 0:
                 return
             if excel_connected[role]:
+                # Excel was connected and is now gone (closed by the customer,
+                # crashed, or restarting after an add-in prompt). Keep waiting
+                # for it to come back instead of quitting.
+                #
+                # This used to be `if excel_miss_counts[role] >= 10:
+                # os._exit(0)`, which silently killed the EXE about 10 seconds
+                # after Excel went away, so nothing rewrote the sheets even
+                # after the customer reopened Excel. The miss counter is now
+                # tracked for diagnostics only.
                 excel_miss_counts[role] += 1
-                if excel_miss_counts[role] >= 10:
-                    os._exit(0)
                 return
             if excel_first_attempt[role] is None:
                 excel_first_attempt[role] = time.time()
@@ -1747,6 +1802,11 @@ def _write_to_excel(role):
             role_symbol[role] = new_sym
             _pending_date_loads.clear()
             _dropdown_sig.pop(new_sym, None)
+            # New symbol means different rows and a different ladder, so the
+            # payload and shape signatures from the old one must not suppress
+            # the first write or the first recolour.
+            _block_payload.clear()
+            _block_shape.clear()
             _refetch_now = True
             ensure_sym_state(new_sym)
             for cell in ("D3", "O3", "Z3"):
@@ -1834,7 +1894,15 @@ def _write_to_excel(role):
 
                 write_started = time.perf_counter()
                 try:
-                    sheet.range((5, block["start"])).options(index=False, header=False).value = chain
+                    # Only write when the contents actually differ. Any data
+                    # change alters the signature and forces the write, so live
+                    # updates still land; unchanged blocks cost nothing.
+                    payload_sig = hash(tuple(map(tuple, chain.values.tolist())))
+                    if payload_sig != _block_payload.get((role, bi)):
+                        _block_payload[(role, bi)] = payload_sig
+                        sheet.range((5, block["start"])).options(index=False, header=False).value = chain
+                    else:
+                        _performance_metrics.record(role, "excel_range_skipped", 0.0, rows=n_rows)
                 finally:
                     _performance_metrics.record(
                         role,
@@ -1853,18 +1921,26 @@ def _write_to_excel(role):
 
                 formatting_started = time.perf_counter()
                 try:
-                    force_usd_block_formats(sheet, block, n_rows)
-
-                    atm_strike = min(chain["strike"], key=lambda s: abs(s - sp))
-                    atm_row = chain[chain["strike"] == atm_strike].index[0] + 5
-
-                    atm_range = f"{block['atm']}{atm_row}:{block['put_end']}{atm_row}"
-                    sheet.range(atm_range).color = (255, 255, 0)
-                    sheet.range(atm_range).font.bold = True
-
+                    # ATM row and ITM ranges depend only on which strikes are
+                    # present, not on their prices. Skip when the ladder is
+                    # unchanged; force_usd_block_formats is already self-gating.
                     strikes = chain["strike"].tolist()
-                    for cell_range, color in itm_color_ranges(block, strikes, sp):
-                        sheet.range(cell_range).color = color
+                    shape = (n_rows, strikes[0] if strikes else 0,
+                             strikes[-1] if strikes else 0)
+                    if _block_shape.get((role, bi)) != shape:
+                        _block_shape[(role, bi)] = shape
+
+                        force_usd_block_formats(sheet, block, n_rows)
+
+                        atm_strike = min(strikes, key=lambda s: abs(s - sp))
+                        atm_row = strikes.index(atm_strike) + 5
+
+                        atm_range = f"{block['atm']}{atm_row}:{block['put_end']}{atm_row}"
+                        sheet.range(atm_range).color = (255, 255, 0)
+                        sheet.range(atm_range).font.bold = True
+
+                        for cell_range, color in itm_color_ranges(block, strikes, sp):
+                            sheet.range(cell_range).color = color
                 finally:
                     _performance_metrics.record(
                         role,
@@ -1920,6 +1996,8 @@ def print_chain(sym):
 async def display_loop():
     is_windows = platform.system() == "Windows"
     license_tick = 0
+    global _excel_gone_logged
+    _excel_gone_logged = False
     while True:
         await asyncio.sleep(REFRESH)
         render_started = time.perf_counter()
@@ -1932,8 +2010,35 @@ async def display_loop():
                 if not ensure_license():
                     os._exit(1)
         if is_windows:
+            # A dead/crashed Excel must never stop the chain. Each role is
+            # isolated, and while Excel is gone we skip the COM pass entirely
+            # and wait for the customer to reopen it. Previously the RPC failure
+            # propagated and killed the EXE, after which nothing wrote at all.
+            excel_alive = excel_process_running()
             for role in ROLE_ORDER:
-                write_to_excel(role)
+                if not excel_alive:
+                    break
+                try:
+                    write_to_excel(role)
+                except Exception as e:
+                    log_excel_exception(role, e, "render pass")
+            if not excel_alive and not _excel_gone_logged:
+                _excel_gone_logged = True
+                print("Excel is not running - pausing writes until it is reopened.", flush=True)
+                _last_excel_exception.clear()
+            elif excel_alive and _excel_gone_logged:
+                # Excel came back. Everything cached about the sheets is now
+                # wrong: the workbooks are freshly opened and their cells are
+                # empty, so the payload/shape/format caches must be dropped or
+                # the app would treat the blank sheets as "already written" and
+                # leave them blank.
+                _excel_gone_logged = False
+                _block_payload.clear()
+                _block_shape.clear()
+                _sheet_fmt_done.clear()
+                _usd_fmt_done.clear()
+                _dropdown_sig.clear()
+                print("Excel reopened - rewriting all sheets from scratch.", flush=True)
             render_seconds = time.perf_counter() - render_started
             _performance_metrics.record("ALL", "render_cycle", render_seconds)
             if render_seconds > REFRESH:

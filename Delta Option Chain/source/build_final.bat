@@ -24,6 +24,13 @@ copy /Y "..\client package\README.txt" "dist\OptionChain\" >nul
 if errorlevel 1 exit /b 1
 copy /Y "..\client package\diagnose_excel_addins.ps1" "dist\OptionChain\" >nul
 if errorlevel 1 exit /b 1
+copy /Y "..\client package\instruction.txt" "dist\OptionChain\" >nul
+if errorlevel 1 exit /b 1
+REM Refresh the client package folder from this build. Without this step the
+REM client package kept whatever EXE was there from an earlier build, so the
+REM ZIP and the folder on disk could be different programs entirely.
+xcopy /E /I /Y /Q "dist\OptionChain" "..\client package" >nul
+if exist "..\client package\license.json" del /Q "..\client package\license.json"
 powershell -NoProfile -ExecutionPolicy Bypass -File "package_release.ps1"
 if errorlevel 1 exit /b 1
 exit /b 0
