@@ -152,7 +152,17 @@ def _key_check(token, variant):
 _pending_date_loads = []
 _date_req_sig = {}
 _book_sheet_cache = {}
+# Resolved (book, sheet) pairs. Accessing book.sheets[0] costs a COM round-trip
+# and a late-binding Dispatch every single call, which dominated the render
+# loop. Cached, and dropped on any COM error so a closed workbook or a renamed
+# sheet recovers instead of failing silently.
+_sheet_cache = {}
+# Excel App COM object, reused across cycles for the bulk-mode calls.
+_app_cache = None
 _last_rows = {}
+# Per (asset, block) shape signature. Expensive per-cell formatting and column
+# resizing only run when the shape actually changes, not on every refresh.
+_block_shape = {}
 _block_hidden = {}
 available_dates = {"BTC": [], "ETH": [], "XAUT": []}
 _dropdown_sig = {}
@@ -1248,6 +1258,40 @@ def force_usd_block_formats(sheet, block, asset, bi, n_rows):
     _usd_fmt_done[(asset, bi)] = key
 
 
+def invalidate_com_cache(asset=None):
+    """Drop cached Excel COM objects so the next write re-resolves them.
+
+    Called on any COM error and whenever we notice Excel went away. Without
+    this, a stale handle keeps failing forever and presents as the app having
+    "stopped writing" while the sheet sits unchanged.
+    """
+    global _app_cache
+    if asset is None:
+        _book_sheet_cache.clear()
+        _sheet_cache.clear()
+        _app_cache = None
+    else:
+        _book_sheet_cache.pop(asset, None)
+        _sheet_cache.pop(asset, None)
+    # Per-shape bookkeeping is also suspect after a reconnect: the sheet may
+    # have been reopened from a different copy.
+    _block_shape.clear()
+    _usd_fmt_done.clear()
+    _dropdown_sig.clear()
+    _block_hidden.clear()
+    _last_rows.clear()
+
+
+def excel_alive():
+    """True when at least one Excel instance is reachable."""
+    try:
+        import xlwings as xw
+        return bool(list(xw.apps))
+    except Exception as e:
+        log_excel_exception("ALL", e, "probing for running Excel")
+        return False
+
+
 def setup_expiry_dropdown(sheet, asset):
     """Hidden helper column + in-cell dropdown on the expiry cells (like US tool)."""
     dates = available_dates[asset]
@@ -1291,21 +1335,27 @@ def _write_to_excel(asset):
     fname = os.path.join(BASE_DIR, f"{asset.lower()}_chain.xlsx")
     try:
         book = _book_sheet_cache.get(asset)
+        cached_sheet = _sheet_cache.get(asset)
         if book is not None:
             # Liveness probe. Cheap (one COM read) and it is what catches a
             # workbook the user closed underneath us, a renamed sheet or an
             # Excel restart, instead of failing on the next real write.
             try:
                 _ = book.name
+                if cached_sheet is not None:
+                    _ = cached_sheet.name
             except Exception as e:
                 log_excel_exception(asset, e, "cached COM object went stale")
                 record_excel_connection(asset, "cached_book_unresponsive", str(e))
                 book = None
+                cached_sheet = None
                 _book_sheet_cache.pop(asset, None)
+                _sheet_cache.pop(asset, None)
         if book is None:
             book = find_open_book(xw, fname)
             if book is not None:
                 _book_sheet_cache[asset] = book
+                _sheet_cache.pop(asset, None)
         if book is None:
             apps_count = excel_apps_count(xw)
             status = (
@@ -1333,7 +1383,10 @@ def _write_to_excel(asset):
         excel_miss_counts[asset] = 0
         excel_connected[asset] = True
         record_excel_connection(asset, "connected", f"workbook={fname}")
-        sheet = book.sheets[0]
+        sheet = cached_sheet
+        if sheet is None:
+            sheet = book.sheets[0]
+            _sheet_cache[asset] = sheet
 
         v = sheet.range("A2").value
         if isinstance(v, str):
@@ -1464,21 +1517,25 @@ def _write_to_excel(asset):
                     # recolouring and number formatting are skipped unless the
                     # signature actually changed. force_usd_block_formats is
                     # already self-gating on (asset, block, row count).
-                    # force USD-only formats (kills ₹ currency rendering)
-                    force_usd_block_formats(sheet, block, asset, bi, cnt)
+                    shape = (n, strikes[0] if n else 0, strikes[-1] if n else 0)
+                    if _block_shape.get((asset, bi)) != shape:
+                        _block_shape[(asset, bi)] = shape
 
-                    # batched side colors: strikes sorted → <sp is prefix, >sp is suffix
-                    k = bisect.bisect_left(strikes, sp)
-                    if k > 0:
-                        sheet.range(f"{block['call_start']}5:{block['call_end']}{4 + k}").color = (198, 224, 180)
-                    m = bisect.bisect_right(strikes, sp)
-                    if m < n:
-                        sheet.range(f"{block['put_start']}{5 + m}:{block['put_end']}{4 + n}").color = (255, 200, 200)
+                        # force USD-only formats (kills ₹ currency rendering)
+                        force_usd_block_formats(sheet, block, asset, bi, cnt)
 
-                    atm_strike = min(strikes, key=lambda s: abs(s - sp))
-                    atm_row = strikes.index(atm_strike) + 5
-                    atm_range = f"{block['atm']}{atm_row}:{block['put_end']}{atm_row}"
-                    sheet.range(atm_range).color = (255, 255, 0)
+                        # batched side colors: strikes sorted → <sp is prefix, >sp is suffix
+                        k = bisect.bisect_left(strikes, sp)
+                        if k > 0:
+                            sheet.range(f"{block['call_start']}5:{block['call_end']}{4 + k}").color = (198, 224, 180)
+                        m = bisect.bisect_right(strikes, sp)
+                        if m < n:
+                            sheet.range(f"{block['put_start']}{5 + m}:{block['put_end']}{4 + n}").color = (255, 200, 200)
+
+                        atm_strike = min(strikes, key=lambda s: abs(s - sp))
+                        atm_row = strikes.index(atm_strike) + 5
+                        atm_range = f"{block['atm']}{atm_row}:{block['put_end']}{atm_row}"
+                        sheet.range(atm_range).color = (255, 255, 0)
                 finally:
                     _performance_metrics.record(
                         asset,
@@ -1504,6 +1561,7 @@ def _write_to_excel(asset):
         # Any COM failure may mean the workbook was closed, renamed or Excel was
         # restarted. Drop every cached object so the next cycle re-resolves from
         # scratch rather than writing into a dead COM handle forever.
+        invalidate_com_cache(asset)
         now = time.time()
         if excel_fail_since[asset] is None:
             excel_fail_since[asset] = now
@@ -1528,98 +1586,22 @@ def _begin_excel_bulk_mode():
     the user is mid-edit, and there is no workbook to talk to yet.
     """
     state = {"app": None, "screen": None, "calc": None}
+    global _app_cache
     try:
-        import xlwings as xw
-        apps = list(xw.apps)
-        if not apps:
-            return None
-        app = apps[0]
-        state["app"] = app
-        try:
-            state["screen"] = bool(app.screen_updating)
-            app.screen_updating = False
-        except Exception as e:
-            log_excel_exception("ALL", e, "disabling screen_updating")
-            state["screen"] = None
-        try:
-            # xlCalculationManual = -4135. Restore the user's own mode after.
-            state["calc"] = int(app.calculation)
-            app.calculation = -4135
-        except Exception as e:
-            log_excel_exception("ALL", e, "switching to manual calculation")
-            state["calc"] = None
-    except Exception as e:
-        log_excel_exception("ALL", e, "entering bulk mode")
-        return None
-
-    def restore():
-        app = state.get("app")
+        app = _app_cache
         if app is None:
-            return
-        if state.get("calc") is not None:
-            try:
-                app.calculation = state["calc"]
-            except Exception as e:
-                log_excel_exception("ALL", e, "restoring calculation mode")
-        if state.get("screen") is not None:
-            try:
-                app.screen_updating = state["screen"]
-            except Exception as e:
-                log_excel_exception("ALL", e, "restoring screen_updating")
-
-    return restore
-
-
-def write_to_excel(asset):
-    started = time.perf_counter()
-    try:
-        _write_to_excel(asset)
-    finally:
-        _performance_metrics.record(
-            asset, "excel_pass", time.perf_counter() - started
-        )
-
-
-def render_cycle():
-    """One full pass over every workbook, inside a single bulk-mode window.
-
-    Screen updating and calculation mode are suspended once per cycle rather
-    than once per asset, so a cycle costs three writes with repaint and
-    recalculation suspended, then one restore.
-    """
-    started = time.perf_counter()
-    restore = _begin_excel_bulk_mode()
-    try:
-        for asset in ("BTC", "ETH", "XAUT"):
-            write_to_excel(asset)
-    finally:
-        if restore is not None:
-            try:
-                restore()
-            except Exception as e:
-                log_excel_exception("ALL", e, "leaving bulk mode")
-        elapsed = time.perf_counter() - started
-        _performance_metrics.record("ALL", "render_cycle", elapsed)
-
-
-def _begin_excel_bulk_mode():
-    """Suspend repaint + recalculation for the duration of one render cycle.
-
-    Every Excel write otherwise repaints the workbook and triggers a full
-    recalculation. That is cheap in an empty sheet but expensive when the user
-    has a strategy workbook open, which is where refresh times blow up.
-
-    Returns a restore callable, or None if nothing could be changed. Failures
-    are expected and non-fatal: screen_updating and calculation both raise if
-    the user is mid-edit, and there is no workbook to talk to yet.
-    """
-    state = {"app": None, "screen": None, "calc": None}
-    try:
-        import xlwings as xw
-        apps = list(xw.apps)
-        if not apps:
+            import xlwings as xw
+            apps = list(xw.apps)
+            if not apps:
+                return None
+            app = apps[0]
+            _app_cache = app
+        try:
+            _ = app.name  # liveness probe; also initialises the COM cache
+        except Exception as e:
+            log_excel_exception("ALL", e, "cached Excel app went stale")
+            _app_cache = None
             return None
-        app = apps[0]
         state["app"] = app
         try:
             state["screen"] = bool(app.screen_updating)
