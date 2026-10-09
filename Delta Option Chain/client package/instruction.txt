@@ -1,74 +1,144 @@
 ﻿====================================
- HOW TO START - ONLY 2 STEPS
+ DELTA OPTION CHAIN - SETUP GUIDE
 ====================================
 
-STEP 1:  Extract the zip file
-         (Right-click on zip -> Extract All)
+BEFORE YOU START
+------------------------------------
+This tool ships as a FOLDER, not a single file.
+The OptionChain folder contains ~2,000 support files
+that it needs to run. Please do not move the EXE out
+of that folder.
 
-STEP 2:  Go inside the extracted folder
-         and double-click  OptionChain.exe
 
-THAT'S IT!
+====================================
+ STEP 1 - UNBLOCK THE ZIP
+====================================
 
-*  All 3 Excel files open automatically
-      (btc_chain.xlsx, eth_chain.xlsx, xaut_chain.xlsx)
-   *  Please WAIT 1-2 MINUTES before checking.
-      The tool activates, connects to the exchange and
-      loads all three markets before the first numbers
-      appear. This is normal, not a hang.
-   *  Once the BTC price in the top-left cell starts
-      changing, everything is working
-   *  To stop: just close Excel
+Windows marks downloaded files as "blocked". This
+stops the tool from starting.
+
+1. Right-click the ZIP file  ->  Properties
+2. At the bottom, tick the box:
+       [x]  Unblock
+3. Click  Apply, then  OK
+
+Skip this and Windows may refuse to run the tool.
+
+
+====================================
+ STEP 2 - EXTRACT THE WHOLE ZIP
+====================================
+
+1. Right-click the ZIP  ->  Extract All...
+2. Choose a plain folder, for example  C:\DeltaChain
+
+IMPORTANT: do NOT run the tool from inside the ZIP.
+Right-click -> Open, or double-click the ZIP in the
+explorer, and the EXE will not find its support files.
+
+After extracting you should see:
+
+   C:\DeltaChain\OptionChain\
+       OptionChain.exe
+       btc_chain.xlsx
+       eth_chain.xlsx
+       xaut_chain.xlsx
+       config.json
+       README.txt
+       _internal\        <- this folder is required
+
+
+====================================
+ STEP 3 - CREATE A SHORTCUT
+====================================
+
+1. Open  C:\DeltaChain\OptionChain
+2. Right-click  OptionChain.exe  ->  Send to
+   ->  Desktop (create shortcut)
+3. Use that shortcut from now on
+
+Always start the tool from the shortcut or from
+inside the OptionChain folder - never from a
+different location.
+
+
+====================================
+ STEP 4 - RUN IT
+====================================
+
+Double-click  OptionChain.exe
+
+*  A "Product Key" box appears on first run.
+   Enter the key from the owner. The key stays
+   valid till the last Friday of that month.
+
+*  All three Excel files open automatically.
+
+*  PLEASE WAIT 1-2 MINUTES before checking.
+   The tool connects to the exchange and loads all
+   three markets before the first numbers appear.
+   This is normal, not a hang.
+
+*  Once the BTC price in the top-left cell starts
+   changing, everything is working.
+
+*  To stop: just close Excel.
 
 
 ====================================
  COMMON QUESTIONS
 ====================================
 
-Q: Excel files are ALREADY open. Can I still run OptionChain.exe?
-A: YES! Just double-click it. The tool connects to the
-   open sheets and starts updating them right away.
+Q: "Windows protected your PC" message?
+A: Click "More info" -> "Run anyway".
+   This is normal for any new program.
+
+Q: Do I need to install Python or anything?
+A: NO. Everything is inside the OptionChain folder.
+   Only Microsoft Excel must be installed.
+
+Q: Excel is ALREADY open. Can I still start it?
+A: YES. Just start the tool and it attaches to the
+   open sheets.
 
 Q: I closed Excel. How do I start again?
-A: Simply double-click OptionChain.exe again.
-   (No need to restart laptop or install anything.)
+A: Run OptionChain.exe again. No restart needed.
 
-Q: "Windows protected your PC" message appears?
-A: Click  "More info"  ->  "Run anyway".
-   This is normal for new programs.
-
-Q: Data is not updating?
-A: Wait 1-2 minutes first - it needs time to connect.
-   Still blank after 2 minutes?
-   Check your internet connection, then close Excel
-   and run OptionChain.exe again.
-
-Q: The sheets opened but everything says "--"?
-A: The top-left cell shows the BTC price. Once THAT
-   number starts changing, the chain has loaded.
-   If it never changes, run OptionChain.exe again.
+Q: Sheets are blank or show "--"?
+A: Wait 1-2 minutes first. Still blank after that?
+   Check the internet connection, close Excel, and
+   run OptionChain.exe again.
 
 Q: How often does the price change?
-A: The price refreshes several times per second, but
-   the exchange itself publishes a new index value
-   every few seconds. So the number updates in steps -
-   that is the exchange, not a fault.
+A: The tool refreshes about once per second. The
+   exchange itself publishes a new index value every
+   few seconds, so the number moves in steps. That
+   is the exchange's feed, not a fault in the tool.
 
-Q: Do I need to install Python or anything else?
-A: NO. Everything is packed inside OptionChain.exe.
-   Only Microsoft Excel must be installed on the laptop.
+Q: An Excel add-in error appears on startup
+   (for example a ".xll" file name)?
+A: That is NOT from this tool. This package contains
+   no .xll add-in. It comes from other software
+   already installed on that computer.
+   To remove it:
+     Excel -> File -> Options -> Add-ins
+     -> Manage: Excel Add-ins -> Go
+     -> untick the offending add-in -> OK
+   Or remove its startup entry from
+     %appdata%\Microsoft\Excel\XLSTART
 
-Q: "Product Key" popup appears?
-A: Every month needs a new key (first run too).
-   Key stays valid till the last Friday of the
-   month - ask the owner for the current key,
-   type it in, and the tool continues.
+Q: Where are the logs?
+A: C:\Users\<your name>\AppData\Local\DeltaOptionChain
+   - startup_diag.log  (system and Excel details)
+   - app.log           (errors, if any)
+   Send these to the owner if something is wrong.
 
 
 ====================================
  QUICK TIPS
 ------------------------------------
- Change expiry dates : edit D3 / O3 / Z3  (e.g. 02/10/2026, or dropdown)
- Change strike count : edit A2            (e.g. 20)
- Yellow row = ATM | Green = ITM calls | Red = ITM puts
+Change expiry dates : edit D3 / O3 / Z3
+Change strike count : edit A2  (e.g. 20)
+Yellow row = ATM
+Green = ITM calls    Red = ITM puts
 ====================================

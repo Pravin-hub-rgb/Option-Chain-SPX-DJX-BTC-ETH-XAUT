@@ -1597,7 +1597,9 @@ def _begin_excel_bulk_mode():
             app = apps[0]
             _app_cache = app
         try:
-            _ = app.name  # liveness probe; also initialises the COM cache
+            # xlwings.App has no .name; .version is the cheap liveness probe
+            # that goes through to Excel and raises if the instance is gone.
+            _ = app.version
         except Exception as e:
             log_excel_exception("ALL", e, "cached Excel app went stale")
             _app_cache = None
@@ -1610,9 +1612,16 @@ def _begin_excel_bulk_mode():
             log_excel_exception("ALL", e, "disabling screen_updating")
             state["screen"] = None
         try:
-            # xlCalculationManual = -4135. Restore the user's own mode after.
-            state["calc"] = int(app.calculation)
-            app.calculation = -4135
+            # xlwings exposes calculation as a lowercase NAME
+            # ("automatic" / "semiautomatic" / "manual"); the setter only
+            # accepts those names, and int() or a raw xl* constant both raise.
+            # Read the user's current mode, set manual, restore it afterwards.
+            import xlwings as _xw
+            current = str(app.calculation).strip().lower()
+            if current not in ("automatic", "semiautomatic", "manual"):
+                current = "automatic"
+            state["calc"] = current
+            app.calculation = "manual"
         except Exception as e:
             log_excel_exception("ALL", e, "switching to manual calculation")
             state["calc"] = None

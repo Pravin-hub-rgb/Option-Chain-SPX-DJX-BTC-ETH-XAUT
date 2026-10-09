@@ -47,12 +47,15 @@ if (Test-Path -LiteralPath $strayLicense) {
     throw "license.json must never ship: it would let anyone run the tool unlocked. Remove it from $strayLicense"
 }
 
-# No Python source or licence sidecar files anywhere in the release payload.
-$strayFiles = Get-ChildItem -LiteralPath $appDirectory -Recurse -File |
+# Our own Python source must not sit in the client payload. This is a
+# ROOT-LEVEL check only: _internal legitimately carries openpyxl/xlwings
+# package sources, because --collect-all ships them. Those are third-party
+# library files, not our code, and scanning them recursively fails every build.
+$straySource = Get-ChildItem -LiteralPath $appDirectory -File |
     Where-Object { $_.Extension -ieq '.py' -or $_.Extension -ieq '.pyc' }
-if ($strayFiles) {
-    $paths = ($strayFiles | ForEach-Object { $_.FullName }) -join "`n"
-    throw "Unexpected Python source/bytecode files found in release:`n$paths"
+if ($straySource) {
+    $paths = ($straySource | ForEach-Object { $_.FullName }) -join "`n"
+    throw "Unexpected Python source/bytecode in release root:`n$paths"
 }
 
 # Only config.json is expected at the top level of the client payload.
