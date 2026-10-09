@@ -163,6 +163,9 @@ _last_rows = {}
 # Per (asset, block) shape signature. Expensive per-cell formatting and column
 # resizing only run when the shape actually changes, not on every refresh.
 _block_shape = {}
+# Per (asset, block) payload signature, so an unchanged chain is not rewritten
+# to Excel at all.
+_block_payload = {}
 _block_hidden = {}
 available_dates = {"BTC": [], "ETH": [], "XAUT": []}
 _dropdown_sig = {}
@@ -1276,6 +1279,7 @@ def invalidate_com_cache(asset=None):
     # Per-shape bookkeeping is also suspect after a reconnect: the sheet may
     # have been reopened from a different copy.
     _block_shape.clear()
+    _block_payload.clear()
     _usd_fmt_done.clear()
     _dropdown_sig.clear()
     _block_hidden.clear()
@@ -1487,7 +1491,18 @@ def _write_to_excel(asset):
                     # xlwings, but measured no faster (the Python-side
                     # conversion costs what the COM negotiation saved), so the
                     # simpler form stays.
-                    sheet.range((5, block["start"])).options(index=False, header=False).value = chain
+                    #
+                    # Only write when the payload actually differs. The block
+                    # range write is the single most expensive call in the whole
+                    # render loop, and between ticks most rows are unchanged,
+                    # so a cheap Python-side signature check avoids a full Excel
+                    # rewrite for no visible difference.
+                    payload_sig = hash(tuple(map(tuple, chain.values.tolist())))
+                    if payload_sig != _block_payload.get((asset, bi)):
+                        _block_payload[(asset, bi)] = payload_sig
+                        sheet.range((5, block["start"])).options(index=False, header=False).value = chain
+                    else:
+                        _performance_metrics.record(asset, "excel_range_skipped", 0.0, rows=cnt)
                 finally:
                     _performance_metrics.record(
                         asset,
