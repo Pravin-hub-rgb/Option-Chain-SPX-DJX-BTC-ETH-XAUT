@@ -1388,7 +1388,10 @@ def excel_apps_count(xw):
         return -1
 
 
-def excel_process_running():
+_excel_liveness_cache = None  # (monotonic_timestamp, running_bool)
+
+
+def excel_process_running(max_age=1.0):
     """True if any EXCEL.EXE is alive, checked without touching COM.
 
     If Excel has crashed or been killed, the cached COM server is a dead
@@ -1396,7 +1399,17 @@ def excel_process_running():
     unavailable" and can take the whole process down with it. Checking the
     process table first means we simply stop writing and wait for the customer
     to bring Excel back, instead of dying silently.
+
+    The answer is cached briefly. Spawning tasklist per workbook per cycle
+    added a large fraction of a second to every render pass, which is a lot to
+    pay for a check that only needs to be approximately current.
     """
+    global _excel_liveness_cache
+    now = time.monotonic()
+    if _excel_liveness_cache is not None:
+        stamp, running = _excel_liveness_cache
+        if now - stamp <= max_age:
+            return running
     try:
         result = subprocess.run(
             ["tasklist", "/FI", "IMAGENAME eq EXCEL.EXE", "/NH"],
@@ -1407,8 +1420,11 @@ def excel_process_running():
         )
     except Exception:
         # Unknown -> assume it is alive so behaviour is unchanged.
+        _excel_liveness_cache = (now, True)
         return True
-    return "EXCEL.EXE" in (result.stdout or "").upper()
+    running = "EXCEL.EXE" in (result.stdout or "").upper()
+    _excel_liveness_cache = (now, running)
+    return running
 
 
 def find_open_book(xw, fname):
@@ -1723,25 +1739,29 @@ def force_usd_block_formats(sheet, block, n_rows):
         log_excel_exception("EXCEL", e, "formatting option-chain cells")
 
 
-_workbook_missing_since = None
-_workbook_missing_notice_shown = False
+_workbook_missing = {}  # path -> [first_seen_monotonic, already_notified]
 
 
 def notice_workbook_missing(fname):
-    """Tell the user once when Excel is open but our workbook is not.
+    """Tell the user once when Excel is open but this workbook is not.
 
     Without this the tool simply waits, and since it runs without a console the
     customer sees nothing at all and assumes it has stopped working.
+
+    Tracked per workbook: all three are checked every cycle, so a global timer
+    would be reset by whichever books are still connected and the missing one
+    would never be reported.
     """
-    global _workbook_missing_since, _workbook_missing_notice_shown
     now = time.monotonic()
-    if _workbook_missing_since is None:
-        _workbook_missing_since = now
+    entry = _workbook_missing.get(fname)
+    if entry is None:
+        _workbook_missing[fname] = [now, False]
+        return
     # Excel may still be opening the workbooks it was just asked to open, so
     # give it a moment before telling the user anything is wrong.
-    if _workbook_missing_notice_shown or now - _workbook_missing_since < 20:
+    if entry[1] or now - entry[0] < 20:
         return
-    _workbook_missing_notice_shown = True
+    entry[1] = True
     try:
         show_error(
             "Microsoft Excel is open, but this workbook is not:\n\n"
@@ -1754,10 +1774,8 @@ def notice_workbook_missing(fname):
         print(f"Could not show workbook-missing notice: {e}", flush=True)
 
 
-def clear_workbook_missing_notice():
-    global _workbook_missing_since, _workbook_missing_notice_shown
-    _workbook_missing_since = None
-    _workbook_missing_notice_shown = False
+def clear_workbook_missing_notice(fname):
+    _workbook_missing.pop(fname, None)
 
 
 def _write_to_excel(role):
@@ -1779,7 +1797,7 @@ def _write_to_excel(role):
             )
             record_excel_connection(role, status, f"expected_workbook={path}")
             if apps_count > 0:
-                notice_workbook_missing(fname if 'role' == 'asset' else path)
+                notice_workbook_missing(path)
                 return
             if excel_connected[role]:
                 # Excel was connected and is now gone (closed by the customer,
@@ -1803,7 +1821,7 @@ def _write_to_excel(role):
                 os._exit(1)
             return
         excel_miss_counts[role] = 0
-        clear_workbook_missing_notice()
+        clear_workbook_missing_notice(path)
         excel_connected[role] = True
         try:
             excel_info = (
@@ -2147,22 +2165,6 @@ async def main_async():
         process_pending_dates(),
         display_loop(),
     )
-
-
-def _process_image_path(kernel32, pid):
-    """Full path of a running process, or None if it cannot be read."""
-    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-    h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-    if not h:
-        return None
-    try:
-        size = wintypes.DWORD(32768)
-        buf = ctypes.create_unicode_buffer(size.value)
-        if not kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
-            return None
-        return buf.value
-    finally:
-        kernel32.CloseHandle(h)
 
 
 def _instance_guard_log(message):
