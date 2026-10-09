@@ -1,14 +1,18 @@
 @echo off
 cd /d "%~dp0"
-echo Building OptionChain.exe (onefile, no console)...
+echo Building OptionChain.exe (onedir, no console)...
 
-rem NOTE: client package lives in the sibling folder "..\client package"
-rem (README.txt / instruction.txt already live there - they are NOT copied in.)
+rem Build the complete onedir client folder. Do not create an archive here.
 
-python -m PyInstaller --noconfirm --clean --onefile --noconsole ^
+python -m PyInstaller --noconfirm --clean --onedir --noconsole --noupx ^
   --name OptionChain ^
   --collect-all xlwings ^
   --collect-all openpyxl ^
+  --hidden-import win32com ^
+  --hidden-import win32com.client ^
+  --hidden-import pythoncom ^
+  --hidden-import pywintypes ^
+  --hidden-import win32timezone ^
   main.py
 if errorlevel 1 (
   echo BUILD FAILED
@@ -25,11 +29,10 @@ if exist "djx_option_chain.xlsx" copy /y "djx_option_chain.xlsx" "%PKG%\" >nul
 if exist "us_stock_option_chain.xlsx" copy /y "us_stock_option_chain.xlsx" "%PKG%\" >nul
 copy /y "config.json" "%PKG%\" >nul
 
-rem Replace the exe only AFTER templates are in place, so the client package
-rem is never left without its .xlsx files.
-copy /y "dist\OptionChain.exe" "%PKG%\" >nul
-if errorlevel 1 (
-  echo COPY EXE FAILED
+rem Copy the complete onedir runtime and templates. Do not create a ZIP here.
+xcopy /e /i /y "dist\OptionChain\*" "%PKG%\" >nul
+if errorlevel 2 (
+  echo COPY ONEDIR PACKAGE FAILED
   exit /b 1
 )
 
@@ -37,16 +40,9 @@ rem never ship an activated licence
 if exist "%PKG%\license.json" del /f /q "%PKG%\license.json"
 del /f /q "%PKG%\~$*.xlsx" >nul 2>&1
 
-if exist "..\us-option-chain.zip" del /f /q "..\us-option-chain.zip"
-powershell -NoProfile -Command "Compress-Archive -Path '%PKG%' -DestinationPath '..\us-option-chain.zip'"
-if errorlevel 1 (
-  echo ZIP FAILED
-  exit /b 1
-)
-
 echo.
 echo Build OK:
-echo   dist\OptionChain.exe
-echo   ..\client package\
-echo   ..\us-option-chain.zip
+echo   dist\OptionChain\
+echo   ..\client package\  (complete onedir folder)
+echo   No ZIP was created.
 echo.

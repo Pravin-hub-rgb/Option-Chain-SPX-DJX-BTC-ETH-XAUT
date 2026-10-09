@@ -25,6 +25,14 @@ import pandas as pd
 import requests
 
 import config
+from us_diagnostics import (
+    append_app_exception,
+    append_connection_event,
+    excel_process_details,
+    append_performance_summary,
+    write_startup_diagnostics,
+)
+from us_performance import PerformanceMetrics, itm_color_ranges
 
 BASE_DIR = config.base_dir()
 cfg = config.load_config()
@@ -335,6 +343,30 @@ def show_info(msg):
         ctypes.windll.user32.MessageBoxW(0, msg, "US Stock Option Chain", 0x40)
     else:
         print(msg, flush=True)
+
+
+def record_excel_connection(role, status, detail=""):
+    if _excel_connection_status.get(role) == status:
+        return
+    _excel_connection_status[role] = status
+    try:
+        append_connection_event(role, status, detail)
+    except OSError as e:
+        print(f"Could not log Excel connection state ({role}): {e}", flush=True)
+
+
+def log_excel_exception(role, exc, context="Excel/COM update"):
+    now = time.monotonic()
+    signature = (type(exc).__name__, str(exc))
+    key = (role, context)
+    previous = _last_excel_exception.get(key)
+    if previous and previous[0] == signature and now - previous[1] < 60:
+        return
+    _last_excel_exception[key] = (signature, now)
+    try:
+        append_app_exception(f"{context} for {role}", exc)
+    except OSError as log_error:
+        print(f"Could not log {context} traceback ({role}): {log_error}", flush=True)
 
 
 def month_end(d_year, d_month):
@@ -721,6 +753,14 @@ def open_excel_files():
             os.startfile(path)
         except OSError as e:
             show_error(f"Could not open {ROLE_FILES[role]}:\n{e}")
+            try:
+                append_app_exception(f"opening {role} workbook", e)
+            except OSError as log_error:
+                print(f"Could not log workbook open failure ({role}): {log_error}", flush=True)
+            try:
+                append_app_exception(f"opening {role} workbook", e)
+            except OSError as log_error:
+                print(f"Could not log workbook open failure ({role}): {log_error}", flush=True)
 
 
 def normalize_symbol(raw):
@@ -1332,26 +1372,34 @@ excel_first_attempt = {r: None for r in ROLE_ORDER}
 def excel_apps_count(xw):
     try:
         return len(list(xw.apps))
-    except Exception:
+    except Exception as e:
+        log_excel_exception("EXCEL", e, "enumerating Excel applications")
         return -1
 
 
 def find_open_book(xw, fname):
     target = os.path.abspath(fname).lower()
+    role = next(
+        (candidate for candidate, file_name in ROLE_FILES.items() if file_name.lower() in target),
+        "unknown",
+    )
     try:
         apps = list(xw.apps)
-    except Exception:
+    except Exception as e:
+        log_excel_exception(role, e, "enumerating Excel applications")
         return None
     for app in apps:
         try:
             books = list(app.books)
-        except Exception:
+        except Exception as e:
+            log_excel_exception(role, e, "enumerating open workbooks")
             continue
         for book in books:
             try:
                 if os.path.abspath(book.fullname).lower() == target:
                     return book
-            except Exception:
+            except Exception as e:
+                log_excel_exception(role, e, "reading workbook path")
                 continue
     return None
 
@@ -1370,8 +1418,8 @@ def update_expiry_dropdowns(sym, sheet):
     helper_end = max(len(options), 40)
     try:
         sheet.range((1, helper_col), (helper_end, helper_col)).clear()
-    except Exception:
-        pass
+    except Exception as e:
+        log_excel_exception(sym, e, "clearing expiry dropdown helper column")
     # xlwings Sheet has no .cell() — write helper column as one range
     try:
         col_letter = get_column_letter(helper_col)
@@ -1383,14 +1431,14 @@ def update_expiry_dropdowns(sym, sheet):
         return
     try:
         sheet.range((1, helper_col)).api.EntireColumn.Hidden = True
-    except Exception:
-        pass
+    except Exception as e:
+        log_excel_exception(sym, e, "hiding expiry dropdown helper column")
     formula = f"=$AH$1:$AH${len(options)}"
     for cell in ("D3", "O3", "Z3"):
         try:
             sheet.range(cell).api.Validation.Delete()
-        except Exception:
-            pass
+        except Exception as e:
+            log_excel_exception(sym, e, f"clearing expiry validation {cell}")
         try:
             sheet.range(cell).api.Validation.Add(
                 Type=3,
@@ -1440,6 +1488,23 @@ def update_user_dates(sym, sheet):
 
 
 _sheet_fmt_done = set()
+_usd_fmt_done = set()
+_performance_metrics = PerformanceMetrics()
+_last_performance_flush = time.monotonic()
+_performance_log_error_shown = False
+_excel_connection_status = {}
+_last_excel_exception = {}
+
+
+def forget_workbook_formatting(path):
+    normalized_path = os.path.abspath(path).lower()
+    _sheet_fmt_done.discard(normalized_path)
+    stale_keys = {
+        key for key in _usd_fmt_done
+        if isinstance(key, tuple) and key[0] == normalized_path
+    }
+    _usd_fmt_done.difference_update(stale_keys)
+
 
 # Labels written every run (cheap) so user always sees changeable hints
 # J1 is role-dependent — written inside write_hint_labels
@@ -1463,26 +1528,26 @@ def write_hint_labels(sheet, role="stock"):
         r.value = j1_text
         r.font.bold = True
         r.font.color = (89, 89, 89)
-    except Exception:
-        pass
+    except Exception as e:
+        log_excel_exception(role, e, "writing symbol label")
     for cell, text in HINT_LABELS:
         try:
             r = sheet.range(cell)
             r.value = text
             r.font.bold = True
             r.font.color = (89, 89, 89)
-        except Exception:
-            pass
+        except Exception as e:
+            log_excel_exception(role, e, f"writing worksheet hint {cell}")
     for cell in _HINT_CLEAR:
         try:
             sheet.range(cell).value = None
-        except Exception:
-            pass
+        except Exception as e:
+            log_excel_exception(role, e, f"clearing owned hint cell {cell}")
     # keep Symbol label from squishing (cheap — every run)
     try:
-        sheet.columns("J").width = 22
-    except Exception:
-        pass
+        sheet.range("J:J").api.ColumnWidth = 22
+    except Exception as e:
+        log_excel_exception(role, e, "setting symbol column width")
 
 
 def format_sheet(sheet, role="stock"):
@@ -1496,7 +1561,6 @@ def format_sheet(sheet, role="stock"):
         key = id(sheet)
     if key in _sheet_fmt_done:
         return
-    _sheet_fmt_done.add(key)
 
     HEADER_FILL = (31, 78, 121)       # dark blue
     INPUT_FILL = (255, 255, 153)      # light yellow = editable
@@ -1519,12 +1583,13 @@ def format_sheet(sheet, role="stock"):
     try:
         for c, w in widths.items():
             sheet.columns(get_column_letter(c)).width = w
-    except Exception:
+    except Exception as e:
         try:
             for c, w in widths.items():
                 sheet.range(f"{get_column_letter(c)}:{get_column_letter(c)}").api.ColumnWidth = w
-        except Exception:
-            pass
+        except Exception as fallback_error:
+            log_excel_exception(role, e, "setting worksheet column widths")
+            log_excel_exception(role, fallback_error, "setting fallback column widths")
 
     try:
         # Row 1 spot / PCR
@@ -1561,11 +1626,14 @@ def format_sheet(sheet, role="stock"):
         for cell in ("D3", "O3", "Z3"):
             try:
                 sheet.range(cell).api.NumberFormat = "@"
-            except Exception:
-                pass
+            except Exception as e:
+                log_excel_exception(role, e, f"setting expiry cell format {cell}")
         write_hint_labels(sheet, role)
     except Exception as e:
         print(f"format_sheet: {e}", flush=True)
+        log_excel_exception(role, e, "formatting worksheet")
+    else:
+        _sheet_fmt_done.add(key)
 
 
 def force_usd_block_formats(sheet, block, n_rows):
@@ -1575,6 +1643,13 @@ def force_usd_block_formats(sheet, block, n_rows):
     c0 = block["start"]
     end = 4 + n_rows
     try:
+        sheet_key = os.path.abspath(sheet.book.fullname).lower()
+    except Exception:
+        sheet_key = str(id(sheet))
+    format_key = (sheet_key, c0, n_rows)
+    if format_key in _usd_fmt_done:
+        return
+    try:
         for off in (0, 1, 2, 6, 7, 8):
             col = get_column_letter(c0 + off)
             sheet.range(f"{col}5:{col}{end}").api.NumberFormat = "0.00"
@@ -1582,10 +1657,7 @@ def force_usd_block_formats(sheet, block, n_rows):
         for off in (3, 5):
             col = get_column_letter(c0 + off)
             rng = sheet.range(f"{col}5:{col}{end}")
-            try:
-                rng.api.NumberFormat = "@"
-            except Exception:
-                pass
+            rng.api.NumberFormat = "@"
             # rewrite numeric/₹ leftovers as $ text
             for r in range(5, end + 1):
                 cell = sheet.range((r, c0 + off))
@@ -1597,11 +1669,13 @@ def force_usd_block_formats(sheet, block, n_rows):
                         cell.value = fmt_oi(v)
                     elif "₹" in str(v) or "Rs" in str(v):
                         cell.value = fmt_oi(v)
+        _usd_fmt_done.add(format_key)
     except Exception as e:
         print(f"force_usd formats: {e}", flush=True)
+        log_excel_exception("EXCEL", e, "formatting option-chain cells")
 
 
-def write_to_excel(role):
+def _write_to_excel(role):
     try:
         import xlwings as xw
     except ImportError:
@@ -1611,7 +1685,14 @@ def write_to_excel(role):
     try:
         book = find_open_book(xw, path)
         if book is None:
+            forget_workbook_formatting(path)
             apps_count = excel_apps_count(xw)
+            status = (
+                "excel_running_workbook_not_found"
+                if apps_count > 0
+                else "excel_not_found"
+            )
+            record_excel_connection(role, status, f"expected_workbook={path}")
             if apps_count > 0:
                 return
             if excel_connected[role]:
@@ -1630,8 +1711,34 @@ def write_to_excel(role):
             return
         excel_miss_counts[role] = 0
         excel_connected[role] = True
+        try:
+            excel_info = (
+                f"; excel_version={book.app.api.Version}"
+                f"; excel_operating_system={book.app.api.OperatingSystem}"
+            )
+            try:
+                excel_details = excel_process_details(book.app.api.Hwnd)
+                excel_info += (
+                    f"; excel_process_bitness={excel_details['bitness']}"
+                    f"; excel_process_is_administrator="
+                    f"{excel_details['is_administrator']}"
+                )
+            except (OSError, TypeError, ValueError) as e:
+                excel_info += (
+                    f"; excel_process_is_administrator=unavailable:"
+                    f"{type(e).__name__}:{e}"
+                )
+        except Exception as e:
+            excel_info = f"; excel_details_unavailable={type(e).__name__}: {e}"
+        record_excel_connection(role, "connected", f"workbook={path}{excel_info}")
         sheet = book.sheets[0]
-        format_sheet(sheet, role)
+        formatting_started = time.perf_counter()
+        try:
+            format_sheet(sheet, role)
+        finally:
+            _performance_metrics.record(
+                role, "worksheet_setup", time.perf_counter() - formatting_started
+            )
 
         global _refetch_now
         new_sym = read_symbol_cell(sheet, role)
@@ -1670,11 +1777,13 @@ def write_to_excel(role):
             update_user_dates(sym, sheet)
         except Exception as e:
             print(f"update_user_dates ({sym}): {e}", flush=True)
+            log_excel_exception(role, e, "reading expiry input cells")
         try:
             update_expiry_dropdowns(sym, sheet)
         except Exception as e:
             _dropdown_sig.pop(sym, None)
             print(f"update_expiry_dropdowns ({sym}): {e}", flush=True)
+            log_excel_exception(role, e, "updating expiry dropdowns")
 
         sp = spot_cmp[sym] or 0
         MAX_A2 = 100
@@ -1695,7 +1804,17 @@ def write_to_excel(role):
                 sheet.range((1, col_l + 4)).value = "PCR: --"
                 continue
 
-            chain, pcr = build_option_chain(sym, expiry, range_val)
+            chain_started = time.perf_counter()
+            chain = None
+            try:
+                chain, pcr = build_option_chain(sym, expiry, range_val)
+            finally:
+                _performance_metrics.record(
+                    role,
+                    "chain_build",
+                    time.perf_counter() - chain_started,
+                    rows=len(chain) if chain is not None else 0,
+                )
             cnt = len(chain) if chain is not None else 0
             sheet.range((1, col_l)).value = f"{sym} Spot: {sp:.2f} | {cnt} strikes"
             sheet.range((1, col_l + 4)).value = f"PCR: {pcr:.2f}"
@@ -1708,43 +1827,69 @@ def write_to_excel(role):
                 for off in (3, 5):
                     try:
                         sheet.range((5, c0 + off), (4 + n_rows, c0 + off)).api.NumberFormat = "@"
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log_excel_exception(
+                            role, e, f"formatting open-interest column {c0 + off}"
+                        )
 
-                sheet.range((5, block["start"])).options(index=False, header=False).value = chain
+                write_started = time.perf_counter()
+                try:
+                    sheet.range((5, block["start"])).options(index=False, header=False).value = chain
+                finally:
+                    _performance_metrics.record(
+                        role,
+                        "excel_range_write",
+                        time.perf_counter() - write_started,
+                        rows=n_rows,
+                    )
 
                 # clear stale rows below (fixes A2 shrink leaving old data)
                 if n_rows < 200:
                     stale_a = f"{get_column_letter(c0)}{5 + n_rows}:{get_column_letter(c0 + 8)}2000"
                     try:
                         sheet.range(stale_a).clear()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log_excel_exception(role, e, f"clearing stale rows in block {bi + 1}")
 
-                force_usd_block_formats(sheet, block, n_rows)
+                formatting_started = time.perf_counter()
+                try:
+                    force_usd_block_formats(sheet, block, n_rows)
 
-                atm_strike = min(chain["strike"], key=lambda s: abs(s - sp))
-                atm_row = chain[chain["strike"] == atm_strike].index[0] + 5
+                    atm_strike = min(chain["strike"], key=lambda s: abs(s - sp))
+                    atm_row = chain[chain["strike"] == atm_strike].index[0] + 5
 
-                atm_range = f"{block['atm']}{atm_row}:{block['put_end']}{atm_row}"
-                sheet.range(atm_range).color = (255, 255, 0)
-                sheet.range(atm_range).font.bold = True
+                    atm_range = f"{block['atm']}{atm_row}:{block['put_end']}{atm_row}"
+                    sheet.range(atm_range).color = (255, 255, 0)
+                    sheet.range(atm_range).font.bold = True
 
-                for idx, row in chain.iterrows():
-                    r = idx + 5
-                    strike = row["strike"]
-                    if strike < sp:
-                        sr = f"{block['call_start']}{r}:{block['call_end']}{r}"
-                        sheet.range(sr).color = (198, 224, 180)
-                    if strike > sp:
-                        sr = f"{block['put_start']}{r}:{block['put_end']}{r}"
-                        sheet.range(sr).color = (255, 200, 200)
+                    strikes = chain["strike"].tolist()
+                    for cell_range, color in itm_color_ranges(block, strikes, sp):
+                        sheet.range(cell_range).color = color
+                finally:
+                    _performance_metrics.record(
+                        role,
+                        "excel_formatting",
+                        time.perf_counter() - formatting_started,
+                        rows=n_rows,
+                    )
             else:
                 clear_start = get_column_letter(block["start"])
                 clear_end = get_column_letter(block["start"] + 8)
                 sheet.range(f"{clear_start}5:{clear_end}2000").clear()
     except Exception as e:
         print(f"Excel error ({role} / {role_symbol.get(role)}): {e}", flush=True)
+        record_excel_connection(role, "excel_com_error", f"{type(e).__name__}: {e}")
+        log_excel_exception(role, e)
+
+
+def write_to_excel(role):
+    started = time.perf_counter()
+    try:
+        _write_to_excel(role)
+    finally:
+        _performance_metrics.record(
+            role, "excel_pass", time.perf_counter() - started
+        )
 
 
 def print_chain(sym):
@@ -1777,6 +1922,7 @@ async def display_loop():
     license_tick = 0
     while True:
         await asyncio.sleep(REFRESH)
+        render_started = time.perf_counter()
         # re-check license roughly every ~60s while running
         license_tick += 1
         if license_tick >= max(1, int(60 / max(REFRESH, 0.05))):
@@ -1788,11 +1934,39 @@ async def display_loop():
         if is_windows:
             for role in ROLE_ORDER:
                 write_to_excel(role)
+            render_seconds = time.perf_counter() - render_started
+            _performance_metrics.record("ALL", "render_cycle", render_seconds)
+            if render_seconds > REFRESH:
+                _performance_metrics.record(
+                    "ALL", "refresh_overrun", render_seconds - REFRESH
+                )
+            await flush_performance_metrics()
         else:
             os.system("clear")
             for sym in active_symbols():
                 print_chain(sym)
             print(f"Symbols {','.join(active_symbols())} | poll {POLL_GAP}s | Ctrl+C stop", flush=True)
+
+
+async def flush_performance_metrics():
+    global _last_performance_flush, _performance_log_error_shown
+    now = time.monotonic()
+    if now - _last_performance_flush < 30:
+        return
+    lines = _performance_metrics.summary_lines(now)
+    try:
+        await asyncio.to_thread(append_performance_summary, lines)
+    except OSError as e:
+        if not _performance_log_error_shown:
+            show_error(
+                "Could not append performance diagnostics to startup_diag.log.\n\n"
+                "Check that your user profile is writable and has free space.\n\n"
+                f"Details: {e}"
+            )
+            _performance_log_error_shown = True
+    else:
+        _performance_metrics.reset(now)
+        _last_performance_flush = now
 
 
 async def main_async():
@@ -1821,6 +1995,10 @@ async def main_async():
 
 
 def main():
+    try:
+        write_startup_diagnostics()
+    except OSError as e:
+        show_error(f"Could not write startup diagnostics:\n{e}")
     try:
         if not ensure_license():
             os._exit(1)

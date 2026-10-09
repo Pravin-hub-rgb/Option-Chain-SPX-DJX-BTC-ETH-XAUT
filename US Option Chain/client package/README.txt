@@ -26,8 +26,9 @@ if BigClawd is down.
  HOW TO USE
 ------------------------------------
  Option A — EXE (no Python needed):
-  1. Extract us-option-chain.zip
-  2. Double-click OptionChain.exe
+  1. Extract the complete OptionChain onedir folder if it is delivered in a ZIP.
+     Keep the _internal folder beside OptionChain.exe.
+  2. Double-click OptionChain.exe inside that folder.
   3. THREE Excel files open + live data
 
  Option B — source (Python installed):
@@ -44,6 +45,26 @@ if BigClawd is down.
  Rebuild EXE later:
 
   build_exe.bat
+
+  This builds an onedir client folder only. No ZIP is created unless requested.
+
+  Keep the _internal folder beside OptionChain.exe when running.
+
+Excel desktop is required (Excel for the web is not supported). The US tool
+uses xlwings/Excel COM; .NET for Excel-DNA XLLs is not a US tool prerequisite.
+
+Startup and performance diagnostics:
+  %LOCALAPPDATA%\USOptionChain\startup_diag.log
+Excel/COM tracebacks:
+  %LOCALAPPDATA%\USOptionChain\app.log
+Logs include workbook connection status and aggregate refresh, chain-build,
+Excel-write, formatting and missed-refresh timings. They do not record prices
+or strategy/leg contents and rotate at 1 MB.
+
+Read-only Excel add-in check:
+  powershell -NoProfile -ExecutionPolicy Bypass -File .\diagnose_excel_addins.ps1
+Writes a report to the Desktop. It checks common Excel OPEN entries and
+XLSTART files and never changes registry settings or disables add-ins.
 
 ------------------------------------
  CHANGE SYMBOL (stock file only)

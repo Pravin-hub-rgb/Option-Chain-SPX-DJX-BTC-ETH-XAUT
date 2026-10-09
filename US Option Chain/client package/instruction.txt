@@ -4,12 +4,23 @@
 
 NO PYTHON NEEDED (recommended):
 
-  1. Extract us-option-chain.zip
-  2. Double-click OptionChain.exe
-  3. THREE Excel files open + live data:
-       spx_option_chain.xlsx
-       djx_option_chain.xlsx
-       us_stock_option_chain.xlsx
+  1. Extract the complete OptionChain onedir folder if delivered in a ZIP
+  2. Keep the _internal folder beside OptionChain.exe
+  3. Double-click OptionChain.exe inside that folder
+  4. THREE Excel files open + live data
+
+  Until a release ZIP is requested, the build output is the complete
+  client package folder; no archive is created by the build script.
+
+  Startup/performance log:
+    %LOCALAPPDATA%\USOptionChain\startup_diag.log
+  Excel/COM exception log:
+    %LOCALAPPDATA%\USOptionChain\app.log
+  Read-only Excel add-in report:
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\diagnose_excel_addins.ps1
+
+The tool requires desktop Excel, not Excel for the web. It uses xlwings/Excel
+COM; .NET for Excel-DNA XLLs is not a US tool prerequisite.
 
 Or run from source (needs Python):
 
