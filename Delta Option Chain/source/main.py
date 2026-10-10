@@ -1746,12 +1746,22 @@ def _begin_excel_bulk_mode():
         try:
             # xlwings exposes calculation as a lowercase NAME
             # ("automatic" / "semiautomatic" / "manual"); the setter only
-            # accepts those names, and int() or a raw xl* constant both raise.
-            # Read the user's current mode, set manual, restore it afterwards.
-            import xlwings as _xw
-            current = str(app.calculation).strip().lower()
-            if current not in ("automatic", "semiautomatic", "manual"):
-                current = "automatic"
+            # accepts those names.
+            #
+            # Read it through the raw API on purpose. xlwings' own getter does
+            # calculation_i2s[self.xl.Calculation], and when Excel is busy or
+            # showing a modal it hands back an HRESULT instead of a valid
+            # xlCalculation value, so the lookup raises KeyError. That left bulk
+            # mode silently giving up on suspending recalculation.
+            try:
+                raw = int(app.api.Calculation)
+            except Exception:
+                raw = None
+            current = {
+                -4105: "automatic",   # xlCalculationAutomatic
+                2: "semiautomatic",   # xlCalculationSemiautomatic
+                -4135: "manual",      # xlCalculationManual
+            }.get(raw, "automatic")
             state["calc"] = current
             app.calculation = "manual"
         except Exception as e:
