@@ -2051,6 +2051,88 @@ def print_chain(sym):
         print()
 
 
+_app_cache = None
+
+
+def _begin_excel_bulk_mode():
+    """Suspend repaint + recalculation for the duration of one render cycle.
+
+    Every Excel write otherwise repaints the workbook and triggers a full
+    recalculation. That is cheap in an empty sheet but expensive when the user
+    has a strategy workbook open in the same Excel instance, which is where
+    refresh times blow up and where the "it feels slow" complaint comes from.
+
+    Returns a restore callable, or None if nothing could be changed. Failures
+    are expected and non-fatal: both settings raise if the user is mid-edit or
+    a dialog is up, and there may be no workbook to talk to yet.
+    """
+    state = {"app": None, "screen": None, "calc": None}
+    global _app_cache
+    try:
+        app = _app_cache
+        if app is None:
+            import xlwings as xw
+            apps = list(xw.apps)
+            if not apps:
+                return None
+            app = apps[0]
+            _app_cache = app
+        try:
+            # xlwings.App has no .name; .version is the cheap liveness probe
+            # that goes through to Excel and raises if the instance is gone.
+            _ = app.version
+        except Exception as e:
+            log_excel_exception("ALL", e, "cached Excel app went stale")
+            _app_cache = None
+            return None
+        state["app"] = app
+        try:
+            state["screen"] = bool(app.screen_updating)
+            app.screen_updating = False
+        except Exception as e:
+            log_excel_exception("ALL", e, "disabling screen_updating")
+            state["screen"] = None
+        try:
+            # Read the mode through the raw API on purpose. xlwings' own getter
+            # is calculation_i2s[self.xl.Calculation], and when Excel is busy or
+            # showing a modal it hands back an HRESULT instead of a valid
+            # xlCalculation value, so that lookup raises KeyError.
+            try:
+                raw = int(app.api.Calculation)
+            except Exception:
+                raw = None
+            current = {
+                -4105: "automatic",   # xlCalculationAutomatic
+                2: "semiautomatic",   # xlCalculationSemiautomatic
+                -4135: "manual",      # xlCalculationManual
+            }.get(raw, "automatic")
+            state["calc"] = current
+            app.calculation = "manual"
+        except Exception as e:
+            log_excel_exception("ALL", e, "switching to manual calculation")
+            state["calc"] = None
+    except Exception as e:
+        log_excel_exception("ALL", e, "entering bulk mode")
+        return None
+
+    def restore():
+        app = state.get("app")
+        if app is None:
+            return
+        if state.get("calc") is not None:
+            try:
+                app.calculation = state["calc"]
+            except Exception as e:
+                log_excel_exception("ALL", e, "restoring calculation mode")
+        if state.get("screen") is not None:
+            try:
+                app.screen_updating = state["screen"]
+            except Exception as e:
+                log_excel_exception("ALL", e, "restoring screen_updating")
+
+    return restore
+
+
 async def display_loop():
     is_windows = platform.system() == "Windows"
     license_tick = 0
@@ -2072,30 +2154,43 @@ async def display_loop():
             # and wait for the customer to reopen it. Previously the RPC failure
             # propagated and killed the EXE, after which nothing wrote at all.
             excel_alive = excel_process_running()
-            for role in ROLE_ORDER:
-                if not excel_alive:
-                    break
+            if excel_alive:
+                if _excel_gone_logged:
+                    # Excel came back. Everything cached about the sheets is now
+                    # wrong: the workbooks are freshly opened and their cells are
+                    # empty, so the payload/shape/format caches must be dropped
+                    # or the app would treat the blank sheets as "already
+                    # written" and leave them blank.
+                    _excel_gone_logged = False
+                    _block_payload.clear()
+                    _block_shape.clear()
+                    _sheet_fmt_done.clear()
+                    _usd_fmt_done.clear()
+                    _dropdown_sig.clear()
+                    print("Excel reopened - rewriting all sheets from scratch.", flush=True)
+
+                # One bulk-mode window around all three books rather than per
+                # book, so the customer's own workbook recalculates at most once
+                # per cycle instead of once per write.
+                restore = _begin_excel_bulk_mode()
                 try:
-                    write_to_excel(role)
-                except Exception as e:
-                    log_excel_exception(role, e, "render pass")
-            if not excel_alive and not _excel_gone_logged:
+                    for role in ROLE_ORDER:
+                        if not excel_process_running():
+                            break
+                        try:
+                            write_to_excel(role)
+                        except Exception as e:
+                            log_excel_exception(role, e, "render pass")
+                finally:
+                    if restore is not None:
+                        try:
+                            restore()
+                        except Exception as e:
+                            log_excel_exception("ALL", e, "leaving bulk mode")
+            elif not _excel_gone_logged:
                 _excel_gone_logged = True
                 print("Excel is not running - pausing writes until it is reopened.", flush=True)
                 _last_excel_exception.clear()
-            elif excel_alive and _excel_gone_logged:
-                # Excel came back. Everything cached about the sheets is now
-                # wrong: the workbooks are freshly opened and their cells are
-                # empty, so the payload/shape/format caches must be dropped or
-                # the app would treat the blank sheets as "already written" and
-                # leave them blank.
-                _excel_gone_logged = False
-                _block_payload.clear()
-                _block_shape.clear()
-                _sheet_fmt_done.clear()
-                _usd_fmt_done.clear()
-                _dropdown_sig.clear()
-                print("Excel reopened - rewriting all sheets from scratch.", flush=True)
             render_seconds = time.perf_counter() - render_started
             _performance_metrics.record("ALL", "render_cycle", render_seconds)
             if render_seconds > REFRESH:
