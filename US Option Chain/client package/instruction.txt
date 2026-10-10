@@ -114,8 +114,11 @@ DJX FILE (djx_option_chain):
 ------------------------------------
  STOP
 ------------------------------------
-   Close Excel or press Ctrl+C in terminal
-  (EXE: close Excel or end OptionChain
-   process from Task Manager)
+   Closing Excel only PAUSES the writes. The tool stays
+   running and carries on by itself as soon as you reopen
+   the workbooks.
+   To stop it for good, open Task Manager, find
+   OptionChain.exe and choose End task.
+   (Ctrl+C works only if you started it from a terminal)
 
 ====================================

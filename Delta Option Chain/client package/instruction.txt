@@ -82,7 +82,10 @@ Double-click  OptionChain.exe
 *  Once the BTC price in the top-left cell starts
    changing, everything is working.
 
-*  To stop: just close Excel.
+*  Closing Excel only PAUSES the writes. The tool stays
+   running and carries on by itself as soon as you reopen
+   the workbooks. To stop it for good, open Task Manager,
+   find OptionChain.exe and choose End task.
 
 
 ====================================
@@ -102,12 +105,14 @@ A: YES. Just start the tool and it attaches to the
    open sheets.
 
 Q: I closed Excel. How do I start again?
-A: Run OptionChain.exe again. No restart needed.
+A: Just reopen the workbooks. The tool never stopped - it waits
+   and refills them by itself within a few seconds. Only run
+   OptionChain.exe again if Excel is not already open.
 
 Q: Sheets are blank or show "--"?
 A: Wait 1-2 minutes first. Still blank after that?
-   Check the internet connection, close Excel, and
-   run OptionChain.exe again.
+   Check the internet connection, reopen the chain workbooks,
+   and give it another minute.
 
 Q: How often does the price change?
 A: The tool refreshes about once per second. The

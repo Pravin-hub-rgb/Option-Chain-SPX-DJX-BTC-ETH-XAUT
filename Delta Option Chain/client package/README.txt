@@ -6,10 +6,9 @@
    from DeltaOptionChain.zip anywhere on the laptop. If Windows marked the
    downloaded ZIP as blocked, right-click the ZIP, choose Properties, select
    Unblock if shown, then extract it before running the app.
-   Before extraction, support can provide DeltaOptionChain.zip.sha256;
-   verify the download in PowerShell with:
-   (Get-FileHash .\DeltaOptionChain.zip -Algorithm SHA256).Hash
-   Compare that value to the hash in DeltaOptionChain.zip.sha256.
+   Extract the WHOLE folder, not just OptionChain.exe. Do not extract into
+   OneDrive or a Desktop that syncs to the cloud - those can leave the
+   _internal folder as an empty placeholder and the app will not start.
 
 2. Microsoft Excel (desktop) should be installed
    The app uses Excel COM; Excel for the web is not sufficient. Delta's
@@ -17,15 +16,22 @@
 
 3. Double-click OptionChain.exe inside that folder.
    Keep the folder, including its _internal subfolder, together.
+   Starting another Delta copy from a different folder replaces the older
+   Delta process; it does not stop the separate US Option Chain tool.
 
 THAT'S IT!
 
 - btc_chain.xlsx, eth_chain.xlsx and xaut_chain.xlsx
   (BTC, ETH & Gold) open automatically
 - Live data starts updating within a few seconds
-- To stop: just close Excel (tool exits on its own)
+- To stop: closing Excel only PAUSES the writes. The tool keeps running and
+  carries on by itself the moment you reopen the workbooks. To stop it for
+  good, open Task Manager, find OptionChain.exe and choose End task.
 - Startup diagnostics are appended to:
   %LOCALAPPDATA%\DeltaOptionChain\startup_diag.log
+  The first line of every entry is build_id, which identifies this exact
+  build. Send this log with any support request and we can tell immediately
+  which version you are on.
   (includes Windows/Excel details, .NET release, Python/xlwings versions,
    whether the OptionChain process is running as administrator, and Excel
    workbook connection outcomes)
@@ -93,14 +99,24 @@ asks for the new key.
 "Windows protected your PC" message?
   Click "More info" -> "Run anyway"
 
+ "Failed to load Python DLL" or "_internal" missing?
+   The folder is incomplete, so the app cannot start. Delete the extracted
+   folder completely, extract the WHOLE ZIP again into a plain local folder
+   such as C:\OptionChain (not OneDrive, not a syncing Desktop), and make
+   sure OptionChain\_internal\python310.dll exists. Copying OptionChain.exe
+   on its own is never enough - the _internal folder must travel with it.
+
  Excel add-in popup or NorenLink XLL warning?
    Close Excel, run the read-only PowerShell command above, then send the
    Desktop report and exact popup text to support. Delta does not include
    or register NorenLink and will not disable add-ins from other software.
+   If the popup is your broker's add-in, dismiss it (No / OK) and reopen
+   Excel once; after that Excel stays running and Delta reuses it.
 
  Data not updating?
-   Check internet connection, close Excel,
-   and double-click OptionChain.exe again
+   The tool waits and reconnects on its own. Close Excel, reopen the
+   chain workbooks, and it refills within a few seconds. Only double-click
+   OptionChain.exe again if nothing happens after that.
 
 Excel shows an add-in or XLL warning?
   This Delta package uses xlwings/Excel COM and contains no NorenLink XLL.

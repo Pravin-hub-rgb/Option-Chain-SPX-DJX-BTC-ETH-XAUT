@@ -13,6 +13,15 @@ if errorlevel 1 (
 )
 echo EXITCODE=0 >> "%temp%\b_delta_final.log"
 > "dist\OptionChain\optionchain.product" echo delta
+REM Stamp the build so the tool can report which build it is. This replaces the
+REM separate .sha256 file that used to be shipped beside the ZIP: the customer
+REM could not download that from Drive, and could not act on it even if they
+REM could. Now they send startup_diag.log and support reads build_id from it.
+set "BUILD_SHA=local"
+for /f "delims=" %%i in ('git -C "%~dp0..\..\GIT-BACKUP" rev-parse --short HEAD 2^>nul') do set "BUILD_SHA=%%i"
+> "dist\OptionChain\build_info.txt" echo product=delta
+>> "dist\OptionChain\build_info.txt" echo build_sha=%BUILD_SHA%
+>> "dist\OptionChain\build_info.txt" echo build_date=%DATE% %TIME%
 copy /Y "*.xlsx" "dist\OptionChain\" >nul
 if errorlevel 1 exit /b 1
 copy /Y "config.json" "dist\OptionChain\" >nul

@@ -131,8 +131,32 @@ def _registry_diagnostics():
     return values, errors
 
 
+def _build_id():
+    """Identify this build, so support knows what the customer is running.
+
+    build_info.txt is written by build_final.bat next to the executable. It
+    replaces the separate .sha256 file that used to be delivered beside the
+    ZIP: customers could not fetch that from Drive, and even if they could it
+    told them nothing about which build they had. This is self-reported, so it
+    works whether or not anyone checks anything.
+    """
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    try:
+        with open(os.path.join(base, "build_info.txt"), encoding="utf-8") as handle:
+            parts = [line.strip() for line in handle if line.strip()]
+    except OSError:
+        return "not stamped (rebuilt outside build_final.bat)"
+    if not parts:
+        return "not stamped (build_info.txt was empty)"
+    return " ".join(parts)
+
+
 def _diagnostic_lines():
     data = {
+        "build_id": _build_id(),
         "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
         "platform": platform.platform(),
         "windows_release": platform.release(),

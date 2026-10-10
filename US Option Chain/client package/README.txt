@@ -25,30 +25,27 @@ if BigClawd is down.
 ------------------------------------
  HOW TO USE
 ------------------------------------
- Option A — EXE (no Python needed):
-  1. Extract the complete OptionChain onedir folder if it is delivered in a ZIP.
-     Keep the _internal folder beside OptionChain.exe.
-  2. Double-click OptionChain.exe inside that folder.
-  3. THREE Excel files open + live data
+   1. Extract the WHOLE OptionChain folder if it is delivered in a ZIP.
+      Keep the _internal folder beside OptionChain.exe. Do not extract into
+      OneDrive or a syncing Desktop - those can leave _internal as an empty
+      placeholder and the app will not start.
+   2. Double-click OptionChain.exe inside that folder.
+   3. THREE Excel files open + live data
+      Starting another US copy from a different folder replaces the older
+      US process; it does not stop the separate Delta Option Chain tool.
 
- Option B — source (Python installed):
-  1. Run:  python main.py
-  2. All xlsx files auto-open
-  3. SPX file: always SPX
-     DJX file: always DJX
-  4. Stock file: type ticker in K1
-     (label Symbol in J1)
-     AAPL -> QQQ -> MSFT -> any US stock
-  5. Blocks update automatically
-  6. Close Excel / Ctrl+C to stop
+   Stopping:
+      Closing Excel only PAUSES the writes. The tool keeps running and
+      carries on by itself when you reopen the workbooks. To stop it for
+      good, open Task Manager, find OptionChain.exe and choose End task.
 
- Rebuild EXE later:
+   Identifying your build:
+      The first line of every entry in
+      %LOCALAPPDATA%\USOptionChain\startup_diag.log is build_id.
+      Send that log with any support request and we can tell immediately
+      which version you are on.
 
-  build_exe.bat
-
-  This builds an onedir client folder only. No ZIP is created unless requested.
-
-  Keep the _internal folder beside OptionChain.exe when running.
+------------------------------------
 
 Excel desktop is required (Excel for the web is not supported). The US tool
 uses xlwings/Excel COM; .NET for Excel-DNA XLLs is not a US tool prerequisite.
