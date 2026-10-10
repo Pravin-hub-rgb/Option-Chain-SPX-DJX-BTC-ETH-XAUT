@@ -1738,8 +1738,15 @@ def _begin_excel_bulk_mode():
             return None
         state["app"] = app
         try:
-            state["screen"] = bool(app.screen_updating)
-            app.screen_updating = False
+            if app.screen_updating:
+                state["screen"] = True
+                app.screen_updating = False
+            else:
+                # Already off: the customer turned it off, or the other Option
+                # Chain tool has it off for its own write window. Leave it and
+                # do not record it, or we would "restore" the other tool's
+                # temporary setting and leave the customer's Excel hidden.
+                state["screen"] = None
         except Exception as e:
             log_excel_exception("ALL", e, "disabling screen_updating")
             state["screen"] = None
@@ -1751,8 +1758,7 @@ def _begin_excel_bulk_mode():
             # Read it through the raw API on purpose. xlwings' own getter does
             # calculation_i2s[self.xl.Calculation], and when Excel is busy or
             # showing a modal it hands back an HRESULT instead of a valid
-            # xlCalculation value, so the lookup raises KeyError. That left bulk
-            # mode silently giving up on suspending recalculation.
+            # xlCalculation value, so the lookup raises KeyError.
             try:
                 raw = int(app.api.Calculation)
             except Exception:
@@ -1761,9 +1767,17 @@ def _begin_excel_bulk_mode():
                 -4105: "automatic",   # xlCalculationAutomatic
                 2: "semiautomatic",   # xlCalculationSemiautomatic
                 -4135: "manual",      # xlCalculationManual
-            }.get(raw, "automatic")
-            state["calc"] = current
-            app.calculation = "manual"
+            }.get(raw)
+            if current == "manual":
+                # Already manual: either the customer wants that, or the other
+                # Option Chain tool set it for its own write window. Either way,
+                # leave it alone and do not record it for restore -- recording it
+                # would "restore" the other tool's temporary setting and leave
+                # the customer's Excel stuck on manual calculation.
+                state["calc"] = None
+            else:
+                state["calc"] = current or "automatic"
+                app.calculation = "manual"
         except Exception as e:
             log_excel_exception("ALL", e, "switching to manual calculation")
             state["calc"] = None
