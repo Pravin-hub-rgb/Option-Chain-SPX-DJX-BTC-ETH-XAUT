@@ -22,6 +22,8 @@ if errorlevel 1 (
 set "PKG=..\client package"
 if not exist "%PKG%" mkdir "%PKG%"
 
+> "dist\OptionChain\optionchain.product" echo us
+
 rem Excel templates (also auto-created at runtime, but ship pre-built)
 python -c "import main; main.ensure_excel_file('spx'); main.ensure_excel_file('djx'); main.ensure_excel_file('stock')"
 if exist "spx_option_chain.xlsx" copy /y "spx_option_chain.xlsx" "%PKG%\" >nul

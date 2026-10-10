@@ -12,6 +12,7 @@ if errorlevel 1 (
   exit /b 1
 )
 echo EXITCODE=0 >> "%temp%\b_delta_final.log"
+> "dist\OptionChain\optionchain.product" echo delta
 copy /Y "*.xlsx" "dist\OptionChain\" >nul
 if errorlevel 1 exit /b 1
 copy /Y "config.json" "dist\OptionChain\" >nul

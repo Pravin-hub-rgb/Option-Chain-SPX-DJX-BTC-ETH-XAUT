@@ -34,6 +34,7 @@ from us_diagnostics import (
     write_startup_diagnostics,
 )
 from us_performance import PerformanceMetrics, itm_color_ranges
+from product_identity import identify_product_directory
 
 BASE_DIR = config.base_dir()
 cfg = config.load_config()
@@ -2198,9 +2199,8 @@ def _process_image_path(kernel32, pid):
 def kill_previous_instances():
     """Stop an older copy of *this* tool so a double-click takes over cleanly.
 
-    Both tools ship an executable called OptionChain.exe, so matching on the
-    process name alone would make one tool kill the other. Only processes
-    running from this tool's own folder are stopped.
+    Both products use OptionChain.exe. Identify the product by its package
+    marker or, for legacy installs, by its complete workbook set.
 
     Never let this break startup: any failure is logged and ignored.
     """
@@ -2214,6 +2214,12 @@ def kill_previous_instances():
         TH32CS_SNAPPROCESS = 0x2
         my_pid = os.getpid()
         my_dir = os.path.normcase(os.path.abspath(BASE_DIR))
+        my_product = identify_product_directory(BASE_DIR)
+        if my_product is None:
+            _instance_guard_log(
+                f"pid={my_pid} dir={my_dir} product unknown; leaving other instances alone"
+            )
+            return
 
         class PROCESSENTRY32(ctypes.Structure):
             _fields_ = [
@@ -2248,7 +2254,8 @@ def kill_previous_instances():
 
         others = [pid for pid in matches if pid != my_pid]
         _instance_guard_log(
-            f"pid={my_pid} dir={my_dir} matched={matches} others={others}"
+            f"pid={my_pid} product={my_product} dir={my_dir} "
+            f"matched={matches} others={others}"
         )
 
         for pid in others:
@@ -2257,15 +2264,21 @@ def kill_previous_instances():
                 _instance_guard_log(f"  pid={pid} path unreadable, left alone")
                 continue
             other_dir = os.path.normcase(os.path.dirname(os.path.abspath(path)))
-            if other_dir != my_dir:
-                # A different tool that happens to share the file name.
-                _instance_guard_log(f"  pid={pid} other tool at {other_dir}, left alone")
+            other_product = identify_product_directory(other_dir)
+            if other_product != my_product:
+                _instance_guard_log(
+                    f"  pid={pid} product={other_product or 'unknown'} "
+                    f"at {other_dir}, left alone"
+                )
                 continue
             h = kernel32.OpenProcess(0x0001, False, pid)
             if h:
                 kernel32.TerminateProcess(h, 1)
                 kernel32.CloseHandle(h)
-                _instance_guard_log(f"  pid={pid} stopped, this launch takes over")
+                _instance_guard_log(
+                    f"  pid={pid} product={other_product} at {other_dir}, "
+                    "stopped; this launch takes over"
+                )
     except Exception as e:  # never block startup on this
         _instance_guard_log(f"guard error: {type(e).__name__}: {e}")
 
