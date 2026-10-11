@@ -1530,7 +1530,14 @@ def _write_to_excel(asset):
             if held is not None:
                 show_status(held, asset, "WAITING", message)
             if apps_count > 0:
-                notice_workbook_missing(fname)
+                # Only tell the customer about a workbook we HAD working and
+                # have now lost. While Excel is starting, or right after a
+                # restart, Excel is up before the workbooks are, and a message
+                # then is simply wrong -- it fired on a machine that was
+                # opening them perfectly normally. If it never connected, the
+                # window title stays as the plain file name, which is the tell.
+                if excel_connected[asset]:
+                    notice_workbook_missing(fname)
                 return
             if excel_connected[asset]:
                 # Excel was connected and is now gone (closed by the customer,
