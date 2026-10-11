@@ -26,6 +26,7 @@ from startup_diagnostics import (
     append_app_exception,
     append_connection_event,
     append_performance_summary,
+    build_id,
     write_startup_diagnostics,
 )
 
@@ -1183,9 +1184,11 @@ async def date_loader():
 
 
 excel_fail_since = {"BTC": None, "ETH": None, "XAUT": None}
+excel_fail_notice_shown = {"BTC": False, "ETH": False, "XAUT": False}
 excel_connected = {"BTC": False, "ETH": False, "XAUT": False}
 excel_miss_counts = {"BTC": 0, "ETH": 0, "XAUT": 0}
 excel_first_attempt = {"BTC": None, "ETH": None, "XAUT": None}
+excel_startup_notice_shown = {"BTC": False, "ETH": False, "XAUT": False}
 
 
 def excel_apps_count(xw):
@@ -1374,6 +1377,47 @@ def setup_expiry_dropdown(sheet, asset):
             log_excel_exception(asset, e, f"applying expiry dropdown to {cell}")
 
 
+_last_window_status = {}
+_SHORT_BUILD = None
+
+
+def _short_build():
+    """Just the sha, so the status line stays short enough for a title bar."""
+    global _SHORT_BUILD
+    if _SHORT_BUILD is None:
+        raw = str(build_id())
+        for token in raw.split():
+            if token.startswith("build_sha="):
+                _SHORT_BUILD = token.split("=", 1)[1]
+                break
+        else:
+            _SHORT_BUILD = "unstamped"
+    return _SHORT_BUILD
+
+
+def show_status(book, asset, status, detail=""):
+    """Put the tool's health where the user can see it without asking for anything.
+
+    The customer is not technical and does not read logs. Support works by
+    screen-sharing, so the one thing guaranteed to be on screen is this
+    workbook's own title bar. It carries the build and a plain-language status,
+    which is enough to tell a working tool from a broken one and to name the
+    build, without the customer having to do anything at all.
+
+    Only written when the text actually changes, so it costs nothing per cycle.
+    """
+    stamp = time.strftime("%H:%M:%S")
+    title = f"{asset}  |  Option Chain {_short_build()}  |  {status}  {stamp}"
+    key = id(book)
+    if _last_window_status.get(key) == title:
+        return
+    _last_window_status[key] = title
+    try:
+        book.api.Windows(1).Caption = title
+    except Exception as e:
+        log_excel_exception(asset, e, "setting window status")
+
+
 def excel_environment_detail(book):
     """Excel version and bitness, for diagnosing machine-specific failures.
 
@@ -1475,6 +1519,16 @@ def _write_to_excel(asset):
                 else "excel_not_found"
             )
             record_excel_connection(asset, status, f"expected_workbook={fname}")
+            # No book means no window to retitle, so surface the state on any
+            # window we still hold, and say it in plain words.
+            held = _book_sheet_cache.get(asset)
+            message = (
+                f"OPEN {os.path.basename(fname)}"
+                if apps_count > 0
+                else "EXCEL IS CLOSED - reopen it"
+            )
+            if held is not None:
+                show_status(held, asset, "WAITING", message)
             if apps_count > 0:
                 notice_workbook_missing(fname)
                 return
@@ -1494,15 +1548,21 @@ def _write_to_excel(asset):
             if excel_first_attempt[asset] is None:
                 excel_first_attempt[asset] = time.time()
             elif time.time() - excel_first_attempt[asset] > 90:
-                show_error(
-                    "Could not connect to Microsoft Excel.\n\n"
-                    "Please run OptionChain.exe again."
-                )
-                os._exit(1)
+                if not excel_startup_notice_shown.get(asset):
+                    excel_startup_notice_shown[asset] = True
+                    show_error(
+                        "Microsoft Excel is taking a long time to appear.\n\n"
+                        "The tool is still running and will start as soon as\n"
+                        "Excel is open with the chain workbooks.\n\n"
+                        "Open Excel and the three workbook files, then leave\n"
+                        "them open. No need to run anything else."
+                    )
             return
         excel_miss_counts[asset] = 0
         clear_workbook_missing_notice(fname)
         excel_connected[asset] = True
+        excel_startup_notice_shown[asset] = False
+        show_status(book, asset, "LIVE")
         record_excel_connection(asset, "connected", f"workbook={fname}; {excel_environment_detail(book)}")
         sheet = cached_sheet
         if sheet is None:
@@ -1685,6 +1745,7 @@ def _write_to_excel(asset):
                 _last_rows[(asset, bi)] = 0
 
         excel_fail_since[asset] = None
+        excel_fail_notice_shown[asset] = False
 
     except Exception as e:
         print(f"Excel error ({asset}): {e}", flush=True)
@@ -1697,13 +1758,15 @@ def _write_to_excel(asset):
         now = time.time()
         if excel_fail_since[asset] is None:
             excel_fail_since[asset] = now
-        elif now - excel_fail_since[asset] > 30:
+        elif now - excel_fail_since[asset] > 30 and not excel_fail_notice_shown[asset]:
+            excel_fail_notice_shown[asset] = True
             show_error(
                 "Lost connection to Microsoft Excel.\n\n"
-                "Please run OptionChain.exe again.\n\n"
+                "The tool is still running and will keep trying on its own.\n"
+                "To resume now: close Excel, reopen the chain workbooks,\n"
+                "and leave Excel open for a few seconds.\n\n"
                 "Details: " + str(e)
             )
-            os._exit(1)
 
 
 def _begin_excel_bulk_mode():

@@ -31,6 +31,7 @@ from us_diagnostics import (
     append_connection_event,
     excel_process_details,
     append_performance_summary,
+    build_id,
     write_startup_diagnostics,
 )
 from us_performance import PerformanceMetrics, itm_color_ranges
@@ -1379,6 +1380,48 @@ def build_option_chain(sym, expiry, range_val=50):
 excel_connected = {r: False for r in ROLE_ORDER}
 excel_miss_counts = {r: 0 for r in ROLE_ORDER}
 excel_first_attempt = {r: None for r in ROLE_ORDER}
+_excel_startup_notice_shown = {r: False for r in ROLE_ORDER}
+
+
+_last_window_status = {}
+_SHORT_BUILD = None
+
+
+def _short_build():
+    """Just the sha, so the status line stays short enough for a title bar."""
+    global _SHORT_BUILD
+    if _SHORT_BUILD is None:
+        raw = str(build_id())
+        for token in raw.split():
+            if token.startswith("build_sha="):
+                _SHORT_BUILD = token.split("=", 1)[1]
+                break
+        else:
+            _SHORT_BUILD = "unstamped"
+    return _SHORT_BUILD
+
+
+def show_status(book, role, status, detail=""):
+    """Put the tool's health where the user can see it without asking for anything.
+
+    The customer is not technical and does not read logs. Support works by
+    screen-sharing, so the one thing guaranteed to be on screen is this
+    workbook's own title bar. It carries the build and a plain-language status,
+    which is enough to tell a working tool from a broken one and to name the
+    build, without the customer having to do anything at all.
+
+    Only written when the text actually changes, so it costs nothing per cycle.
+    """
+    stamp = time.strftime("%H:%M:%S")
+    title = f"{role.upper()}  |  Option Chain {_short_build()}  |  {status}  {stamp}"
+    key = id(book)
+    if _last_window_status.get(key) == title:
+        return
+    _last_window_status[key] = title
+    try:
+        book.api.Windows(1).Caption = title
+    except Exception as e:
+        log_excel_exception(role, e, "setting window status")
 
 
 def excel_apps_count(xw):
@@ -1797,6 +1840,11 @@ def _write_to_excel(role):
                 else "excel_not_found"
             )
             record_excel_connection(role, status, f"expected_workbook={path}")
+            message = (
+                f"OPEN {os.path.basename(path)}"
+                if apps_count > 0
+                else "EXCEL IS CLOSED - reopen it"
+            )
             if apps_count > 0:
                 notice_workbook_missing(path)
                 return
@@ -1815,15 +1863,21 @@ def _write_to_excel(role):
             if excel_first_attempt[role] is None:
                 excel_first_attempt[role] = time.time()
             elif time.time() - excel_first_attempt[role] > 90:
-                show_error(
-                    "Could not connect to Microsoft Excel.\n\n"
-                    "Please run OptionChain.exe again."
-                )
-                os._exit(1)
+                if not _excel_startup_notice_shown.get(role):
+                    _excel_startup_notice_shown[role] = True
+                    show_error(
+                        "Microsoft Excel is taking a long time to appear.\n\n"
+                        "The tool is still running and will start as soon as\n"
+                        "Excel is open with the chain workbooks.\n\n"
+                        "Open Excel and the three workbook files, then leave\n"
+                        "them open. No need to run anything else."
+                    )
             return
         excel_miss_counts[role] = 0
         clear_workbook_missing_notice(path)
         excel_connected[role] = True
+        _excel_startup_notice_shown[role] = False
+        show_status(book, role, "LIVE")
         try:
             excel_info = (
                 f"; excel_version={book.app.api.Version}"

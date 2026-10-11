@@ -154,6 +154,11 @@ def _build_id():
     return " ".join(parts)
 
 
+def build_id():
+    """Public accessor for the build stamp, used for the window title."""
+    return _build_id()
+
+
 def _diagnostic_lines():
     data = {
         "build_id": _build_id(),
