@@ -10,6 +10,7 @@ Shared cache by symbol; one process drives all books.
 """
 
 import asyncio
+import atexit
 import calendar
 import hashlib
 import hmac
@@ -26,6 +27,7 @@ import pandas as pd
 import requests
 
 import config
+import calc_mode_guard
 from us_diagnostics import (
     append_app_exception,
     append_connection_event,
@@ -38,6 +40,14 @@ from us_performance import PerformanceMetrics, itm_color_ranges
 from product_identity import identify_product_directory
 
 BASE_DIR = config.base_dir()
+
+# Identifies this tool inside the shared calculation-mode record, so US and
+# the Delta tool running together in one Excel instance do not fight over it.
+PRODUCT_ID = "us"
+
+# The most recent bulk-mode restore callable, so an exit path that never
+# reaches the render loop's finally can still put Excel back.
+_last_bulk_restore = None
 cfg = config.load_config()
 
 POLL_GAP = float(cfg.get("poll_gap_seconds", 2))
@@ -2183,6 +2193,11 @@ def _begin_excel_bulk_mode():
                 state["calc"] = None
             else:
                 state["calc"] = current or "automatic"
+                # Written BEFORE Excel is changed. If this process dies inside
+                # the window, the next launch finds the record and puts Excel
+                # back, instead of leaving their formulas silently dead.
+                calc_mode_guard.acquire(state["calc"], PRODUCT_ID)
+                state["calc_guarded"] = True
                 app.calculation = "manual"
         except Exception as e:
             log_excel_exception("ALL", e, "switching to manual calculation")
@@ -2200,12 +2215,19 @@ def _begin_excel_bulk_mode():
                 app.calculation = state["calc"]
             except Exception as e:
                 log_excel_exception("ALL", e, "restoring calculation mode")
+        if state.get("calc_guarded"):
+            # Only drop our claim once Excel has actually been put back.
+            try:
+                calc_mode_guard.release(PRODUCT_ID)
+            except Exception as e:
+                log_excel_exception("ALL", e, "releasing calculation guard")
         if state.get("screen") is not None:
             try:
                 app.screen_updating = state["screen"]
             except Exception as e:
                 log_excel_exception("ALL", e, "restoring screen_updating")
 
+    _last_bulk_restore = restore
     return restore
 
 
@@ -2453,11 +2475,61 @@ def kill_previous_instances():
     except Exception as e:  # never block startup on this
         _instance_guard_log(f"guard error: {type(e).__name__}: {e}")
 
+def recover_calc_mode():
+    """Put Excel back on automatic if a previous run died mid-write-window.
+
+    A crash, a kill from Task Manager or a power cut while calculation was
+    suspended would otherwise leave the customer's formulas silently stopped.
+    The record is consulted first; Excel's current mode is only read if there
+    is something to undo.
+    """
+    should, mode, reason = calc_mode_guard.pending_recovery()
+    if not should:
+        return False
+    if reason:
+        print(f"  calculation-mode record found: {reason}", flush=True)
+    try:
+        import xlwings as xw
+
+        apps = list(xw.apps)
+        if not apps:
+            calc_mode_guard.clear_record()
+            return False
+        app = apps[0]
+        if int(app.api.Calculation) != calc_mode_guard.XL_MANUAL:
+            # Excel is not on manual, so there is nothing to undo. Clear the
+            # record rather than touching a mode the customer may have set.
+            calc_mode_guard.clear_record()
+            return False
+        app.calculation = mode or "automatic"
+        calc_mode_guard.clear_record()
+        print(f"  restored Excel calculation to {mode or 'automatic'}", flush=True)
+        return True
+    except Exception as e:
+        print(f"  could not restore calculation mode: {e}", flush=True)
+        return False
+
+
+def _emergency_restore():
+    """Last-ditch restore on a clean exit, in case a cycle never finished."""
+    restore = _last_bulk_restore
+    if restore is None:
+        return
+    try:
+        restore()
+    except Exception:
+        pass
+
+
+atexit.register(_emergency_restore)
+
+
 def main():
     try:
         write_startup_diagnostics()
     except OSError as e:
         show_error(f"Could not write startup diagnostics:\n{e}")
+    recover_calc_mode()
     kill_previous_instances()
     try:
         if not ensure_license():
@@ -2465,6 +2537,8 @@ def main():
         asyncio.run(main_async())
     except KeyboardInterrupt:
         pass
+    finally:
+        _emergency_restore()
 
 
 if __name__ == "__main__":
