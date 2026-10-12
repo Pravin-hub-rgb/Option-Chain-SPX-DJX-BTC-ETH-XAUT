@@ -2420,6 +2420,10 @@ async def main_async():
     for sym in active_symbols():
         ensure_sym_state(sym)
     open_excel_files()
+    # After opening the workbooks, not before: at process start xw.apps can be
+    # empty even though Excel is already running, and recovery then gave up and
+    # discarded the record while leaving Excel stuck on manual.
+    recover_calc_mode()
     errs = []
     for sym in active_symbols():
         try:
@@ -2571,10 +2575,18 @@ def recover_calc_mode():
     try:
         import xlwings as xw
 
-        apps = list(xw.apps)
+        apps = []
+        for _ in range(10):
+            try:
+                apps = list(xw.apps)
+            except Exception:
+                apps = []
+            if apps:
+                break
+            time.sleep(0.5)
         if not apps:
-            calc_mode_guard.clear_record()
-            return False
+            print("  calc recovery: no Excel instance reachable", flush=True)
+            return False          # keep the record so a later launch can retry
         app = apps[0]
         if int(app.api.Calculation) != calc_mode_guard.XL_MANUAL:
             # Excel is not on manual, so there is nothing to undo. Clear the
@@ -2609,7 +2621,6 @@ def main():
         write_startup_diagnostics()
     except OSError as e:
         show_error(f"Could not write startup diagnostics:\n{e}")
-    recover_calc_mode()
     kill_previous_instances()
     try:
         if not ensure_license():

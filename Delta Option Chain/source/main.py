@@ -2216,6 +2216,11 @@ def init_asset(asset):
 
 async def main_async():
     open_excel_files()
+    # After opening the workbooks, not before. At process start xw.apps can be
+    # empty even though the customer's Excel is already running, and the
+    # recovery was then giving up and discarding the record while leaving Excel
+    # stuck on manual calculation.
+    recover_calc_mode()
     try:
         init_asset("BTC")
         init_asset("ETH")
@@ -2366,20 +2371,31 @@ def recover_calc_mode():
     """
     should, mode, reason = calc_mode_guard.pending_recovery()
     if not should:
+        if reason:
+            print(f"  calc recovery not needed: {reason}", flush=True)
         return False
-    if reason:
-        print(f"  calculation-mode record found: {reason}", flush=True)
+    print(f"  calculation-mode record found: {reason}", flush=True)
     try:
         import xlwings as xw
 
-        apps = list(xw.apps)
+        # Retry briefly: Excel is often still registering itself in the running
+        # object table immediately after the workbooks are opened.
+        apps = []
+        for _ in range(10):
+            try:
+                apps = list(xw.apps)
+            except Exception:
+                apps = []
+            if apps:
+                break
+            time.sleep(0.5)
         if not apps:
-            calc_mode_guard.clear_record()
-            return False
+            print("  calc recovery: no Excel instance reachable", flush=True)
+            return False          # keep the record so a later launch can retry
         app = apps[0]
-        if int(app.api.Calculation) != calc_mode_guard.XL_MANUAL:
-            # Excel is not on manual, so there is nothing to undo. Clear the
-            # record rather than touching a mode the customer may have set.
+        raw = int(app.api.Calculation)
+        if raw != calc_mode_guard.XL_MANUAL:
+            print(f"  calc recovery: Excel is not on manual (raw={raw})", flush=True)
             calc_mode_guard.clear_record()
             return False
         app.calculation = mode or "automatic"
@@ -2410,7 +2426,6 @@ def main():
         write_startup_diagnostics()
     except OSError as e:
         show_error(f"Could not write startup diagnostics:\n{e}")
-    recover_calc_mode()
     kill_previous_instances()
     if not ensure_license():
         os._exit(1)
