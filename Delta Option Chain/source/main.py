@@ -46,6 +46,7 @@ import websockets
 
 import config
 import calc_mode_guard
+import trader_controls
 from performance_metrics import PerformanceMetrics
 from product_identity import identify_product_directory
 
@@ -58,6 +59,11 @@ PRODUCT_ID = "delta"
 # The most recent bulk-mode restore callable, so an exit path that never
 # reaches render_cycle's finally can still put Excel back.
 _last_bulk_restore = None
+
+# Trader controls read from the sheet: pause and minimum interval.
+_paused = False
+_min_refresh = trader_controls.DEFAULT_REFRESH
+_control_label_cache = {}
 
 REST_BASE = "https://api.india.delta.exchange"
 
@@ -1947,6 +1953,32 @@ def render_cycle():
     recalculation suspended, then one restore.
     """
     started = time.perf_counter()
+
+    # Read the trader's controls once, from the first book we can reach.
+    # Every book carries the controls, and any of them can pause. The trader
+    # should not have to know which workbook owns them.
+    paused = False
+    slowest = trader_controls.DEFAULT_REFRESH
+    for asset in ("BTC", "ETH", "XAUT"):
+        sheet = _sheet_cache.get(asset)
+        if sheet is None:
+            continue
+        try:
+            trader_controls.apply_labels(sheet, _control_label_cache)
+            book_paused, book_refresh = trader_controls.read_controls(sheet)
+            paused = paused or book_paused
+            slowest = max(slowest, book_refresh)
+        except Exception as e:
+            log_excel_exception(asset, e, "reading trader controls")
+    global _min_refresh
+    if _min_refresh < slowest:
+        _min_refresh = slowest
+
+    if paused:
+        _set_paused_status(True)
+        _performance_metrics.record("ALL", "render_cycle", time.perf_counter() - started)
+        return
+
     restore = _begin_excel_bulk_mode()
     try:
         for asset in ("BTC", "ETH", "XAUT"):
@@ -1959,6 +1991,30 @@ def render_cycle():
                 log_excel_exception("ALL", e, "leaving bulk mode")
         elapsed = time.perf_counter() - started
         _performance_metrics.record("ALL", "render_cycle", elapsed)
+
+
+def _set_paused_status(paused):
+    """Show PAUSED in each window title and in the sheet header, once."""
+    global _paused
+    text = trader_controls.describe(True, _min_refresh)
+    if _paused == paused:
+        return
+    _paused = paused
+    for asset in ("BTC", "ETH", "XAUT"):
+        book = _book_sheet_cache.get(asset)
+        if book is not None:
+            try:
+                show_status(book, asset, "PAUSED")
+            except Exception as e:
+                log_excel_exception(asset, e, "showing paused status")
+        sheet = _sheet_cache.get(asset)
+        if sheet is not None:
+            try:
+                col_l = get_column_letter(BLOCK_COLS[0]["start"])
+                sheet.range((1, 1 + BLOCK_COLS[0]["start"] - 1)).value = text
+            except Exception as e:
+                log_excel_exception(asset, e, "showing paused header")
+    return paused
 
 
 async def flush_performance_metrics():
@@ -2047,8 +2103,16 @@ async def display_loop():
         # Sleep AFTER the work, for at least as long as the work took, so a
         # heavy workbook open alongside the chain always leaves Excel idle for
         # an equal stretch and stays usable for building a strategy.
+        #
+        # The trader's I1 cell sets a floor, never a ceiling: they can slow the
+        # refresh down, but the backoff can still push it higher if Excel
+        # needs longer than they asked for.
         await asyncio.sleep(
-            max(float(refresh), time.perf_counter() - render_started)
+            max(
+                float(refresh),
+                _min_refresh,
+                time.perf_counter() - render_started,
+            )
         )
 
 

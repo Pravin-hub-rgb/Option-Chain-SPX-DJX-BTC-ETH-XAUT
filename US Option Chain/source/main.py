@@ -28,6 +28,7 @@ import requests
 
 import config
 import calc_mode_guard
+import trader_controls
 from us_diagnostics import (
     append_app_exception,
     append_connection_event,
@@ -48,6 +49,11 @@ PRODUCT_ID = "us"
 # The most recent bulk-mode restore callable, so an exit path that never
 # reaches the render loop's finally can still put Excel back.
 _last_bulk_restore = None
+
+# Trader controls read from the sheet: pause and minimum interval.
+_paused = False
+_min_refresh = trader_controls.DEFAULT_REFRESH
+_control_label_cache = {}
 cfg = config.load_config()
 
 POLL_GAP = float(cfg.get("poll_gap_seconds", 2))
@@ -2254,6 +2260,26 @@ def _begin_excel_bulk_mode():
     return restore
 
 
+def _set_paused_status(paused):
+    """Show PAUSED on every book, once per change."""
+    global _paused
+    if _paused == paused:
+        return
+    _paused = paused
+    text = trader_controls.describe(True, _min_refresh)
+    try:
+        import xlwings as _xw
+
+        for role in ROLE_ORDER:
+            book = find_open_book(_xw, excel_path(role))
+            if book is None:
+                continue
+            show_status(book, role, "PAUSED")
+            book.sheets[0].range("A1").value = text
+    except Exception as e:
+        log_excel_exception("ALL", e, "showing paused status")
+
+
 async def display_loop():
     is_windows = platform.system() == "Windows"
     license_tick = 0
@@ -2292,12 +2318,44 @@ async def display_loop():
                 # One bulk-mode window around all three books rather than per
                 # book, so the customer's own workbook recalculates at most once
                 # per cycle instead of once per write.
-                restore = _begin_excel_bulk_mode()
+                # Read the trader's controls once, from the first book we can
+                # reach, before deciding whether to write anything at all.
+                try:
+                    import xlwings as _xw
+                except ImportError:
+                    _xw = None
+                # Every book carries the controls, and any of them can pause.
+                # The trader should not have to know which workbook is the
+                # "real" one for the controls to work.
+                paused = False
+                slowest = trader_controls.DEFAULT_REFRESH
+                for role in ROLE_ORDER:
+                    try:
+                        if _xw is None:
+                            break
+                        book = find_open_book(_xw, excel_path(role))
+                        if book is None:
+                            continue
+                        sheet = book.sheets[0]
+                        trader_controls.apply_labels(sheet, _control_label_cache)
+                        book_paused, book_refresh = trader_controls.read_controls(sheet)
+                        paused = paused or book_paused
+                        slowest = max(slowest, book_refresh)
+                    except Exception as e:
+                        log_excel_exception(role, e, "reading trader controls")
+                global _min_refresh
+                if _min_refresh < slowest:
+                    _min_refresh = slowest
+
+                restore = None if paused else _begin_excel_bulk_mode()
                 try:
                     for role in ROLE_ORDER:
                         if not excel_process_running():
                             break
                         try:
+                            if paused:
+                                _set_paused_status(True)
+                                continue
                             write_to_excel(role)
                         except Exception as e:
                             log_excel_exception(role, e, "render pass")
