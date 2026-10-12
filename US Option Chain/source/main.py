@@ -1226,7 +1226,6 @@ async def expiry_roller():
                     # payload/shape must go or the new expiry's first write and
                     # recolour would be skipped as "unchanged".
                     _block_payload.clear()
-                    _block_shape.clear()
                     # write back to every open book currently showing this symbol
                     try:
                         import xlwings as xw
@@ -1268,7 +1267,6 @@ async def process_pending_dates():
                 # cached payload/shape or the first write and the first recolour
                 # of the new expiry would be suppressed.
                 _block_payload.clear()
-                _block_shape.clear()
                 print(f"[{sym}] pinned block {i + 1} -> {parsed}", flush=True)
             except Exception as e:
                 print(f"Date pin error ({sym} {parsed}): {e}", flush=True)
@@ -1600,9 +1598,12 @@ _usd_fmt_done = set()
 # expensive call in the render loop, and between ticks most rows are unchanged,
 # so an unchanged chain is skipped entirely rather than rewritten.
 _block_payload = {}
-# Per (role, block) shape signature, so ATM/ITM recolouring and number
-# formatting only run when the strike ladder actually changes.
-_block_shape = {}
+# Rows this block used on its previous cycle, so a shrink can clear exactly
+# what was there instead of wiping a fixed block of rows every tick.
+_last_rows = {}
+# How far below the live table to sweep the first time we see a block in this
+# run, to catch anything an earlier run left behind. Paid once per block.
+_FIRST_SIGHT_BOUND = 300
 _performance_metrics = PerformanceMetrics()
 _last_performance_flush = time.monotonic()
 _performance_log_error_shown = False
@@ -1935,7 +1936,6 @@ def _write_to_excel(role):
             # payload and shape signatures from the old one must not suppress
             # the first write or the first recolour.
             _block_payload.clear()
-            _block_shape.clear()
             _refetch_now = True
             ensure_sym_state(new_sym)
             for cell in ("D3", "O3", "Z3"):
@@ -2040,26 +2040,52 @@ def _write_to_excel(role):
                         rows=n_rows,
                     )
 
-                # clear stale rows below (fixes A2 shrink leaving old data)
-                if n_rows < 200:
-                    stale_a = f"{get_column_letter(c0)}{5 + n_rows}:{get_column_letter(c0 + 8)}2000"
+                # Clear whatever sits below the live table.
+                #
+                # This used to wipe rows 5+n to 2000 on every single cycle,
+                # for every book. That dirties a couple of thousand cells each
+                # time, which is exactly the kind of thing that makes Excel
+                # expensive for the customer when they have a strategy
+                # workbook open. Now it clears only the rows that can actually
+                # hold leftovers: what this block used, plus, on the first
+                # sighting in this run, a generous sweep to catch anything an
+                # earlier run left behind.
+                prev_n = _last_rows.get((role, bi))
+                if prev_n is None or n_rows < prev_n:
+                    last_row = max(n_rows, prev_n or 0, _FIRST_SIGHT_BOUND)
+                    stale_a = (
+                        f"{get_column_letter(c0)}{5 + n_rows}"
+                        f":{get_column_letter(c0 + 8)}{4 + last_row}"
+                    )
                     try:
                         sheet.range(stale_a).clear()
                     except Exception as e:
                         log_excel_exception(role, e, f"clearing stale rows in block {bi + 1}")
+                _last_rows[(role, bi)] = n_rows
 
                 formatting_started = time.perf_counter()
                 try:
-                    # ATM row and ITM ranges depend only on which strikes are
-                    # present, not on their prices. Skip when the ladder is
-                    # unchanged; force_usd_block_formats is already self-gating.
-                    strikes = chain["strike"].tolist()
-                    shape = (n_rows, strikes[0] if strikes else 0,
-                             strikes[-1] if strikes else 0)
-                    if _block_shape.get((role, bi)) != shape:
-                        _block_shape[(role, bi)] = shape
+                    # force_usd_block_formats is self-gating, so it only does
+                    # work when it must.
+                    force_usd_block_formats(sheet, block, n_rows)
 
-                        force_usd_block_formats(sheet, block, n_rows)
+                    strikes = chain["strike"].tolist()
+                    cs = get_column_letter(c0)
+                    ce = get_column_letter(c0 + 8)
+
+                    # Recolour the whole block every cycle, clearing first.
+                    #
+                    # This was gated on a "shape" signature of (row count, first
+                    # strike, last strike), but the ATM row and the ITM ranges
+                    # all derive from spot, and spot is not in the signature.
+                    # Price moving without the ladder changing size left stale
+                    # yellow and red rows behind. Repainting costs well under a
+                    # millisecond, and clearing first is what makes it correct,
+                    # since setting .color only paints over.
+                    sheet.range(f"{cs}5:{ce}{4 + n_rows}").color = None
+                    if strikes:
+                        for cell_range, color in itm_color_ranges(block, strikes, sp):
+                            sheet.range(cell_range).color = color
 
                         atm_strike = min(strikes, key=lambda s: abs(s - sp))
                         atm_row = strikes.index(atm_strike) + 5
@@ -2067,9 +2093,6 @@ def _write_to_excel(role):
                         atm_range = f"{block['atm']}{atm_row}:{block['put_end']}{atm_row}"
                         sheet.range(atm_range).color = (255, 255, 0)
                         sheet.range(atm_range).font.bold = True
-
-                        for cell_range, color in itm_color_ranges(block, strikes, sp):
-                            sheet.range(cell_range).color = color
                 finally:
                     _performance_metrics.record(
                         role,
@@ -2261,7 +2284,6 @@ async def display_loop():
                     # written" and leave them blank.
                     _excel_gone_logged = False
                     _block_payload.clear()
-                    _block_shape.clear()
                     _sheet_fmt_done.clear()
                     _usd_fmt_done.clear()
                     _dropdown_sig.clear()

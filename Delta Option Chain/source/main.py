@@ -173,9 +173,11 @@ _sheet_cache = {}
 # Excel App COM object, reused across cycles for the bulk-mode calls.
 _app_cache = None
 _last_rows = {}
-# Per (asset, block) shape signature. Expensive per-cell formatting and column
-# resizing only run when the shape actually changes, not on every refresh.
-_block_shape = {}
+# How far below the live table to sweep the first time we see a block in this
+# run. _last_rows is in-memory, so a workbook left dirty by an earlier run is
+# otherwise never cleaned up. Generous enough for any strike count the customer
+# can ask for, and paid for once per block per run rather than every cycle.
+_FIRST_SIGHT_BOUND = 300
 # Per (asset, block) payload signature, so an unchanged chain is not rewritten
 # to Excel at all.
 _block_payload = {}
@@ -1335,7 +1337,6 @@ def invalidate_com_cache(asset=None):
         _sheet_cache.pop(asset, None)
     # Per-shape bookkeeping is also suspect after a reconnect: the sheet may
     # have been reopened from a different copy.
-    _block_shape.clear()
     _block_payload.clear()
     _usd_fmt_done.clear()
     _dropdown_sig.clear()
@@ -1707,40 +1708,67 @@ def _write_to_excel(asset):
 
                 strikes = chain["strike"].tolist()
                 n = len(strikes)
-                # shrink → clear stale rows below (avoids ghost data on expiry roll)
-                prev_n = _last_rows.get((asset, bi), 0)
-                if cnt < prev_n:
+                cs = get_column_letter(block["start"])
+                ce = get_column_letter(block["start"] + 8)
+
+                # Clear whatever sits below the live table. Two cases matter:
+                #   - the block shrank since last cycle, and
+                #   - this is the first time we have seen this block, which
+                #     happens on every tool restart because _last_rows is
+                #     in-memory only. Without the second case a table left over
+                #     from an earlier run survived forever, because prev_n
+                #     was 0 and "cnt < prev_n" was never true.
+                prev_n = _last_rows.get((asset, bi))
+                if prev_n is None:
+                    first_sight = _FIRST_SIGHT_BOUND
+                else:
+                    first_sight = 0
+                if prev_n is None or cnt < prev_n:
                     try:
-                        cs = get_column_letter(block["start"])
-                        ce = get_column_letter(block["start"] + 8)
-                        sheet.range(f"{cs}{5 + cnt}:{ce}{4 + prev_n}").clear()
+                        last_row = max(cnt, prev_n or 0, first_sight)
+                        if last_row < cnt:
+                            last_row = cnt
+                        # Our own block columns only. The customer may keep
+                        # their own formulas in these rows further right.
+                        sheet.range(f"{cs}{5 + cnt}:{ce}{4 + last_row}").clear()
                     except Exception as e:
                         log_excel_exception(asset, e, f"clearing stale rows in block {bi + 1}")
                 _last_rows[(asset, bi)] = cnt
 
                 formatting_started = time.perf_counter()
                 try:
-                    # Shape signature: the expensive work below depends only on
-                    # which strikes are present and which side of spot they sit
-                    # on. Prices move every tick but the shape rarely does, so
-                    # recolouring and number formatting are skipped unless the
-                    # signature actually changed. force_usd_block_formats is
-                    # already self-gating on (asset, block, row count).
-                    shape = (n, strikes[0] if n else 0, strikes[-1] if n else 0)
-                    if _block_shape.get((asset, bi)) != shape:
-                        _block_shape[(asset, bi)] = shape
+                    # force USD-only formats (kills currency rendering). This one
+                    # is self-gating, so it only does work when it must.
+                    force_usd_block_formats(sheet, block, asset, bi, cnt)
 
-                        # force USD-only formats (kills ₹ currency rendering)
-                        force_usd_block_formats(sheet, block, asset, bi, cnt)
+                    # Recolour the whole block every cycle.
+                    #
+                    # This used to be gated on a "shape" signature of
+                    # (row count, first strike, last strike). That was wrong:
+                    # the ATM row and the ITM/OTM split all derive from spot,
+                    # and spot is not in the signature. So when price moved
+                    # without the strike window changing size, nothing was
+                    # repainted and stale yellow and red rows were left behind.
+                    #
+                    # Measured cost of repainting is well under a millisecond,
+                    # against a render cycle three orders of magnitude larger,
+                    # so correctness here is effectively free.
+                    #
+                    # Clearing first is what makes it correct: setting .color
+                    # only paints, so a row that leaves the ITM region would
+                    # otherwise keep its old colour forever.
+                    sheet.range(f"{cs}5:{ce}{4 + n}").color = None
 
-                        # batched side colors: strikes sorted → <sp is prefix, >sp is suffix
-                        k = bisect.bisect_left(strikes, sp)
-                        if k > 0:
-                            sheet.range(f"{block['call_start']}5:{block['call_end']}{4 + k}").color = (198, 224, 180)
-                        m = bisect.bisect_right(strikes, sp)
-                        if m < n:
-                            sheet.range(f"{block['put_start']}{5 + m}:{block['put_end']}{4 + n}").color = (255, 200, 200)
+                    # strikes are sorted, so everything below spot is a prefix
+                    # and everything above it is a suffix.
+                    k = bisect.bisect_left(strikes, sp)
+                    if k > 0:
+                        sheet.range(f"{block['call_start']}5:{block['call_end']}{4 + k}").color = (198, 224, 180)
+                    m = bisect.bisect_right(strikes, sp)
+                    if m < n:
+                        sheet.range(f"{block['put_start']}{5 + m}:{block['put_end']}{4 + n}").color = (255, 200, 200)
 
+                    if n:
                         atm_strike = min(strikes, key=lambda s: abs(s - sp))
                         atm_row = strikes.index(atm_strike) + 5
                         atm_range = f"{block['atm']}{atm_row}:{block['put_end']}{atm_row}"
@@ -1753,12 +1781,18 @@ def _write_to_excel(asset):
                         rows=cnt,
                     )
             else:
-                clear_start = get_column_letter(block["start"])
-                clear_end = get_column_letter(block["start"] + 8)
-                try:
-                    sheet.range(f"{clear_start}5:{clear_end}1000").clear()
-                except Exception as e:
-                    log_excel_exception(asset, e, f"clearing empty chain block {bi + 1}")
+                # An empty block only needs clearing when it stops being empty,
+                # or on the first sighting. Clearing 1000 rows every cycle was
+                # both wasteful and needlessly expensive for Excel to do.
+                prev_n = _last_rows.get((asset, bi))
+                if prev_n is None or prev_n != 0:
+                    clear_start = get_column_letter(block["start"])
+                    clear_end = get_column_letter(block["start"] + 8)
+                    last_row = max(prev_n or 0, _FIRST_SIGHT_BOUND)
+                    try:
+                        sheet.range(f"{clear_start}5:{clear_end}{4 + last_row}").clear()
+                    except Exception as e:
+                        log_excel_exception(asset, e, f"clearing empty chain block {bi + 1}")
                 _last_rows[(asset, bi)] = 0
 
         excel_fail_since[asset] = None
@@ -1994,7 +2028,6 @@ async def display_loop():
                     # them or the app would leave the sheets blank.
                     _excel_gone_logged = False
                     _block_payload.clear()
-                    _block_shape.clear()
                     _usd_fmt_done.clear()
                     _dropdown_sig.clear()
                     _last_excel_exception.clear()
