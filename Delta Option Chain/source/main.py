@@ -64,6 +64,12 @@ _last_bulk_restore = None
 _paused = False
 _min_refresh = trader_controls.DEFAULT_REFRESH
 _control_label_cache = {}
+# Set when a cycle actually put something into Excel, and when the workbook's
+# own recalculation was timed. Nothing here is a guess: both come from the
+# write path and from a real Excel.Calculate() call.
+_cycle_wrote = False
+_bulk_will_recalc = False
+_last_recalc_ms = 0.0
 
 REST_BASE = "https://api.india.delta.exchange"
 
@@ -1679,8 +1685,22 @@ def _write_to_excel(asset):
                 )
             col_l = block["start"]
             cnt = len(chain) if chain is not None else 0
-            sheet.range((1, col_l)).value = f"{asset} Spot: {sp:.2f} | {cnt} strikes"
-            sheet.range((1, col_l + 4)).value = f"PCR: {pcr:.2f}"
+            # Only rewrite the header when the text actually changed. Writing an
+            # identical string still dirties the cell and still makes Excel
+            # recalculate everything that depends on it, so writing it every
+            # cycle costs the customer a recalculation for nothing.
+            global _cycle_wrote
+            spot_text = f"{asset} Spot: {sp:.2f} | {cnt} strikes"
+            pcr_text = f"PCR: {pcr:.2f}"
+            try:
+                if sheet.range((1, col_l)).value != spot_text:
+                    sheet.range((1, col_l)).value = spot_text
+                    _cycle_wrote = True
+                if sheet.range((1, col_l + 4)).value != pcr_text:
+                    sheet.range((1, col_l + 4)).value = pcr_text
+                    _cycle_wrote = True
+            except Exception as e:
+                log_excel_exception(asset, e, "writing chain header")
             net_paint(sheet, asset, bi, col_l)
 
             if chain is not None and not chain.empty:
@@ -1702,6 +1722,7 @@ def _write_to_excel(asset):
                     if payload_sig != _block_payload.get((asset, bi)):
                         _block_payload[(asset, bi)] = payload_sig
                         sheet.range((5, block["start"])).options(index=False, header=False).value = chain
+                        _cycle_wrote = True
                     else:
                         _performance_metrics.record(asset, "excel_range_skipped", 0.0, rows=cnt)
                 finally:
@@ -1902,6 +1923,11 @@ def _begin_excel_bulk_mode():
                 # back, instead of leaving their formulas silently dead.
                 calc_mode_guard.acquire(state["calc"], PRODUCT_ID)
                 state["calc_guarded"] = True
+                # If the workbook was already on automatic, Excel will
+                # recalculate by itself once we restore. Semiautomatic does
+                # the same for ordinary formulas.
+                global _bulk_will_recalc
+                _bulk_will_recalc = state["calc"] in ("automatic", "semiautomatic")
                 app.calculation = "manual"
         except Exception as e:
             log_excel_exception("ALL", e, "switching to manual calculation")
@@ -1945,6 +1971,45 @@ def write_to_excel(asset):
         )
 
 
+def _time_recalc(wrote):
+    """Recalculate once, inside the manual window, and time it.
+
+    This is the number nobody had: how long the customer's own workbook takes
+    to recalculate when we change a cell it depends on. Every timing we had
+    before stopped at the edge of the suspended-calculation window, so the very
+    cost that makes their machine feel stuck was never measured.
+
+    Plain Application.Calculate, not CalculateUntilAsyncQueriesDone: that one
+    is for asynchronous queries such as Power Query and data connections, not
+    for ordinary formulas.
+
+    Only done when we actually wrote something, and only when the workbook was
+    already set to recalculate by itself. Recalculating for someone who chose
+    manual would be doing something they asked us not to.
+    """
+    global _last_recalc_ms
+    if not wrote:
+        _performance_metrics.record("ALL", "excel_recalc_skip_nowrite", 0.0)
+        return 0.0
+    if not _bulk_will_recalc:
+        _performance_metrics.record("ALL", "excel_recalc_skip_mode", 0.0)
+        return 0.0
+    app = _app_cache
+    if app is None:
+        _performance_metrics.record("ALL", "excel_recalc_skip_noapp", 0.0)
+        return 0.0
+    try:
+        started = time.perf_counter()
+        app.api.Calculate()
+        elapsed = (time.perf_counter() - started) * 1000.0
+    except Exception as e:
+        log_excel_exception("ALL", e, "forcing workbook recalculation")
+        return 0.0
+    _last_recalc_ms = elapsed
+    _performance_metrics.record("ALL", "excel_recalc", elapsed / 1000.0)
+    return elapsed
+
+
 def render_cycle():
     """One full pass over every workbook, inside a single bulk-mode window.
 
@@ -1979,14 +2044,29 @@ def render_cycle():
         _performance_metrics.record("ALL", "render_cycle", time.perf_counter() - started)
         return
 
+    global _cycle_wrote
+    _cycle_wrote = False
+
     restore = _begin_excel_bulk_mode()
     try:
         for asset in ("BTC", "ETH", "XAUT"):
             write_to_excel(asset)
+        _time_recalc(_cycle_wrote)
     finally:
         if restore is not None:
             try:
                 restore()
+                # If we already recalculated inside the window, restoring
+                # automatic should find nothing left to do. If Excel is still
+                # calculating or pending, restoring started a second,
+                # duplicated pass and the cost is being paid twice.
+                try:
+                    if _app_cache is not None and int(_app_cache.api.CalculationState) != 0:
+                        _performance_metrics.record("ALL", "excel_recalc_second_pass", 1.0)
+                    else:
+                        _performance_metrics.record("ALL", "excel_recalc_second_pass", 0.0)
+                except Exception:
+                    pass
             except Exception as e:
                 log_excel_exception("ALL", e, "leaving bulk mode")
         elapsed = time.perf_counter() - started
