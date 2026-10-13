@@ -28,10 +28,10 @@ import requests
 
 import config
 import calc_mode_guard
-import trader_controls
 from us_diagnostics import (
     append_app_exception,
     append_connection_event,
+    append_runtime_warning,
     excel_process_details,
     append_performance_summary,
     build_id,
@@ -39,6 +39,15 @@ from us_diagnostics import (
 )
 from us_performance import PerformanceMetrics, itm_color_ranges
 from product_identity import identify_product_directory
+from excel_helpers import (
+    find_book_and_app_in_apps,
+    prefer_expiry_root,
+    refresh_delay,
+    reopen_due,
+    should_restore_calculation,
+    workbook_name_is_open_in_apps,
+)
+from us_time import eastern_now, filter_expiry_dates
 
 BASE_DIR = config.base_dir()
 
@@ -51,9 +60,7 @@ PRODUCT_ID = "us"
 _last_bulk_restore = None
 
 # Trader controls read from the sheet: pause and minimum interval.
-_paused = False
-_min_refresh = trader_controls.DEFAULT_REFRESH
-_control_label_cache = {}
+
 cfg = config.load_config()
 
 POLL_GAP = float(cfg.get("poll_gap_seconds", 2))
@@ -1167,14 +1174,28 @@ def available_expiries(all_expiries, sym=None):
     indices, so ordering is re-ranked by whether the expiry actually carries
     the base root (DJX/SPX). Weekly expiries stay selectable, just not first.
     """
-    now = datetime.now()
-    today = now.strftime("%Y-%m-%d")
-    dates = sorted(d for d in all_expiries if d >= today)
-    if now.hour >= 16 and dates and dates[0] == today:
-        dates = dates[1:]
+    now, eastern_available = eastern_now(warning=_log_timezone_fallback)
+    dates = filter_expiry_dates(all_expiries, now, eastern_available)
     if sym is None:
         return dates
     return standard_expiries(sym, dates)
+
+
+_timezone_warning_logged = False
+
+
+def _log_timezone_fallback(exc):
+    global _timezone_warning_logged
+    if _timezone_warning_logged:
+        return
+    _timezone_warning_logged = True
+    try:
+        append_runtime_warning(
+            "US Eastern timezone unavailable; today's expiry remains selectable",
+            f"{type(exc).__name__}: {exc}",
+        )
+    except OSError as log_error:
+        print(f"Could not log timezone warning: {log_error}", flush=True)
 
 
 async def init_symbol(sym):
@@ -1284,7 +1305,8 @@ def build_option_chain(sym, expiry, range_val=50):
     sp = spot_cmp[sym]
     if sp is None or not expiry:
         return None, 0.0
-    filtered = [d for d in live_data[sym].values() if d["expiry"] == expiry]
+    want = base_root(sym)
+    filtered = prefer_expiry_root(live_data[sym].values(), expiry, want)
     if not filtered:
         return None, 0.0
     all_calls = [e for e in filtered if e["type"] == "call"]
@@ -1311,8 +1333,6 @@ def build_option_chain(sym, expiry, range_val=50):
     if end - start < window * 2 + 1:
         start = max(0, end - window * 2 - 1)
     target = set(strikes[start:end])
-
-    want = base_root(sym)
 
     def _best_by_strike(rows):
         """Pick one contract per strike: standard root first, then quote quality.
@@ -1395,6 +1415,7 @@ excel_connected = {r: False for r in ROLE_ORDER}
 excel_miss_counts = {r: 0 for r in ROLE_ORDER}
 excel_first_attempt = {r: None for r in ROLE_ORDER}
 _excel_startup_notice_shown = {r: False for r in ROLE_ORDER}
+_reopen_after = {r: 0.0 for r in ROLE_ORDER}
 
 
 _last_window_status = {}
@@ -1499,20 +1520,30 @@ def find_open_book(xw, fname):
     except Exception as e:
         log_excel_exception(role, e, "enumerating Excel applications")
         return None
-    for app in apps:
-        try:
-            books = list(app.books)
-        except Exception as e:
-            log_excel_exception(role, e, "enumerating open workbooks")
-            continue
-        for book in books:
-            try:
-                if os.path.abspath(book.fullname).lower() == target:
-                    return book
-            except Exception as e:
-                log_excel_exception(role, e, "reading workbook path")
-                continue
-    return None
+    book, _app = find_book_and_app_in_apps(
+        apps,
+        target,
+        lambda exc, context: log_excel_exception(role, exc, context),
+    )
+    return book
+
+
+def any_book_named(xw, fname):
+    """True if the exact workbook path is open in any reachable Excel app.
+
+    If an Excel instance cannot be inspected, defer reopening for this cycle
+    rather than risk opening a duplicate workbook.
+    """
+    try:
+        apps = list(xw.apps)
+    except Exception as e:
+        log_excel_exception("EXCEL", e, "enumerating Excel applications before reopen")
+        return True
+    return workbook_name_is_open_in_apps(
+        apps,
+        fname,
+        lambda exc, context: log_excel_exception("EXCEL", exc, context),
+    )
 
 
 def update_expiry_dropdowns(sym, sheet):
@@ -1863,12 +1894,23 @@ def _write_to_excel(role):
                 else "EXCEL IS CLOSED - reopen it"
             )
             if apps_count > 0:
-                # Only tell the customer about a workbook we HAD working and
-                # have now lost. While Excel is starting, or right after a
-                # restart, Excel is up before the workbooks are, and a message
-                # then is simply wrong -- it fired on a machine that was
-                # opening them perfectly normally. If it never connected, the
-                # window title stays as the plain file name, which is the tell.
+                now = time.monotonic()
+                if reopen_due(now, _reopen_after[role]) and not any_book_named(xw, path):
+                    _reopen_after[role] = now
+                    try:
+                        os.startfile(path)
+                        record_excel_connection(
+                            role, "workbook_reopen_requested", f"path={path}"
+                        )
+                    except OSError as e:
+                        log_excel_exception(role, e, "reopening missing workbook")
+                        try:
+                            append_app_exception(f"reopening {role} workbook", e)
+                        except OSError as log_error:
+                            print(
+                                f"Could not log workbook reopen failure ({role}): {log_error}",
+                                flush=True,
+                            )
                 if excel_connected[role]:
                     notice_workbook_missing(path)
                 return
@@ -1898,6 +1940,7 @@ def _write_to_excel(role):
                     )
             return
         excel_miss_counts[role] = 0
+        _reopen_after[role] = 0.0
         clear_workbook_missing_notice(path)
         excel_connected[role] = True
         _excel_startup_notice_shown[role] = False
@@ -2154,7 +2197,7 @@ def print_chain(sym):
 _app_cache = None
 
 
-def _begin_excel_bulk_mode():
+def _begin_excel_bulk_mode(app=None):
     """Suspend repaint + recalculation for the duration of one render cycle.
 
     Every Excel write otherwise repaints the workbook and triggers a full
@@ -2167,16 +2210,20 @@ def _begin_excel_bulk_mode():
     a dialog is up, and there may be no workbook to talk to yet.
     """
     state = {"app": None, "screen": None, "calc": None}
-    global _app_cache
+    global _app_cache, _last_bulk_restore
     try:
-        app = _app_cache
+        if app is None:
+            app = _app_cache
         if app is None:
             import xlwings as xw
-            apps = list(xw.apps)
-            if not apps:
+            for role in ROLE_ORDER:
+                book = find_open_book(xw, excel_path(role))
+                if book is not None:
+                    app = book.app
+                    break
+            if app is None:
                 return None
-            app = apps[0]
-            _app_cache = app
+        _app_cache = app
         try:
             # xlwings.App has no .name; .version is the cheap liveness probe
             # that goes through to Excel and raises if the instance is gone.
@@ -2236,23 +2283,28 @@ def _begin_excel_bulk_mode():
         return None
 
     def restore():
+        if state.get("restored"):
+            return
+        state["restored"] = True
         app = state.get("app")
         if app is None:
             return
-        if state.get("calc") is not None:
-            try:
-                app.calculation = state["calc"]
-            except Exception as e:
-                log_excel_exception("ALL", e, "restoring calculation mode")
+        try:
+            _ = app.version
+        except Exception:
+            return
         if state.get("calc_guarded"):
-            # Only drop our claim once Excel has actually been put back.
             try:
+                current = int(app.api.Calculation)
+                if should_restore_calculation(current, calc_mode_guard.XL_MANUAL):
+                    app.calculation = state["calc"]
                 calc_mode_guard.release(PRODUCT_ID)
             except Exception as e:
-                log_excel_exception("ALL", e, "releasing calculation guard")
+                log_excel_exception("ALL", e, "restoring calculation mode")
         if state.get("screen") is not None:
             try:
-                app.screen_updating = state["screen"]
+                if not app.screen_updating:
+                    app.screen_updating = state["screen"]
             except Exception as e:
                 log_excel_exception("ALL", e, "restoring screen_updating")
 
@@ -2260,30 +2312,10 @@ def _begin_excel_bulk_mode():
     return restore
 
 
-def _set_paused_status(paused):
-    """Show PAUSED on every book, once per change."""
-    global _paused
-    if _paused == paused:
-        return
-    _paused = paused
-    text = trader_controls.describe(True, _min_refresh)
-    try:
-        import xlwings as _xw
-
-        for role in ROLE_ORDER:
-            book = find_open_book(_xw, excel_path(role))
-            if book is None:
-                continue
-            show_status(book, role, "PAUSED")
-            book.sheets[0].range("A1").value = text
-    except Exception as e:
-        log_excel_exception("ALL", e, "showing paused status")
-
-
 async def display_loop():
     is_windows = platform.system() == "Windows"
     license_tick = 0
-    global _excel_gone_logged
+    global _excel_gone_logged, _app_cache
     _excel_gone_logged = False
     while True:
         render_started = time.perf_counter()
@@ -2313,6 +2345,9 @@ async def display_loop():
                     _sheet_fmt_done.clear()
                     _usd_fmt_done.clear()
                     _dropdown_sig.clear()
+                    _app_cache = None
+                    for role in ROLE_ORDER:
+                        _reopen_after[role] = 0.0
                     print("Excel reopened - rewriting all sheets from scratch.", flush=True)
 
                 # One bulk-mode window around all three books rather than per
@@ -2327,8 +2362,7 @@ async def display_loop():
                 # Every book carries the controls, and any of them can pause.
                 # The trader should not have to know which workbook is the
                 # "real" one for the controls to work.
-                paused = False
-                slowest = trader_controls.DEFAULT_REFRESH
+                bulk_app = None
                 for role in ROLE_ORDER:
                     try:
                         if _xw is None:
@@ -2336,26 +2370,17 @@ async def display_loop():
                         book = find_open_book(_xw, excel_path(role))
                         if book is None:
                             continue
-                        sheet = book.sheets[0]
-                        trader_controls.apply_labels(sheet, _control_label_cache)
-                        book_paused, book_refresh = trader_controls.read_controls(sheet)
-                        paused = paused or book_paused
-                        slowest = max(slowest, book_refresh)
+                        if bulk_app is None:
+                            bulk_app = book.app
                     except Exception as e:
                         log_excel_exception(role, e, "reading trader controls")
-                global _min_refresh
-                if _min_refresh < slowest:
-                    _min_refresh = slowest
 
-                restore = None if paused else _begin_excel_bulk_mode()
+                restore = _begin_excel_bulk_mode(bulk_app)
                 try:
                     for role in ROLE_ORDER:
                         if not excel_process_running():
                             break
                         try:
-                            if paused:
-                                _set_paused_status(True)
-                                continue
                             write_to_excel(role)
                         except Exception as e:
                             log_excel_exception(role, e, "render pass")
@@ -2392,7 +2417,13 @@ async def display_loop():
         # idle time keeps the workbook usable and lets the refresh stretch
         # automatically when their workbook is heavy, while a light workbook
         # still updates at the configured interval.
-        await asyncio.sleep(max(float(REFRESH), time.perf_counter() - render_started))
+        await asyncio.sleep(
+            refresh_delay(
+                REFRESH,
+                REFRESH,
+                time.perf_counter() - render_started,
+            )
+        )
 
 
 async def flush_performance_metrics():
@@ -2575,19 +2606,19 @@ def recover_calc_mode():
     try:
         import xlwings as xw
 
-        apps = []
+        app = None
         for _ in range(10):
-            try:
-                apps = list(xw.apps)
-            except Exception:
-                apps = []
-            if apps:
+            for role in ROLE_ORDER:
+                book = find_open_book(xw, excel_path(role))
+                if book is not None:
+                    app = book.app
+                    break
+            if app is not None:
                 break
             time.sleep(0.5)
-        if not apps:
-            print("  calc recovery: no Excel instance reachable", flush=True)
+        if app is None:
+            print("  calc recovery: no chain workbook is reachable", flush=True)
             return False          # keep the record so a later launch can retry
-        app = apps[0]
         if int(app.api.Calculation) != calc_mode_guard.XL_MANUAL:
             # Excel is not on manual, so there is nothing to undo. Clear the
             # record rather than touching a mode the customer may have set.
@@ -2621,10 +2652,10 @@ def main():
         write_startup_diagnostics()
     except OSError as e:
         show_error(f"Could not write startup diagnostics:\n{e}")
-    kill_previous_instances()
     try:
         if not ensure_license():
             os._exit(1)
+        kill_previous_instances()
         asyncio.run(main_async())
     except KeyboardInterrupt:
         pass
