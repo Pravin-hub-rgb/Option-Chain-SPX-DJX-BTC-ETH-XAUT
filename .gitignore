@@ -8,16 +8,32 @@ __pycache__/
 *.pyc
 *.spec.bak
 
-# activation state — NEVER commit (personal license)
+# secrets and activation state — NEVER commit
+.env
+.env.*
+!.env.example
 license.json
 kg.dat
 dxc_kg.dat
+databento.key
+*.key
+*.pem
+KeyGen/
+KeyGen (distributor only)/
+KEY_ACTIVATION.md
+understanding/
+OWNER-ONLY/
+
+# logs and local runtime state
+*.log
+instance_guard.log
+startup_diag.log
+feed.log
 
 # Excel lock files
 ~$*.xlsx
 
 # big delivery binaries — they are rebuildable from source
-# (keeps repo small; KeyGen.exe is the exception, it IS committed)
 Delta Option Chain/client package/OptionChain.exe
 US Option Chain/client package/OptionChain.exe
 US Option Chain/source/dist/

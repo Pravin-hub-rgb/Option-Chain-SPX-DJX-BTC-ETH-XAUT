@@ -50,15 +50,10 @@ US Option Chain/
 │   └── *_option_chain.xlsx    Excel workbook templates
 └── client package/            End-user documentation and configuration
 
-KeyGen (distributor only)/
-├── KeyGen.exe                 Product key generator (prebuilt)
-├── keygen_gui.py              Source for KeyGen.exe
-├── keygen.py                  Command-line key generator
-└── KEY_GENERATION.txt         Distributor instructions
-
-understanding/
-└── KEY_ACTIVATION.md          Licensing system documentation
 ```
+
+Owner-only licensing tools and documentation are kept outside this repository
+and are never published or shipped to end users.
 
 ## Architecture
 
@@ -136,15 +131,6 @@ build_exe.bat
 `build_exe.bat` runs PyInstaller and copies the resulting executable together
 with the workbook templates into the client package directory.
 
-### Key Generator (Nuitka)
-
-```bash
-cd "KeyGen (distributor only)"
-python -m nuitka --onefile --windows-console-mode=disable \
-    --enable-plugin=tk-inter --assume-yes-for-downloads \
-    --output-filename=KeyGen.exe keygen_gui.py
-```
-
 > **Note:** Python 3.13 and later may fail to build against the pinned
 > dependencies. Use Python 3.10 or 3.11 in that case.
 
@@ -174,19 +160,15 @@ python -m nuitka --onefile --windows-console-mode=disable \
 
 ## Licensing
 
-The licensing subsystem is documented in
-[`understanding/KEY_ACTIVATION.md`](understanding/KEY_ACTIVATION.md). In summary:
-
-- Licensing cycles align to the **last Friday** of each month.
-- A key encodes a cycle end date plus a variant index (0–99).
-- A key is accepted when `today < cycle_end ≤ today + 45 days`.
-- Activation state is stored in `license.json` alongside the executable,
-  signed with HMAC-SHA256, and protected against clock rollback.
+End-user builds require a product key on first run and when the license cycle
+ends. Activation state is stored in `license.json` beside the executable.
+Owner-only key generation and activation documentation are kept outside this
+repository.
 
 ---
 
-## Security Notice
+## Secrets
 
-The distributor key generator (`KeyGen (distributor only)/`) must **not** be
-distributed to end users. It is capable of producing unlimited valid product
-keys and is intended solely for the licensed distributor.
+Never commit API keys, `.env` files, activation files, or owner-only licensing
+tools. The application reads the Databento key from the Windows user profile,
+not from the repository or the distributed package.
