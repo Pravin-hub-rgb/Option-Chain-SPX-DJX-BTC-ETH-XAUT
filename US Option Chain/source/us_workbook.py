@@ -10,6 +10,7 @@ so call sites keep working. open_excel_files resolves find_open_book from
 main with a late import to stay import-safe.
 """
 
+import math
 import os
 import platform
 import shutil
@@ -86,6 +87,18 @@ def get_column_letter(col):
         result = chr(65 + col % 26) + result
         col //= 26
     return result
+
+
+def safe_float(val, default=0.0):
+    if val is None:
+        return default
+    try:
+        f = float(val)
+    except (ValueError, TypeError):
+        return default
+    if math.isnan(f) or math.isinf(f):
+        return default
+    return f
 
 
 def excel_path(role):

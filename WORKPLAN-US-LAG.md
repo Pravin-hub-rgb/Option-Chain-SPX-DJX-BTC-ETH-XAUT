@@ -31,10 +31,10 @@ Baseline numbers (idle machine, this morning): render_cycle avg 191ms / max 311m
 | 0 | .gitignore extended (DELIVERY/, client package/, RUN-THIS/, GIT-BACKUP/, *.exe, *.xlsx, *.bak, .pytest_cache/) | DONE |
 | 0 | git init -b main, remote origin attached, SSH auth tested OK (Pravin-hub-rgb) | DONE |
 | 0 | git fetch, reconcile with remote history, baseline commit, push | DONE (baseline 0e17db3, history preserved from 4703491) |
-| A1 | Move shared globals into `us_state.py`; import check + 117 tests; commit | PENDING |
-| A2 | Extract `us_licensing.py` (~500 LOC key/licence/dialogs); verify; commit | PENDING |
-| A3 | Extract `us_workbook.py` (~220 LOC template/ensure/open); verify; commit | PENDING |
-| A4 | Extract `us_spot.py` (~500 LOC Yahoo/Tencent/parity/cache); verify; commit | PENDING |
+| A1 | Move shared globals into `us_state.py`; import check + 117 tests; commit | DONE (4574b49) |
+| A2 | Extract `us_licensing.py` (~500 LOC key/licence/dialogs); verify; commit | DONE (b8a9072) |
+| A3 | Extract `us_workbook.py` (~220 LOC template/ensure/open); verify; commit | DONE (5b7c651, includes symbol text helpers) |
+| A4 | Extract `us_spot.py` (~500 LOC Yahoo/Tencent/parity/cache); verify; commit | DONE |
 | A5 | Extract `us_chain.py` (~1,100 LOC symbol state, expiry, build, pollers); verify; commit | PENDING |
 | A6 | Extract `us_excel.py` (~1,400 LOC all COM writes, bulk mode, render cycle); verify; commit | PENDING |
 | A7 | Extract `us_instance.py` (~270 LOC lock/pid/guard); verify; commit | PENDING |
@@ -48,7 +48,7 @@ Gate after every step: `python -m unittest` all suites in `US Option Chain/sourc
 |---|------|--------|
 | B1 | Delta: calc-mode restore respects other holder (skip restore automatic if another guard holder alive) | DONE (commit 4b0f492, 9 new tests green) |
 | B2 | Log `excel_calc_mode_churn` counter in Delta | DONE as `calc_switch_summary` observer (commit 4b0f492) |
-| B3 | Live local test on tonight's crypto session with measure_strategy/latency_harness; keep client build untouched | PENDING |
+| B3 | Live local test on tonight's crypto session with measure_strategy/latency_harness; keep client build untouched | DEFERRED at user's discretion (trading done); coexistence covered by the 9 unit tests |
 
 ## Track C — US lag fixes (land after split; each fix = one module + one test)
 

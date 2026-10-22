@@ -147,8 +147,8 @@ class SpotCacheTests(unittest.TestCase):
     """The spot must be served from a cache the background task keeps warm."""
 
     def setUp(self):
-        import main
-        self.main = main
+        import us_spot
+        self.main = us_spot
 
     def test_tencent_parse_handles_batched_body(self):
         # The real Tencent body puts the feed timestamp at field 30.
@@ -314,8 +314,8 @@ class TencentStalenessTests(unittest.TestCase):
     """A stale index quote must not silently drive the ATM row."""
 
     def setUp(self):
-        import main
-        self.main = main
+        import us_spot
+        self.main = us_spot
 
     def test_recent_stamp_is_fresh(self):
         from us_time import eastern_now
@@ -514,8 +514,8 @@ class ParitySpotTests(unittest.TestCase):
     no external feed, so the spot never freezes when a free endpoint dies."""
 
     def setUp(self):
-        import main
-        self.main = main
+        import us_spot
+        self.main = us_spot
 
     def _rows(self, spot, call_bid, call_ask, put_bid, put_ask, strike=7750.0,
               expiry=None):
@@ -592,7 +592,8 @@ class ParitySpotTests(unittest.TestCase):
     def test_sanity_limit_rejects_a_wildly_wrong_parity(self):
         """A parity nowhere near the external quote is thrown away."""
         import inspect
-        src = inspect.getsource(self.main.load_symbol)
+        import main
+        src = inspect.getsource(main.load_symbol)
         self.assertIn("spot_parity_rejected", src)
         self.assertIn("PARITY_SANITY_PCT", src)
 

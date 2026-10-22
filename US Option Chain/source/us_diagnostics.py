@@ -294,3 +294,39 @@ def append_app_exception(context, exc):
         *"".join(rendered).splitlines(),
     ]
     return _append("application exception", lines, "app.log")
+
+
+# ---------------------------------------------------------------------------
+# Feed observability for the US tool.
+#
+# The failure this exists to prevent: BigClawd 503s on index chains, the tool
+# quietly falls back to CBOE, and the trader spends the session looking at
+# 15-minute-old prices believing they are live. Nothing said so.
+# ---------------------------------------------------------------------------
+FEED_LOG_DIR = os.path.join(os.environ.get("LOCALAPPDATA", "."), "USOptionChain")
+FEED_LOG_PATH = os.path.join(FEED_LOG_DIR, "feed.log")
+FEED_LOG_MAX_BYTES = 2 * 1024 * 1024
+
+
+def _flat(v):
+    """One-line, bounded, safe for a log file."""
+    t = str(v).replace("\r", " ").replace("\n", " ")
+    return t if len(t) <= 200 else t[:200] + f"...(+{len(t) - 200})"
+
+
+def feed_log(event, **fields):
+    """Append one structured line to the rotating feed log. Never raises."""
+    try:
+        os.makedirs(FEED_LOG_DIR, exist_ok=True)
+        try:
+            if (os.path.exists(FEED_LOG_PATH)
+                    and os.path.getsize(FEED_LOG_PATH) > FEED_LOG_MAX_BYTES):
+                os.replace(FEED_LOG_PATH, FEED_LOG_PATH + ".1")
+        except OSError:
+            pass
+        ts = datetime.now().astimezone().isoformat(timespec="milliseconds")
+        body = " ".join(f"{k}={_flat(v)}" for k, v in fields.items())
+        with open(FEED_LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write(f"{ts} {event} {body}\n")
+    except Exception:
+        pass
