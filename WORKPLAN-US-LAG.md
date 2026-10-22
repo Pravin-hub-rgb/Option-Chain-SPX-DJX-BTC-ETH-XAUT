@@ -59,13 +59,13 @@ Gate after every step: `python -m unittest` all suites in `US Option Chain/sourc
 | C3 | Unprotected fallback: merge scattered runs into one span-write (unchanged rows carried from prev values) | DONE (bb6dbbe) |
 | C4 | Feed: pollers use wait=False after initial sync; universe timeout 30s->5s; reconnect resubscribe on worker thread (no _sub_lock hold); subscribe log only added>0; prune _quotes to target set; single lock section in _on_record | DONE (3f8f202) |
 | C5 | Both-tools coexistence: port B1 protocol into US; no fight over calc mode | DONE (58bd615) |
-| C6 | Observability: `calc_mode_flap` counter + 30s summary log line | DONE |
+| C6 | Observability: `calc_mode_flap` counter + 30s summary log line | DONE (4d791a2) |
 
 ## Track D — Build, verify, ship (before US open ~19:00 IST)
 
 | # | Task | Status |
 |---|------|--------|
-| D1 | Full unittest suite green (target >117, incl. new regression tests) | PENDING |
+| D1 | Full unittest suite green (target >117, incl. new regression tests) | DONE |
 | D2 | Idle-Excel run: render_cycle <150ms, zero flapping, compare vs baseline | PENDING |
 | D3 | Rebuild EXE via build_exe.bat; verify build_info stamp | PENDING |
 | D4 | Closed-market smoke: launch our PID, verify A1/strikes/expiries, stop by PID only | PENDING |
