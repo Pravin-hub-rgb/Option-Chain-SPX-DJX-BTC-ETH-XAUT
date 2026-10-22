@@ -49,7 +49,7 @@ Gate after every step: `python -m unittest` all suites in `US Option Chain/sourc
 | B1 | Delta: calc-mode restore respects other holder (skip restore automatic if another guard holder alive) | DONE (commit 4b0f492, 9 new tests green) |
 | B2 | Log `excel_calc_mode_churn` counter in Delta | DONE as `calc_switch_summary` observer (commit 4b0f492) |
 | B3 | Live local test on tonight's crypto session with measure_strategy/latency_harness; keep client build untouched | DEFERRED at user's discretion (trading done); coexistence covered by the 9 unit tests |
-| B4 | Delta parity: port C2+C3 into the Delta monolith (merged 4x31 strip read, connection-change env detail, 2s tasklist cache, 30s calc probe gate, row-run merged span-write); 33 tests green | DONE |
+| B4 | Delta parity: port C2+C3 into the Delta monolith (merged 4x31 strip read, connection-change env detail, 2s tasklist cache, 30s calc probe gate, row-run merged span-write); 33 tests green | DONE (3dda395) |
 
 ## Track C — US lag fixes (land after split; each fix = one module + one test)
 
