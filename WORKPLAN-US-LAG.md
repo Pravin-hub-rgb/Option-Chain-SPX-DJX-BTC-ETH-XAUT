@@ -67,8 +67,8 @@ Gate after every step: `python -m unittest` all suites in `US Option Chain/sourc
 | # | Task | Status |
 |---|------|--------|
 | D1 | Full unittest suite green (target >117, incl. new regression tests) | DONE (a027d5c) |
-| D2 | Idle-Excel run: render_cycle <150ms, zero flapping, compare vs baseline | PENDING |
+| D2 | Idle-Excel run: render_cycle <150ms, zero flapping, compare vs baseline | DONE (1c3a9c7): package build src-307f2e859ee4, steady speed lines cycle_ms 92-104, flap_total stays 1 after startup, Databento universes + OI fresh, SSE quotes waiting for the open |
 | D3 | Rebuild EXE via build_exe.bat; verify build_info stamp | DONE (26a95f6) |
-| D4 | Closed-market smoke: launch our PID, verify A1/strikes/expiries, stop by PID only | PENDING |
+| D4 | Closed-market smoke: launch our PID, verify A1/strikes/expiries, stop by PID only | DONE (1c3a9c7): PID-tracked launch showed "SPX Spot: 7757.17 | 201 strikes", "DJX Spot: 528.56 | 27", "AAPL Spot: 343.99 | 77" with night-stale headline text; A-split NameError breakage (spot_source_for, refresh_tencent_spot_cache, SPOT_POLL_SECONDS, display_loop, math) found and fixed live; static name-binding test locks it (144 tests); our PID + books cleaned after the run |
 | D5 | Refresh DELIVERY zip + WORKPLAN/DIAGNOSIS handoff note | PENDING |
 | D6 | Client instructions: send %LOCALAPPDATA%\USOptionChain\feed.log speed lines + title-bar recalc after 19:00 open | PENDING |
