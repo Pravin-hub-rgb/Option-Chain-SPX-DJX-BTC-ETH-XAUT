@@ -9,6 +9,7 @@ REM matplotlib/scipy/PyQt5/PIL are excluded because the warn log already reports
 REM them as missing-or-optional; they are not imported by main.py.
 REM Do NOT exclude pandas, numpy, tkinter, xlwings, openpyxl or lxml - all required.
 cd /d "%~dp0"
+set "SETUPTOOLS_USE_DISTUTILS=stdlib"
 set "PRODUCT_EXE=delta_option_chain"
 python -m PyInstaller --noconfirm --clean --onedir --noconsole --noupx --name %PRODUCT_EXE% --collect-all xlwings --collect-all openpyxl --hidden-import win32com --hidden-import win32com.client --hidden-import pythoncom --hidden-import pywintypes --hidden-import win32timezone --exclude-module matplotlib --exclude-module scipy --exclude-module PyQt5 --exclude-module PIL main.py > "%temp%\b_delta_final.log" 2>&1
 if errorlevel 1 (
@@ -22,7 +23,7 @@ REM separate .sha256 file that used to be shipped beside the ZIP: the customer
 REM could not download that from Drive, and could not act on it even if they
 REM could. Now they send startup_diag.log and support reads build_id from it.
 set "BUILD_SHA=local"
-for /f "delims=" %%i in ('git -C "%~dp0..\..\GIT-BACKUP" rev-parse --short HEAD 2^>nul') do set "BUILD_SHA=%%i"
+for /f "delims=" %%i in ('git -C "%~dp0." rev-parse --short HEAD 2^>nul') do set "BUILD_SHA=%%i"
 > "dist\%PRODUCT_EXE%\build_info.txt" echo product=delta
 >> "dist\%PRODUCT_EXE%\build_info.txt" echo build_sha=%BUILD_SHA%
 >> "dist\%PRODUCT_EXE%\build_info.txt" echo build_date=%DATE% %TIME%
