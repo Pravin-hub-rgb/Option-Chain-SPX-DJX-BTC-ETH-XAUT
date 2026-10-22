@@ -46,8 +46,8 @@ Gate after every step: `python -m unittest` all suites in `US Option Chain/sourc
 
 | # | Task | Status |
 |---|------|--------|
-| B1 | Delta: calc-mode restore respects other holder (skip restore automatic if another guard holder alive) | PENDING |
-| B2 | Log `excel_calc_mode_churn` counter in Delta | PENDING |
+| B1 | Delta: calc-mode restore respects other holder (skip restore automatic if another guard holder alive) | DONE (commit 4b0f492, 9 new tests green) |
+| B2 | Log `excel_calc_mode_churn` counter in Delta | DONE as `calc_switch_summary` observer (commit 4b0f492) |
 | B3 | Live local test on tonight's crypto session with measure_strategy/latency_harness; keep client build untouched | PENDING |
 
 ## Track C — US lag fixes (land after split; each fix = one module + one test)

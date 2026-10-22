@@ -53,39 +53,27 @@ from excel_helpers import (
 )
 from us_time import eastern_now, filter_expiry_dates
 
-BASE_DIR = config.base_dir()
-
-# Identifies this tool inside the shared calculation-mode record, so US and
-# the Delta tool running together in one Excel instance do not fight over it.
-PRODUCT_ID = "us"
-
-# The executable is named for the product, so the process name alone says which
-# tool it is. The customer can see it in Task Manager, and the instance guard
-# never has to guess the product from the folder - which is what went wrong
-# when both packages were extracted into the same place.
-PRODUCT_EXE = "us_option_chain.exe"
-
-# The most recent bulk-mode restore callable, so an exit path that never
-# reaches the render loop's finally can still put Excel back.
-_last_bulk_restore = None
-
-
-cfg = config.load_config()
-
-POLL_GAP = float(cfg.get("poll_gap_seconds", 2))
-ROUND_PAUSE = float(cfg.get("round_pause_seconds", 2))
-EXPIRY_REFRESH = float(cfg.get("expiry_refresh_seconds", 60))
-REFRESH = float(cfg.get("refresh_interval_seconds", 0.5))
-# How often each symbol's chain is rebuilt. The old loop rebuilt all three in
-# one pass and slept between passes, so every symbol was about six seconds
-# behind. Each symbol now has its own period.
-SYMBOL_POLL_SECONDS = float(cfg.get("symbol_poll_seconds", 0.5))
-# Floor on how often the same symbol may be rebuilt. Small, because the data
-# is already in memory from the live feed.
-SOURCE_MIN_INTERVAL = float(cfg.get("source_min_interval_seconds", 0.25))
-SPX_SYMBOL = str(cfg.get("spx_symbol", "SPX")).upper()
-DJX_SYMBOL = str(cfg.get("djx_symbol", "DJX")).upper()
-DEFAULT_SYMBOL = str(cfg.get("default_symbol", "AAPL")).upper()
+import us_state
+from us_state import (
+    _FIRST_SIGHT_BOUND, _UNPROTECTED_WRITE_INTERVAL, _app_cache,
+    _auto_open_done, _book_sheet_cache, _bulk_will_recalc, _calc_manual_failed,
+    _calc_manual_notice_shown, _calc_notice_shown, _calc_session,
+    _databento_feed, _dropdown_sig, _excel_connection_status,
+    _excel_liveness_cache, _feed_access, _last_bulk_restore,
+    _last_excel_exception, _last_performance_flush, _last_recalc_ms,
+    _last_source_call, _last_symbol_call, _last_rows, _manual_since,
+    _net, _net_drawn, _pending_date_loads, _performance_log_error_shown,
+    _performance_metrics, _rate_lock, _refetch_now, _screen_blocked_until,
+    _screen_failures, _SCREEN_BACKOFF_SECONDS, _SCREEN_FAILURE_LIMIT,
+    _sheet_altered, _sheet_cache, _SHORT_BUILD, _speed_log_at, _spot_cache,
+    _spot_lock, _template_ready, _timezone_warning_logged, active_expiries,
+    all_known_expiries, BASE_DIR, cfg, DEFAULT_SYMBOL, DJX_SYMBOL,
+    EXPIRY_REFRESH, live_data, LOCKED_ROLES, MANUAL_WATCHDOG_SECONDS,
+    NET_FAIL_LIMIT, oi_roots, expiry_roots, POLL_GAP, PRODUCT_EXE, PRODUCT_ID,
+    REFRESH, role_symbol, ROLE_FILES, ROLE_ORDER, ROUND_PAUSE,
+    SOURCE_MIN_INTERVAL, SPX_SYMBOL, spot_cmp, SYMBOL_CELL,
+    SYMBOL_POLL_SECONDS, user_pinned,
+)
 
 # Product key: scrambled = (DDMMYYYY ^ mask8) ^ vmask(variant); all digits vary
 # key = scrambled*10000 + variant*100 + SHA256 check (100 variants/date, sab valid)
@@ -114,9 +102,6 @@ def _key_check(token, variant):
 # Market/API ghatne par sheet freeze ho jata hai; user ko pata chalna chahiye
 # ki data stale hai. NET_FAIL_LIMIT consecutive failures ke baad header me red
 # tag dikhta hai, aur connection wapas aate hi apne aap hat jaata hai.
-NET_FAIL_LIMIT = 2
-_net = {"fails": 0, "since": None}
-_net_drawn = {}   # (role, block) -> last text written to that tag cell
 
 
 def net_note(ok):
@@ -197,9 +182,7 @@ def base_root(sym):
 
 # Expiry -> set of roots seen for it in the latest payload, so the expiry
 # picker can tell a standard expiry (has the base root) from a weekly-only one.
-expiry_roots = {}
 # base root -> expiry -> count of contracts that actually report OI > 0
-oi_roots = {}
 
 
 def _note_expiry_roots(sym, rows):
@@ -250,25 +233,6 @@ def standard_expiries(sym, all_expiries):
 
 
 # Configured once in main(), after the owner/customer key has been resolved.
-_databento_feed = None
-ROLE_FILES = {
-    "spx": "spx_option_chain.xlsx",
-    "djx": "djx_option_chain.xlsx",
-    "stock": "us_stock_option_chain.xlsx",
-}
-ROLE_ORDER = ("spx", "djx", "stock")
-# roles whose K1 is locked (not user-editable)
-LOCKED_ROLES = frozenset({"spx", "djx"})
-
-# active ticker per Excel file/role (spx/djx fixed; stock from K1)
-role_symbol = {"spx": SPX_SYMBOL, "djx": DJX_SYMBOL, "stock": DEFAULT_SYMBOL}
-SYMBOL_CELL = "K1"
-
-live_data = {}
-spot_cmp = {}
-active_expiries = {}
-user_pinned = {}
-all_known_expiries = {}
 
 
 def active_symbols():
@@ -300,19 +264,6 @@ BLOCK_COLS = [
 
 CHAIN_COLS = ["Call LTP", "Call Bid", "Call Ask", "Call OI",
               "strike", "Put OI", "Put Bid", "Put Ask", "Put LTP"]
-
-_rate_lock = asyncio.Lock()
-# Serialises access to the shared Databento feed so two symbols never mutate
-# it at the same time. It does not add any delay of its own.
-_feed_access = asyncio.Semaphore(1)
-_last_source_call = 0.0
-# Last rebuild time per symbol, so the same symbol is not rebuilt twice in a
-# row while another symbol is still waiting its turn.
-_last_symbol_call = {}
-_pending_date_loads = []
-_dropdown_sig = {}
-_refetch_now = False
-
 
 def safe_float(val, default=0.0):
     if val is None:
@@ -596,9 +547,6 @@ def default_k1(role):
 
 def is_locked_role(role):
     return role in LOCKED_ROLES
-
-
-_template_ready = set()
 
 
 def _unmerge_all(ws):
@@ -1062,8 +1010,6 @@ TENCENT_SPOT = {
 # endpoint was measured serving a quote that was twenty to thirty seconds old
 # and alternating between two stale values. Taking the freshest of both is
 # what stops the index level from jumping about.
-_spot_cache = {}          # root -> (price, age_seconds, source, monotonic, quote_ts)
-_spot_lock = threading.Lock()
 SPOT_POLL_SECONDS = float(cfg.get("spot_poll_seconds", 1.0))
 # How long a cached quote is offered before the tool stops serving it and falls
 # back to the last known value. This is only a backstop for "we stopped
@@ -1611,9 +1557,6 @@ def available_expiries(all_expiries, sym=None, by_date=False):
     return standard_expiries(sym, dates)
 
 
-_timezone_warning_logged = False
-
-
 def _log_timezone_fallback(exc):
     global _timezone_warning_logged
     if _timezone_warning_logged:
@@ -1927,13 +1870,9 @@ _reopen_after = {r: 0.0 for r in ROLE_ORDER}
 # asks again: a customer who closes the workbook must not watch it pop back
 # up. Re-armed only if the file itself disappears, so a deleted workbook can
 # still be recreated and opened.
-_auto_open_done = {r: False for r in ROLE_ORDER}
-# Set when a workbook's layout no longer matches what the tool writes to.
-_sheet_altered = {r: False for r in ROLE_ORDER}
 
 
 _last_window_status = {}
-_SHORT_BUILD = None
 
 
 def _short_build():
@@ -2051,9 +1990,6 @@ def excel_apps_count(xw):
     except Exception as e:
         log_excel_exception("EXCEL", e, "enumerating Excel applications")
         return -1
-
-
-_excel_liveness_cache = None  # (monotonic_timestamp, running_bool)
 
 
 def excel_process_running(max_age=1.0):
@@ -2271,37 +2207,6 @@ _user_fmt_done = set()
 _colour_state = {}
 # Rows this block used on its previous cycle, so a shrink can clear exactly
 # what was there instead of wiping a fixed block of rows every tick.
-_last_rows = {}
-# How far below the live table to sweep the first time we see a block in this
-# run, to catch anything an earlier run left behind. Paid once per block.
-_FIRST_SIGHT_BOUND = 300
-_performance_metrics = PerformanceMetrics()
-_last_performance_flush = time.monotonic()
-_performance_log_error_shown = False
-_excel_connection_status = {}
-_last_excel_exception = {}
-_cycle_wrote = False
-_bulk_will_recalc = False
-# Who owns Excel's calculation mode, for the whole session.
-#
-# "owned" is true only when this tool changed the mode itself. If Excel was
-# already on manual calculation - because the customer wants that, or because
-# the other OptionChain tool owns it - it is left exactly as it was found.
-_calc_session = {
-    "owned": False,
-    "failed": False,
-    "mode": None,
-    "app": None,
-}
-# The customer is told once, not on every cycle.
-_calc_notice_shown = False
-# Screen updating is set and restored around every write. When Excel is busy
-# that switch fails, and four failing calls a cycle make Excel busier still.
-# After a few failures the attempt is paused for a while.
-_screen_failures = 0
-_screen_blocked_until = 0.0
-_SCREEN_FAILURE_LIMIT = 3
-_SCREEN_BACKOFF_SECONDS = 60.0
 
 
 def _screen_pause_active():
@@ -2326,11 +2231,6 @@ def _note_screen_failed(exc):
             seconds=_SCREEN_BACKOFF_SECONDS,
             error=type(exc).__name__,
         )
-_last_recalc_ms = 0.0
-# Cached (book, sheet) COM objects per role — book.sheets[0] is a COM round-trip
-# every call, and it dominated the render loop. Cached and dropped on staleness.
-_book_sheet_cache = {}
-_sheet_cache = {}
 
 
 def forget_workbook_formatting(path):
@@ -3242,9 +3142,6 @@ def render_cycle():
         _log_speed_summary(elapsed)
 
 
-_speed_log_at = 0.0
-
-
 def _log_speed_summary(cycle_ms):
     """Write the whole pipeline's timings into the log every half minute.
 
@@ -3330,22 +3227,6 @@ def print_chain(sym):
             print("  ".join(parts))
         print()
 
-
-_app_cache = None
-
-# Set when Excel refused to switch to manual calculation. The write window
-# is then unprotected, so every cell we touch makes Excel recalculate. When
-# that happens the render loop slows itself down instead of fighting Excel,
-# and the customer is told once what to clear.
-_calc_manual_failed = False
-_calc_manual_notice_shown = False
-# When the write window is unprotected, write at most this often.
-_UNPROTECTED_WRITE_INTERVAL = 3.0
-_last_unprotected_write = 0.0
-
-
-_manual_since = 0.0
-MANUAL_WATCHDOG_SECONDS = 4.0
 
 # xlwings' .calculation getter hands back a stale value while Excel is busy, so a
 # "did the restore work?" check built on it can pass falsely and leave the trader
