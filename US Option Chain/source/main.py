@@ -12,150 +12,30 @@ Shared cache by symbol; one process drives all books.
 import asyncio
 import atexit
 import os
-import platform
-import re
-import shutil
-import subprocess
-import threading
 import time
-from collections import defaultdict
-from datetime import date, datetime
 
-import requests
-
-import config
-import calc_mode_guard
 import databento_feed
+
 from us_diagnostics import (
     append_app_exception,
-    append_connection_event,
-    append_runtime_warning,
-    excel_process_details,
-    append_performance_summary,
-    build_id,
     write_startup_diagnostics,
     feed_log,
 )
-from us_performance import PerformanceMetrics, color_signature, itm_color_ranges
-from product_identity import identify_product_directory
-from excel_helpers import (
-    find_book_and_app_in_apps,
-    find_book_by_name_in_apps,
-    prefer_expiry_root,
-    refresh_delay,
-    reopen_due,
-    should_restore_calculation,
-    workbook_name_is_open_in_apps,
-    workbook_name_open_anywhere_in_apps,
-)
-from us_time import eastern_now, filter_expiry_dates
-
-import us_state
-from us_licensing import ensure_license, license_is_valid, save_license, show_error, show_info
-from us_workbook import (
-    _rebuild_fresh, _safe_set, _unmerge_all, _write_template, base_root,
-    clean_symbol, default_k1, ensure_excel_file, excel_path, get_column_letter,
-    is_index_symbol, is_locked_role, normalize_symbol, open_excel_files,
-    BLOCK_COLS, INDEX_SYMBOLS,
-)
-from us_spot import (
-    PARITY_SANITY_PCT, PARITY_TOLERANCE_PCT, PARITY_TOLERANCE_POINTS,
-    SPOT_POLL_SECONDS, SPOT_STALE_SECONDS,
-    _databento_spot, _parity_log_at, _parity_spot, _parity_spot_cache,
-    _spot_divergence, _yahoo_spot_fetch, note_spot, refresh_tencent_spot_cache,
-    source_delay_note, spot_source_for, tencent_spot, yahoo_spot,
-)
-from us_chain import (
-    _header_at, _set_header_at, _short_build, active_symbols, build_option_chain,
-    available_expiries, data_poller, ensure_sym_state, expiry_roller,
-    fmt_oi, init_symbol, iso_to_user, parse_user_date, process_pending_dates,
-    read_symbol_cell, spot_poller,
-    CHAIN_COLS,
-)
-from us_excel import (
-    display_loop,
-)
+from us_licensing import ensure_license, show_error
+from us_workbook import INDEX_SYMBOLS, open_excel_files
 from us_instance import (
     kill_previous_instances, recover_calc_mode, _emergency_restore,
 )
-from us_state import (
-    _FIRST_SIGHT_BOUND, _UNPROTECTED_WRITE_INTERVAL, _app_cache,
-    _auto_open_done, _book_sheet_cache, _bulk_will_recalc, _calc_manual_failed,
-    _calc_manual_notice_shown, _calc_notice_shown, _calc_session,
-    _databento_feed, _dropdown_sig, _excel_connection_status,
-    _excel_liveness_cache, _feed_access, _last_bulk_restore,
-    _last_excel_exception, _last_performance_flush, _last_recalc_ms,
-    _last_source_call, _last_symbol_call, _last_rows, _manual_since,
-    _net, _net_drawn, _pending_date_loads, _performance_log_error_shown,
-    _performance_metrics, _rate_lock, _screen_blocked_until,
-    _screen_failures, _SCREEN_BACKOFF_SECONDS, _SCREEN_FAILURE_LIMIT,
-    _sheet_altered, _sheet_cache, _speed_log_at, _spot_cache,
-    _spot_lock, _template_ready, active_expiries,
-    all_known_expiries, BASE_DIR, cfg, DEFAULT_SYMBOL, DJX_SYMBOL,
-    EXPIRY_REFRESH, live_data, LOCKED_ROLES, MANUAL_WATCHDOG_SECONDS,
-    net_badge, net_note,
-    NET_FAIL_LIMIT, oi_roots, expiry_roots, POLL_GAP, PRODUCT_EXE, PRODUCT_ID,
-    REFRESH, role_symbol, ROLE_FILES, ROLE_ORDER, ROUND_PAUSE,
-    SOURCE_MIN_INTERVAL, SPX_SYMBOL, spot_cmp, SYMBOL_CELL,
-    SYMBOL_POLL_SECONDS, user_pinned,
+from us_chain import (
+    active_symbols, available_expiries, data_poller, ensure_sym_state,
+    expiry_roller, init_symbol, process_pending_dates, spot_poller,
+    _short_build,
 )
 
-# --- connection health indicator ------------------------------------------
-# Market/API ghatne par sheet freeze ho jata hai; user ko pata chalna chahiye
-# ki data stale hai. NET_FAIL_LIMIT consecutive failures ke baad header me red
-# tag dikhta hai, aur connection wapas aate hi apne aap hat jaata hai.
-
-
-def print_chain(sym):
-    sp = spot_cmp[sym]
-    for bi, expiry in enumerate(active_expiries[sym]):
-        if not expiry:
-            continue
-        chain, pcr = build_option_chain(sym, expiry, 999)
-        if chain is None or chain.empty:
-            continue
-        sentiment = "BULLISH" if pcr > 1.0 else "BEARISH"
-        print(f"{sym} Block {bi + 1} | {expiry} | Spot: {sp:.2f} | PCR: {pcr:.2f} ({sentiment}) | {len(chain)} strikes")
-        header = "  ".join(f"{c:>10}" for c in CHAIN_COLS)
-        print(header)
-        print("-" * len(header))
-        for _, row in chain.iterrows():
-            parts = []
-            for c in CHAIN_COLS:
-                v = row.get(c, 0)
-                if c in ("Call OI", "Put OI", "strike"):
-                    parts.append(str(v).rjust(10))
-                else:
-                    parts.append(f"{float(v):>10.2f}")
-            print("  ".join(parts))
-        print()
-
-
-# xlwings' .calculation getter hands back a stale value while Excel is busy, so a
-# "did the restore work?" check built on it can pass falsely and leave the trader
-# stuck on manual. Set AND verify through the raw API with these ids.
-
-
-async def flush_performance_metrics():
-    global _last_performance_flush, _performance_log_error_shown
-    now = time.monotonic()
-    if now - _last_performance_flush < 30:
-        return
-    lines = _performance_metrics.summary_lines(now)
-    try:
-        await asyncio.to_thread(append_performance_summary, lines)
-    except OSError as e:
-        if not _performance_log_error_shown:
-            show_error(
-                "Could not append performance diagnostics to startup_diag.log.\n\n"
-                "Check that your user profile is writable and has free space.\n\n"
-                f"Details: {e}"
-            )
-            _performance_log_error_shown = True
-    else:
-        _performance_metrics.reset(now)
-        _last_performance_flush = now
-
+import us_state
+from us_state import (
+    BASE_DIR, PRODUCT_EXE, PRODUCT_ID, _databento_feed, expiry_roots,
+)
 
 async def main_async():
     for sym in active_symbols():

@@ -29,7 +29,7 @@ from us_state import (
 from us_chain import (
     _header_at, _set_header_at, _short_build, active_symbols,
     available_expiries, build_option_chain, ensure_sym_state, fmt_oi,
-    iso_to_user, parse_user_date, read_symbol_cell,
+    iso_to_user, parse_user_date, print_chain, read_symbol_cell,
 )
 from us_spot import source_delay_note, spot_source_for
 from us_workbook import (
@@ -43,7 +43,7 @@ from excel_helpers import (
 from us_diagnostics import (
     append_app_exception, append_connection_event, excel_process_details, feed_log,
 )
-from us_performance import color_signature, itm_color_ranges
+from us_performance import color_signature, flush_performance_metrics, itm_color_ranges
 from us_licensing import ensure_license, license_is_valid, show_error
 import asyncio
 import calc_mode_guard
@@ -1381,6 +1381,10 @@ def _log_speed_summary(cycle_ms):
 
 
 
+# xlwings' .calculation getter hands back a stale value while Excel is busy, so a
+# "did the restore work?" check built on it can pass falsely and leave the trader
+# stuck on manual. Set AND verify through the raw API with these ids.
+
 def _raw_calc_mode(app):
     return int(app.api.Calculation)
 
@@ -1616,7 +1620,6 @@ def bulk_app():
 
 
 async def display_loop():
-    import main as _main
     is_windows = platform.system() == "Windows"
     license_tick = 0
     us_state._excel_gone_logged = False
@@ -1672,11 +1675,11 @@ async def display_loop():
                 _performance_metrics.record(
                     "ALL", "refresh_overrun", render_seconds - REFRESH
                 )
-            await _main.flush_performance_metrics()
+            await flush_performance_metrics()
         else:
             os.system("clear")
             for sym in active_symbols():
-                _main.print_chain(sym)
+                print_chain(sym)
             print(f"Symbols {','.join(active_symbols())} | poll {POLL_GAP}s | Ctrl+C stop", flush=True)
 
         # Sleep AFTER the work, for at least as long as the work took.

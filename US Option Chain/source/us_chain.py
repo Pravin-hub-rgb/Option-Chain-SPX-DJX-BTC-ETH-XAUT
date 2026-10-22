@@ -736,3 +736,26 @@ def _set_header_at(header_values, col, value):
         header_values[index] = value
 
 
+def print_chain(sym):
+    sp = spot_cmp[sym]
+    for bi, expiry in enumerate(active_expiries[sym]):
+        if not expiry:
+            continue
+        chain, pcr = build_option_chain(sym, expiry, 999)
+        if chain is None or chain.empty:
+            continue
+        sentiment = "BULLISH" if pcr > 1.0 else "BEARISH"
+        print(f"{sym} Block {bi + 1} | {expiry} | Spot: {sp:.2f} | PCR: {pcr:.2f} ({sentiment}) | {len(chain)} strikes")
+        header = "  ".join(f"{c:>10}" for c in CHAIN_COLS)
+        print(header)
+        print("-" * len(header))
+        for _, row in chain.iterrows():
+            parts = []
+            for c in CHAIN_COLS:
+                v = row.get(c, 0)
+                if c in ("Call OI", "Put OI", "strike"):
+                    parts.append(str(v).rjust(10))
+                else:
+                    parts.append(f"{float(v):>10.2f}")
+            print("  ".join(parts))
+        print()

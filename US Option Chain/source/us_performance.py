@@ -1,8 +1,11 @@
 """Bounded timings and behavior-preserving batched ITM color ranges."""
 
+import asyncio
 import time
 from collections import defaultdict
 from bisect import bisect_left, bisect_right
+
+from us_diagnostics import append_performance_summary
 
 
 class PerformanceMetrics:
@@ -79,3 +82,26 @@ def itm_color_ranges(block, strikes, spot):
             )
         )
     return ranges
+
+
+async def flush_performance_metrics():
+    import us_state
+    from us_licensing import show_error
+
+    now = time.monotonic()
+    if now - _last_performance_flush < 30:
+        return
+    lines = _performance_metrics.summary_lines(now)
+    try:
+        await asyncio.to_thread(append_performance_summary, lines)
+    except OSError as e:
+        if not us_state._performance_log_error_shown:
+            show_error(
+                "Could not append performance diagnostics to startup_diag.log.\n\n"
+                "Check that your user profile is writable and has free space.\n\n"
+                f"Details: {e}"
+            )
+            us_state._performance_log_error_shown = True
+    else:
+        us_state._performance_metrics.reset(now)
+        us_state._last_performance_flush = now
