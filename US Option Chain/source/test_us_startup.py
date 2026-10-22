@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import patch
 
 import main
+import us_instance
 
 
 class StartupLicensingTests(unittest.TestCase):
@@ -104,7 +105,7 @@ class ProductNamingTests(unittest.TestCase):
     def test_guard_matches_only_our_own_executable(self):
         """The other product's tool must never be a candidate."""
         import inspect
-        src = inspect.getsource(main.kill_previous_instances)
+        src = inspect.getsource(us_instance.kill_previous_instances)
         self.assertIn("PRODUCT_EXE", src)
         self.assertNotIn('"optionchain.exe"', src)
 
@@ -114,17 +115,17 @@ class LockFileTests(unittest.TestCase):
 
     def test_lock_file_is_used(self):
         import inspect
-        src = inspect.getsource(main.kill_previous_instances)
+        src = inspect.getsource(us_instance.kill_previous_instances)
         self.assertIn("_take_over_locked_instance", src)
 
     def test_lock_path_is_in_the_product_folder(self):
         import inspect
-        src = inspect.getsource(main._lock_path)
+        src = inspect.getsource(us_instance._lock_path)
         self.assertIn("BASE_DIR", src)
 
     def test_duplicate_that_cannot_be_stopped_raises(self):
         import inspect
-        src = inspect.getsource(main._take_over_locked_instance)
+        src = inspect.getsource(us_instance._take_over_locked_instance)
         self.assertIn("RuntimeError", src)
 
 

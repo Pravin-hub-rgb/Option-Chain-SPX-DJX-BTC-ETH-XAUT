@@ -36,8 +36,8 @@ Baseline numbers (idle machine, this morning): render_cycle avg 191ms / max 311m
 | A3 | Extract `us_workbook.py` (~220 LOC template/ensure/open); verify; commit | DONE (5b7c651, includes symbol text helpers) |
 | A4 | Extract `us_spot.py` (~500 LOC Yahoo/Tencent/parity/cache); verify; commit | DONE (3b91528) |
 | A5 | Extract `us_chain.py` (~1,100 LOC symbol state, expiry, build, pollers); verify; commit | DONE (149e75e) |
-| A6 | Extract `us_excel.py` (~1,700 LOC all COM writes, bulk mode, render cycle); verify; commit | DONE (5b83112) |
-| A7 | Extract `us_instance.py` (~270 LOC lock/pid/guard); verify; commit | PENDING |
+| A6 | Extract `us_excel.py` (~1,700 LOC all COM writes, bulk mode, render cycle); verify; commit | DONE (df519d7) |
+| A7 | Extract `us_instance.py` (lock/pid/guard + calc-mode lifecycle); verify; commit | DONE |
 | A8 | Slim main.py to ~400 LOC wiring (main_async, exit hooks); full suite; commit | PENDING |
 
 Gate after every step: `python -m unittest` all suites in `US Option Chain/source` + `python -c "import main"` passes.
