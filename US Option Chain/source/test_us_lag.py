@@ -454,8 +454,12 @@ class AutoOpenLatchTests(unittest.TestCase):
         """Nothing else may open a workbook behind the customer's back."""
         import inspect
         import main
-        src = inspect.getsource(main)
-        self.assertEqual(src.count("os.startfile("), 2)
+        import us_workbook
+        self.assertEqual(
+            inspect.getsource(main).count("os.startfile(")
+            + inspect.getsource(us_workbook).count("os.startfile("),
+            2,
+        )
 
     def test_latch_is_rearmed_only_when_the_file_is_gone(self):
         import inspect

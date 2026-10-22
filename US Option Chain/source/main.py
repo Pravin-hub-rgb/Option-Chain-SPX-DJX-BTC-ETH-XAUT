@@ -1,4 +1,4 @@
-"""
+﻿"""
 US Stock / S&P 500 Option Chain Tool
 Primary: Databento OPRA live when an API key is configured.
 Fallback: BigClawd free brokerage chain then CBOE delayed quotes.
@@ -53,6 +53,12 @@ from us_time import eastern_now, filter_expiry_dates
 
 import us_state
 from us_licensing import ensure_license, license_is_valid, save_license, show_error, show_info
+from us_workbook import (
+    _rebuild_fresh, _safe_set, _unmerge_all, _write_template, base_root,
+    clean_symbol, default_k1, ensure_excel_file, excel_path, get_column_letter,
+    is_index_symbol, is_locked_role, normalize_symbol, open_excel_files,
+    BLOCK_COLS, INDEX_SYMBOLS,
+)
 from us_state import (
     _FIRST_SIGHT_BOUND, _UNPROTECTED_WRITE_INTERVAL, _app_cache,
     _auto_open_done, _book_sheet_cache, _bulk_will_recalc, _calc_manual_failed,
@@ -105,7 +111,7 @@ def net_badge():
 
 
 def net_paint(sheet, role, bi, col_l):
-    """Tag cell (row 1, block ka last column) likho — sirf jab badle."""
+    """Tag cell (row 1, block ka last column) likho â€” sirf jab badle."""
     tag = net_badge()
     prev = _net_drawn.get((role, bi), None)
     if tag == prev:
@@ -126,39 +132,7 @@ HTTP_HEADERS = {
     "Accept": "application/json",
 }
 
-# US index option roots — CBOE delayed needs "_" prefix; BigClawd partial support
-INDEX_SYMBOLS = {
-    "SPX", "SPXW", "XSP", "DJX", "DJXW", "NDX", "NDXP",
-    "VIX", "VIXW", "RUT", "RUTW", "OEX", "XEO",
-}
-
-
-def clean_symbol(sym):
-    """User-facing ticker -> API root (strip ^, map . class shares)."""
-    s = str(sym or "").strip().upper().replace(".", "-")
-    if s.startswith("^"):
-        s = s[1:]
-    return s
-
-
-def is_index_symbol(sym):
-    return clean_symbol(sym) in INDEX_SYMBOLS
-
-
-def base_root(sym):
-    """DJXW -> DJX, SPXW -> SPX. Standard (non-weekly) root of an index family.
-
-    CBOE index payloads interleave the standard chain (DJX/SPX, the "mega")
-    with the weekly chain (DJXW/SPXW, the "mini") on the same strikes. Users
-    want the standard contract, so every comparison is made against this root.
-    """
-    s = clean_symbol(sym)
-    return s[:-1] if (len(s) > 2 and s.endswith("W") and s[:-1] in INDEX_SYMBOLS) else s
-
-
-# Expiry -> set of roots seen for it in the latest payload, so the expiry
-# picker can tell a standard expiry (has the base root) from a weekly-only one.
-# base root -> expiry -> count of contracts that actually report OI > 0
+# US index option roots â€” CBOE delayed needs "_" prefix; BigClawd partial support
 
 
 def _note_expiry_roots(sym, rows):
@@ -232,12 +206,6 @@ def ensure_sym_state(sym):
 MONTHS = {"JAN": "01", "FEB": "02", "MAR": "03", "APR": "04", "MAY": "05", "JUN": "06",
           "JUL": "07", "AUG": "08", "SEP": "09", "OCT": "10", "NOV": "11", "DEC": "12"}
 
-BLOCK_COLS = [
-    {"start": 1,  "atm": "A", "call_start": "A", "call_end": "D", "put_start": "F", "put_end": "I"},
-    {"start": 12, "atm": "L", "call_start": "L", "call_end": "O", "put_start": "Q", "put_end": "T"},
-    {"start": 23, "atm": "W", "call_start": "W", "call_end": "Z", "put_start": "AB", "put_end": "AE"},
-]
-
 CHAIN_COLS = ["Call LTP", "Call Bid", "Call Ask", "Call OI",
               "strike", "Put OI", "Put Bid", "Put Ask", "Put LTP"]
 
@@ -254,9 +222,9 @@ def safe_float(val, default=0.0):
 
 
 def fmt_oi(val):
-    # Force USD only — strip any ₹/INR and coerce to float
+    # Force USD only â€” strip any â‚¹/INR and coerce to float
     if isinstance(val, str):
-        s = val.replace("₹", "").replace("Rs", "").replace("INR", "").replace("$", "").replace(",", "").strip()
+        s = val.replace("â‚¹", "").replace("Rs", "").replace("INR", "").replace("$", "").replace(",", "").strip()
         try:
             val = float(s)
         except ValueError:
@@ -270,15 +238,6 @@ def fmt_oi(val):
     if val >= 1_000:
         return f"${val / 1_000:.2f}K"
     return f"${val:.0f}"
-
-
-def get_column_letter(col):
-    result = ""
-    while col > 0:
-        col -= 1
-        result = chr(65 + col % 26) + result
-        col //= 26
-    return result
 
 
 def record_excel_connection(role, status, detail=""):
@@ -305,242 +264,10 @@ def log_excel_exception(role, exc, context="Excel/COM update"):
         print(f"Could not log {context} traceback ({role}): {log_error}", flush=True)
 
 
-def excel_path(role):
-    return os.path.join(BASE_DIR, ROLE_FILES[role])
-
-
-def default_k1(role):
-    return role_symbol.get(role) or DEFAULT_SYMBOL
-
-
-def is_locked_role(role):
-    return role in LOCKED_ROLES
-
-
-def _unmerge_all(ws):
-    """Drop every merged range on the sheet.
-
-    The layout is a plain grid (three side-by-side blocks, headers on row 4),
-    so a merged range is never intentional -- it only turns up when the user
-    merges cells by hand while tidying the sheet. Leaving one in place makes
-    openpyxl hand back read-only MergedCell objects for everything inside it,
-    and writing to those killed the app at startup. Unmerging is always safe
-    because the labels we care about are rewritten right after.
-    """
-    if not ws.merged_cells.ranges:
-        return False
-    for rng in list(ws.merged_cells.ranges):
-        try:
-            ws.unmerge_cells(str(rng))
-        except Exception:
-            pass
-    return True
-
-
-def _safe_set(ws, row, col, val):
-    """Write to a cell, skipping read-only merged leftovers instead of crashing."""
-    try:
-        cell = ws.cell(row=row, column=col)
-        if type(cell).__name__ == "MergedCell":
-            return False
-        cell.value = val
-        return True
-    except (AttributeError, ValueError, TypeError):
-        return False
-
-
-def _write_template(ws, role):
-    """(Re)write every label the tool owns. Returns True if anything changed."""
-    changed = False
-    headers = ["Call LTP", "Call Bid", "Call Ask", "Call OI", "Strike",
-               "Put OI", "Put Bid", "Put Ask", "Put LTP"]
-    for block in BLOCK_COLS:
-        for i, h in enumerate(headers):
-            r, c = 4, block["start"] + i
-            cell = ws.cell(row=r, column=c)
-            if getattr(cell, "value", None) == h:
-                continue
-            if _safe_set(ws, r, c, h):
-                changed = True
-    j1 = "Symbol (locked):" if is_locked_role(role) else "Symbol (change):"
-    if _safe_set(ws, 1, 10, j1):
-        changed = True
-    if is_locked_role(role) or not normalize_symbol(ws.cell(row=1, column=11).value):
-        if _safe_set(ws, 1, 11, default_k1(role)):
-            changed = True
-    if _safe_set(ws, 2, 2, "± strikes — edit A2"):
-        changed = True
-    for col, label in ((1, "Expiry 1"), (3, "(edit D3)"), (12, "Expiry 2"),
-                       (14, "(edit O3)"), (23, "Expiry 3"), (25, "(edit Z3)")):
-        if _safe_set(ws, 3, col, label):
-            changed = True
-    for row in (2, 3):
-        cell = ws.cell(row=row, column=10)
-        if getattr(cell, "value", None) and _safe_set(ws, row, 10, None):
-            changed = True
-    return changed
-
-
-def _rebuild_fresh(path):
-    """Last resort: swap a broken template for a clean one.
-
-    The damaged file is kept as .bak so nothing the user did is silently
-    thrown away, then an empty sheet is created for the caller to fill in.
-    Read-only attribute is cleared first -- Excel's "read-only recommended" or
-    a file copied off a locked share would otherwise make the replace fail.
-    """
-    try:
-        if os.path.exists(path):
-            try:
-                os.chmod(path, 0o666)  # drop read-only flag
-            except Exception:
-                pass
-            try:
-                shutil.copy2(path, path + ".bak")
-            except Exception:
-                pass
-            try:
-                os.remove(path)
-            except Exception as e:
-                print(f"Could not replace {os.path.basename(path)}: {e}", flush=True)
-    except Exception:
-        pass
-    from openpyxl import Workbook, load_workbook
-    fresh = path
-    try:
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Chain"
-        wb.save(path)
-        return load_workbook(path)
-    except Exception as e:
-        # folder itself is read-only -> write alongside with a fresh name
-        print(f"Cannot write {os.path.basename(path)}: {e} - using alternate name", flush=True)
-        fresh = path.replace(".xlsx", "_new.xlsx")
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Chain"
-        wb.save(fresh)
-        return load_workbook(fresh)
-
-
-def ensure_excel_file(role):
-    path = excel_path(role)
-    if role in _template_ready and os.path.exists(path):
-        return path
-    created = False
-    if not os.path.exists(path):
-        from openpyxl import Workbook
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Chain"
-        wb.save(path)
-        created = True
-    from openpyxl import load_workbook
-    wb = None
-    try:
-        wb = load_workbook(path)
-        ws = wb.active
-    except Exception as e:
-        # unreadable / corrupt workbook (truncated zip, half-written on a crash)
-        print(f"Template unreadable ({role}: {e}) - rebuilding sheet", flush=True)
-        wb = _rebuild_fresh(path)
-        ws = wb.active
-    need_save = created
-    try:
-        need_save = _unmerge_all(ws) or need_save
-        need_save = _write_template(ws, role) or need_save
-    except Exception as e:
-        # anything unexpected in a file the user edited -> start clean
-        print(f"Template repair failed ({role}: {e}) - rebuilding sheet", flush=True)
-        wb = _rebuild_fresh(path)
-        ws = wb.active
-        try:
-            _write_template(ws, role)
-        except Exception as e2:
-            print(f"Fresh template still failing ({role}: {e2})", flush=True)
-        need_save = True
-    if need_save:
-        try:
-            wb.save(path)
-        except Exception as e:
-            print(f"Template save failed ({role}: {e}) - rebuilding sheet", flush=True)
-            wb = _rebuild_fresh(path)
-            ws = wb.active
-            try:
-                _write_template(ws, role)
-                wb.save(path)
-            except Exception as e2:
-                # last chance: leave the rebuilt sheet on disk as-is
-                print(f"Could not save labels for {role}: {e2}", flush=True)
-    _template_ready.add(role)
-    return path
-
-
-def open_excel_files():
-    if platform.system() != "Windows":
-        return
-    import xlwings as xw
-    for role in ROLE_ORDER:
-        path = excel_path(role)
-        try:
-            os.remove(path + ":Zone.Identifier")
-        except OSError:
-            pass
-        # If the workbook is already open in Excel, don't open it again.
-        # Opening a second copy with the same name throws "same name" errors,
-        # and openpyxl cannot load a file Excel has locked anyway.
-        try:
-            book = find_open_book(xw, path)
-            if book is not None:
-                # Already open - the customer opened it themselves, so the
-                # tool must never open it again behind their back.
-                _auto_open_done[role] = True
-                continue
-        except Exception:
-            pass
-        # Workbook not open — ensure the file exists, then open it.
-        try:
-            ensure_excel_file(role)
-        except Exception as e:
-            print(f"ensure_excel_file failed ({role}): {e}", flush=True)
-        try:
-            os.startfile(path)
-            # We have now opened it. If the customer closes it later, it stays
-            # closed.
-            _auto_open_done[role] = True
-        except OSError as e:
-            show_error(f"Could not open {ROLE_FILES[role]}:\n{e}")
-            try:
-                append_app_exception(f"opening {role} workbook", e)
-            except OSError as log_error:
-                print(f"Could not log workbook open failure ({role}): {log_error}", flush=True)
-            try:
-                append_app_exception(f"opening {role} workbook", e)
-            except OSError as log_error:
-                print(f"Could not log workbook open failure ({role}): {log_error}", flush=True)
-
-
-def normalize_symbol(raw):
-    if raw is None:
-        return ""
-    s = str(raw).strip().upper().replace(".", "-")
-    # strip hint text if user pasted label into K1
-    for junk in ("(CHANGE)", "(CHANGEABLE)", "CHANGE:", "TICKER", "SYMBOL"):
-        if junk in s:
-            s = s.split(junk)[0].strip()
-    s = s.strip(" :->")
-    if s.startswith("^"):
-        s = s[1:].strip()
-    if not s or s in ("SYMBOL", "TICKER", "K1", "EDIT"):
-        return ""
-    return s
-
-
 def read_symbol_cell(sheet, role):
     locked = default_k1(role) if is_locked_role(role) else None
     if locked is not None:
-        # locked — force fixed ticker (user edits overwritten)
+        # locked â€” force fixed ticker (user edits overwritten)
         if sheet.range(SYMBOL_CELL).value != locked:
             sheet.range(SYMBOL_CELL).value = locked
         return locked
@@ -634,7 +361,7 @@ def _price(ltp, bid, ask):
         return ltp
     if bid > 0 and ask > 0:
         return (bid + ask) / 2
-    # CBOE no-quote often sends bid=0, ask=20 sentinel — never mark lone ask as LTP
+    # CBOE no-quote often sends bid=0, ask=20 sentinel â€” never mark lone ask as LTP
     if bid > 0:
         return bid
     return 0.0
@@ -646,7 +373,7 @@ def _is_no_quote(bid, ask):
 
 
 def _quote_quality(bid, ask, oi, ltp):
-    """Higher is better — used when same strike has DJX vs DJXW (or SPX vs SPXW)."""
+    """Higher is better â€” used when same strike has DJX vs DJXW (or SPX vs SPXW)."""
     b, a = safe_float(bid), safe_float(ask)
     real_book = 1 if (b > 0 and a > 0 and a >= b and not _is_no_quote(b, a)) else 0
     return (real_book, 1 if safe_float(ltp) > 0 else 0, safe_float(oi))
@@ -1293,7 +1020,7 @@ async def load_symbol(sym):
             feed_log("expiry_none_available", symbol=sym,
                      note="no expiry list; keeping previous assignment")
 
-    # full replace — drops stale foreign-root / expired keys after source switch
+    # full replace â€” drops stale foreign-root / expired keys after source switch
     fresh = {}
     for row in rows:
         key = row["contract"] or f"{sym}-{row['type']}-{row['strike']}-{row['expiry']}"
@@ -1821,7 +1548,7 @@ def find_open_book(xw, fname):
     # (an old install, a copy they made, the source tree). Excel will not open
     # a second workbook with the same name, so opening our own copy fails and
     # leaves the tool unable to write anything. Use the copy that is already
-    # open — it is the same product, and it is the one on their screen.
+    # open â€” it is the same product, and it is the one on their screen.
     book, _app = find_book_by_name_in_apps(
         apps,
         fname,
@@ -1881,7 +1608,7 @@ def update_expiry_dropdowns(sym, sheet):
         sheet.range((1, helper_col), (helper_end, helper_col)).clear()
     except Exception as e:
         log_excel_exception(sym, e, "clearing expiry dropdown helper column")
-    # xlwings Sheet has no .cell() — write helper column as one range
+    # xlwings Sheet has no .cell() â€” write helper column as one range
     try:
         col_letter = get_column_letter(helper_col)
         sheet.range(f"{col_letter}1:{col_letter}{len(options)}").value = [
@@ -1913,7 +1640,7 @@ def update_user_dates(sym, sheet):
     for i, cell in enumerate(["D3", "O3", "Z3"]):
         rng = sheet.range(cell)
         try:
-            # text — stops Excel date conversion / #####
+            # text â€” stops Excel date conversion / #####
             # Setting the format dirties the cell, so only do it once per
             # sheet instead of on every refresh.
             fmt_key = (id(sheet), cell)
@@ -1923,7 +1650,7 @@ def update_user_dates(sym, sheet):
         except Exception:
             pass
         val = rng.value
-        # Excel may have converted text into a datetime — force back to DD/MM/YYYY text
+        # Excel may have converted text into a datetime â€” force back to DD/MM/YYYY text
         if isinstance(val, datetime):
             rng.value = val.strftime("%d/%m/%Y")
             continue
@@ -1947,7 +1674,7 @@ def update_user_dates(sym, sheet):
                     pass
             _pending_date_loads.append((sym, i, parsed))
         elif parsed and re.match(r"^\d{1,2}/\d{1,2}/\d{4}$", user_str) is None:
-            # same expiry but odd format — normalize
+            # same expiry but odd format â€” normalize
             try:
                 rng.value = iso_to_user(parsed)
             except Exception:
@@ -2012,9 +1739,9 @@ def forget_workbook_formatting(path):
 
 
 # Labels written every run (cheap) so user always sees changeable hints
-# J1 is role-dependent — written inside write_hint_labels
+# J1 is role-dependent â€” written inside write_hint_labels
 HINT_LABELS = (
-    ("B2", "± strikes — edit A2"),
+    ("B2", "Â± strikes â€” edit A2"),
     ("A3", "Expiry 1"),
     ("C3", "(edit D3)"),
     ("L3", "Expiry 2"),
@@ -2048,7 +1775,7 @@ def write_hint_labels(sheet, role="stock"):
             sheet.range(cell).value = None
         except Exception as e:
             log_excel_exception(role, e, f"clearing owned hint cell {cell}")
-    # keep Symbol label from squishing (cheap — every run)
+    # keep Symbol label from squishing (cheap â€” every run)
     try:
         sheet.range("J:J").api.ColumnWidth = 22
     except Exception as e:
@@ -2082,7 +1809,7 @@ def format_sheet(sheet, role="stock"):
             widths[block["start"] + off] = 11
     widths[3] = 11    # C = (edit D3) hint
     widths[4] = 13    # D = Expiry 1 input DD/MM/YYYY
-    widths[9] = 22    # J Symbol label — full text
+    widths[9] = 22    # J Symbol label â€” full text
     widths[10] = 12   # K symbol value
     widths[14] = 11   # N = (edit O3)
     widths[15] = 13   # O Expiry 2
@@ -2117,7 +1844,7 @@ def format_sheet(sheet, role="stock"):
         for cell in ("B2", "A3", "L3", "W3", "C3", "N3", "Y3", "J1"):
             sheet.range(cell).color = LABEL_FILL
         # Input cells highlighted (do NOT wipe user values)
-        # Locked files (SPX/DJX): K1 gray + forced — not an input
+        # Locked files (SPX/DJX): K1 gray + forced â€” not an input
         input_cells = ["A2", "D3", "O3", "Z3"]
         if role == "stock":
             input_cells.append("K1")
@@ -2130,7 +1857,7 @@ def format_sheet(sheet, role="stock"):
             k1.color = LABEL_FILL
             k1.font.bold = True
             k1.value = default_k1(role)
-        # Stock role: K1 is user-editable — never write its value here.
+        # Stock role: K1 is user-editable â€” never write its value here.
         # The initial value is set by _write_template when the file is created.
         for cell in ("D3", "O3", "Z3"):
             try:
@@ -2146,15 +1873,15 @@ def format_sheet(sheet, role="stock"):
 
 
 def force_usd_block_formats(sheet, block, n_rows):
-    """Prices = 0.00, OI = text with $ only (kills ₹ number format).
+    """Prices = 0.00, OI = text with $ only (kills â‚¹ number format).
 
     The OI columns are already written as "$123" text by build_option_chain, so
     the only thing needed here is the text number format that stops Excel
     coercing them back into a number.
 
     The previous version also walked the OI column one cell at a time to
-    convert leftovers. That was 1,206 COM round trips per block — about twelve
-    seconds for a 600-row block — and it ran again every time the row count
+    convert leftovers. That was 1,206 COM round trips per block â€” about twelve
+    seconds for a 600-row block â€” and it ran again every time the row count
     changed. It is now one bulk read and one bulk write, once per sheet, and
     the per-cycle cost is a single range write.
     """
@@ -2182,7 +1909,7 @@ def force_usd_block_formats(sheet, block, n_rows):
             print(f"force_usd formats: {e}", flush=True)
             log_excel_exception("EXCEL", e, "formatting option-chain cells")
             return
-        # One-off bulk cleanup of values left as numbers or ₹ by an older
+        # One-off bulk cleanup of values left as numbers or â‚¹ by an older
         # build. One read and one write for the whole sheet, not per cell.
         for off in (3, 5):
             col = get_column_letter(c0 + off)
@@ -2199,7 +1926,7 @@ def force_usd_block_formats(sheet, block, n_rows):
                 if isinstance(v, (int, float)):
                     values[i] = fmt_oi(v)
                     changed = True
-                elif isinstance(v, str) and ("₹" in v or "Rs" in v):
+                elif isinstance(v, str) and ("â‚¹" in v or "Rs" in v):
                     values[i] = fmt_oi(v)
                     changed = True
             if changed:
@@ -2258,7 +1985,7 @@ def _write_to_excel(role):
         os._exit(1)
     path = ensure_excel_file(role)
     try:
-        # Cached COM book/sheet objects — avoids enumerating all apps + all
+        # Cached COM book/sheet objects â€” avoids enumerating all apps + all
         # books on every cycle, which dominated the render loop. Dropped on
         # staleness so a closed/renamed workbook recovers.
         book = _book_sheet_cache.get(role)
@@ -2495,7 +2222,7 @@ def _write_to_excel(role):
         sp = spot_cmp[sym] or 0
         MAX_A2 = 100
         if not user_provided:
-            range_val = MAX_A2  # empty A2 → all (API returns ≤100 around ATM)
+            range_val = MAX_A2  # empty A2 â†’ all (API returns â‰¤100 around ATM)
         else:
             desired = int(v)
             if desired > MAX_A2:
@@ -2524,7 +2251,7 @@ def _write_to_excel(role):
             if not expiry:
                 # Only rewrite header cells when the text actually changed.
                 # Writing an identical string still dirties the cell and forces
-                # every dependent formula to recalculate — that cost is what
+                # every dependent formula to recalculate â€” that cost is what
                 # makes a strategy workbook feel stuck.
                 head_text = f"{sym} Spot: --"
                 pcr_text = "PCR: --"
@@ -2811,7 +2538,7 @@ def _time_recalc(wrote):
     workbook takes to recalc when we change a cell it depends on. Plain
     Application.Calculate, not CalculateUntilAsyncQueriesDone (that is for
     asynchronous queries such as Power Query). Only done when we actually
-    wrote something and Excel was on auto/semiauto — recalculating for a
+    wrote something and Excel was on auto/semiauto â€” recalculating for a
     customer who chose manual would undo their choice.
     """
     global _last_recalc_ms
