@@ -1103,5 +1103,62 @@ class CoexistenceGuardTests(unittest.TestCase):
         self.assertIn("60.0", src)
 
 
+
+class FlapCounterTests(unittest.TestCase):
+    """Observed calculation-mode flips are counted without extra COM calls."""
+
+
+    _NAMES = (
+        "_last_observed_calc_raw",
+        "_calc_mode_flap_count",
+        "_calc_flap_summary_after",
+    )
+
+    def setUp(self):
+        import us_excel
+
+        self.main = us_excel
+        self.saved = {n: getattr(us_excel, n) for n in self._NAMES}
+
+    def tearDown(self):
+        for name, value in self.saved.items():
+            setattr(self.main, name, value)
+
+    def test_transition_counts_one_flap(self):
+        self.main._last_observed_calc_raw = -4105
+        before = self.main._calc_mode_flap_count
+        self.main._observe_raw_calc(-4135)
+        self.assertEqual(self.main._calc_mode_flap_count, before + 1)
+
+    def test_steady_mode_counts_nothing(self):
+        self.main._last_observed_calc_raw = -4135
+        before = self.main._calc_mode_flap_count
+        self.main._observe_raw_calc(-4135)
+        self.assertEqual(self.main._calc_mode_flap_count, before)
+
+    def test_none_resets_the_baseline(self):
+        self.main._last_observed_calc_raw = -4105
+        before = self.main._calc_mode_flap_count
+        self.main._observe_raw_calc(None)
+        self.assertIsNone(self.main._last_observed_calc_raw)
+        self.main._observe_raw_calc(-4135)
+        self.assertEqual(self.main._calc_mode_flap_count, before)
+
+    def test_counter_reads_the_existing_probe(self):
+        import inspect
+
+        self.assertIn(
+            "_observe_raw_calc(raw)",
+            inspect.getsource(self.main._begin_excel_bulk_mode),
+        )
+
+    def test_summary_is_throttled_to_thirty_seconds(self):
+        import inspect
+
+        self.assertEqual(self.main._CALC_FLAP_SUMMARY_SECONDS, 30.0)
+        src = inspect.getsource(self.main._observe_raw_calc)
+        self.assertIn("calc_mode_flap_summary", src)
+
+
 if __name__ == "__main__":
     unittest.main()

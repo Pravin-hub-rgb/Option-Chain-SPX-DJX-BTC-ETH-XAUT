@@ -1447,6 +1447,41 @@ def _other_chain_tool_holds():
     return True
 
 
+_last_observed_calc_raw = None
+_calc_mode_flap_count = 0
+_calc_flap_summary_after = 0.0
+_CALC_FLAP_SUMMARY_SECONDS = 30.0
+_CALC_ID_NAMES = {-4105: "automatic", 2: "semiautomatic", -4135: "manual"}
+
+
+def _observe_raw_calc(raw):
+    """Count a transition of Excel's calculation mode between cycles.
+
+    raw comes from the read _begin_excel_bulk_mode already does every
+    cycle, so this adds no COM round-trips. An unreadable value (None)
+    resets the baseline so a single glitch is not mistaken for a flip.
+    """
+    global _last_observed_calc_raw, _calc_mode_flap_count, _calc_flap_summary_after
+    if raw is None:
+        _last_observed_calc_raw = None
+        return
+    previous = _last_observed_calc_raw
+    _last_observed_calc_raw = raw
+    if previous is None or previous == raw:
+        return
+    _calc_mode_flap_count += 1
+    now = time.time()
+    if now >= _calc_flap_summary_after:
+        _calc_flap_summary_after = now + _CALC_FLAP_SUMMARY_SECONDS
+        feed_log(
+            "calc_mode_flap_summary",
+            flap_total=_calc_mode_flap_count,
+            last_from=_CALC_ID_NAMES.get(previous, str(previous)),
+            last_to=_CALC_ID_NAMES.get(raw, str(raw)),
+            note="cumulative calculation-mode transitions seen between cycles",
+        )
+
+
 def ensure_calculation_not_stranded(app=None):
     """Safety net: never leave the trader in manual calculation.
 
@@ -1545,6 +1580,7 @@ def _begin_excel_bulk_mode(app=None):
                 raw = int(app.api.Calculation)
             except Exception:
                 raw = None
+            _observe_raw_calc(raw)
             current = {
                 -4105: "automatic",   # xlCalculationAutomatic
                 2: "semiautomatic",   # xlCalculationSemiautomatic
