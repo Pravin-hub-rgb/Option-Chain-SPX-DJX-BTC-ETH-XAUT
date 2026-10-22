@@ -1414,6 +1414,39 @@ def _set_calc_mode(app, name):
     return _raw_calc_mode(app) == _CALC_IDS[name]
 
 
+_calc_watchdog_skip_logged_at = 0.0
+
+
+def _other_chain_tool_holds():
+    """True when the current manual window belongs to a running sibling tool.
+
+    The watchdog must never rescue a mode a live tool owns: the sibling chain
+    product deliberately holds manual for its own write windows, and flipping
+    to automatic underneath it is the fight that made Excel flap whenever
+    both tools ran side by side.
+    """
+    global _calc_watchdog_skip_logged_at
+    try:
+        holds = calc_mode_guard.other_holder_alive(PRODUCT_ID)
+    except Exception as e:
+        feed_log(
+            "calc_watchdog_holdercheck_error",
+            error=type(e).__name__,
+            detail=str(e)[:150],
+        )
+        return False
+    if not holds:
+        return False
+    now = time.time()
+    if now - _calc_watchdog_skip_logged_at >= 60.0:
+        _calc_watchdog_skip_logged_at = now
+        feed_log(
+            "calc_watchdog_skip_holder",
+            note="another chain tool holds manual calculation; watchdog left it alone",
+        )
+    return True
+
+
 def ensure_calculation_not_stranded(app=None):
     """Safety net: never leave the trader in manual calculation.
 
@@ -1439,6 +1472,8 @@ def ensure_calculation_not_stranded(app=None):
         us_state._manual_since = now
         return
     if now - us_state._manual_since < MANUAL_WATCHDOG_SECONDS:
+        return
+    if _other_chain_tool_holds():
         return
     try:
         if _set_calc_mode(app, "automatic"):

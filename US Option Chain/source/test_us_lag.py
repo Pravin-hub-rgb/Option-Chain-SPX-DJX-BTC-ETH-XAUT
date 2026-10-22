@@ -1004,5 +1004,104 @@ class FeedPollerLagTests(unittest.TestCase):
         self.assertIn("threading.Thread", src)
 
 
+
+class CoexistenceGuardTests(unittest.TestCase):
+    """The watchdog must not rescue manual while the sibling tool still holds it."""
+
+
+    def setUp(self):
+        import us_excel
+        import us_state
+
+        self.main = us_excel
+        self.session = dict(us_state._calc_session)
+        self.app_cache = us_state._app_cache
+        self.manual_since = us_state._manual_since
+
+    def tearDown(self):
+        import us_state
+
+        us_state._calc_session.clear()
+        us_state._calc_session.update(self.session)
+        us_state._app_cache = self.app_cache
+        us_state._manual_since = self.manual_since
+
+    def _flippable_app(self):
+        class FlippableApp:
+            def __init__(self):
+                self.mode = -4135
+
+            @property
+            def api(self):
+                probe = self
+
+                class Api:
+                    @property
+                    def Calculation(self):
+                        return probe.mode
+
+                    @Calculation.setter
+                    def Calculation(self, value):
+                        probe.mode = value
+
+                return Api()
+
+        return FlippableApp()
+
+    def test_watchdog_restores_when_no_sibling_holds(self):
+        import time
+        import us_state
+        from unittest import mock
+
+        app = self._flippable_app()
+        us_state._calc_session.pop("owned", None)
+        us_state._manual_since = time.time() - (us_state.MANUAL_WATCHDOG_SECONDS + 5)
+        with mock.patch.object(
+            self.main.calc_mode_guard, "other_holder_alive", return_value=False
+        ):
+            self.main.ensure_calculation_not_stranded(app)
+        self.assertEqual(app.mode, -4105)
+        self.assertEqual(us_state._manual_since, 0.0)
+
+    def test_watchdog_leaves_manual_while_sibling_holds(self):
+        import time
+        import us_state
+        from unittest import mock
+
+        app = self._flippable_app()
+        us_state._calc_session.pop("owned", None)
+        manual = time.time() - (us_state.MANUAL_WATCHDOG_SECONDS + 5)
+        us_state._manual_since = manual
+        with mock.patch.object(
+            self.main.calc_mode_guard, "other_holder_alive", return_value=True
+        ):
+            self.main.ensure_calculation_not_stranded(app)
+        self.assertEqual(app.mode, -4135)
+        self.assertEqual(us_state._manual_since, manual)
+
+    def test_holder_check_failure_fails_open(self):
+        import time
+        import us_state
+        from unittest import mock
+
+        app = self._flippable_app()
+        us_state._calc_session.pop("owned", None)
+        us_state._manual_since = time.time() - (us_state.MANUAL_WATCHDOG_SECONDS + 5)
+        with mock.patch.object(
+            self.main.calc_mode_guard,
+            "other_holder_alive",
+            side_effect=RuntimeError("boom"),
+        ):
+            self.main.ensure_calculation_not_stranded(app)
+        self.assertEqual(app.mode, -4105)
+
+    def test_skip_log_is_throttled(self):
+        import inspect
+
+        src = inspect.getsource(self.main._other_chain_tool_holds)
+        self.assertIn("calc_watchdog_skip_holder", src)
+        self.assertIn("60.0", src)
+
+
 if __name__ == "__main__":
     unittest.main()

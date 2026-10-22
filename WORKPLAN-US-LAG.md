@@ -57,8 +57,8 @@ Gate after every step: `python -m unittest` all suites in `US Option Chain/sourc
 | C1 | Calc-mode flapping: skip watchdog while `_calc_session.owned`; keep ownership in already-manual branch | DONE (d1807c0) |
 | C2 | COM-tax: excel_info computed only on connection-change; 1 merged block-read replaces ~9 single-cell reads/role; 1 watchdog call/cycle; gate CalculationState probe to 30s; tasklist cache 2s | DONE (8400c8f) |
 | C3 | Unprotected fallback: merge scattered runs into one span-write (unchanged rows carried from prev values) | DONE (bb6dbbe) |
-| C4 | Feed: pollers use wait=False after initial sync; universe timeout 30s->5s; reconnect resubscribe on worker thread (no _sub_lock hold); subscribe log only added>0; prune _quotes to target set; single lock section in _on_record | DONE |
-| C5 | Both-tools coexistence: port B1 protocol into US; no fight over calc mode | PENDING |
+| C4 | Feed: pollers use wait=False after initial sync; universe timeout 30s->5s; reconnect resubscribe on worker thread (no _sub_lock hold); subscribe log only added>0; prune _quotes to target set; single lock section in _on_record | DONE (3f8f202) |
+| C5 | Both-tools coexistence: port B1 protocol into US; no fight over calc mode | DONE |
 | C6 | Observability: `calc_mode_flap` counter + 30s summary log line | PENDING |
 
 ## Track D — Build, verify, ship (before US open ~19:00 IST)
