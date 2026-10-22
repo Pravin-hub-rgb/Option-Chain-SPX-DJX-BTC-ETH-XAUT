@@ -49,6 +49,7 @@ Gate after every step: `python -m unittest` all suites in `US Option Chain/sourc
 | B1 | Delta: calc-mode restore respects other holder (skip restore automatic if another guard holder alive) | DONE (commit 4b0f492, 9 new tests green) |
 | B2 | Log `excel_calc_mode_churn` counter in Delta | DONE as `calc_switch_summary` observer (commit 4b0f492) |
 | B3 | Live local test on tonight's crypto session with measure_strategy/latency_harness; keep client build untouched | DEFERRED at user's discretion (trading done); coexistence covered by the 9 unit tests |
+| B4 | Delta parity: port C2+C3 into the Delta monolith (merged 4x31 strip read, connection-change env detail, 2s tasklist cache, 30s calc probe gate, row-run merged span-write); 33 tests green | DONE |
 
 ## Track C — US lag fixes (land after split; each fix = one module + one test)
 
@@ -67,7 +68,7 @@ Gate after every step: `python -m unittest` all suites in `US Option Chain/sourc
 |---|------|--------|
 | D1 | Full unittest suite green (target >117, incl. new regression tests) | DONE (a027d5c) |
 | D2 | Idle-Excel run: render_cycle <150ms, zero flapping, compare vs baseline | PENDING |
-| D3 | Rebuild EXE via build_exe.bat; verify build_info stamp | DONE |
+| D3 | Rebuild EXE via build_exe.bat; verify build_info stamp | DONE (26a95f6) |
 | D4 | Closed-market smoke: launch our PID, verify A1/strikes/expiries, stop by PID only | PENDING |
 | D5 | Refresh DELIVERY zip + WORKPLAN/DIAGNOSIS handoff note | PENDING |
 | D6 | Client instructions: send %LOCALAPPDATA%\USOptionChain\feed.log speed lines + title-bar recalc after 19:00 open | PENDING |
