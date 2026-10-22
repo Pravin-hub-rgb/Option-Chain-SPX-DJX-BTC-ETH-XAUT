@@ -281,8 +281,8 @@ class UsdFormatTests(unittest.TestCase):
 
     def test_no_per_cell_oi_loop(self):
         import inspect
-        import main
-        src = inspect.getsource(main.force_usd_block_formats)
+        import us_excel
+        src = inspect.getsource(us_excel.force_usd_block_formats)
         self.assertNotIn("for r in range(5, end + 1)", src)
         self.assertIn("rng.value", src)
 
@@ -291,8 +291,8 @@ class ContiguousRunsTests(unittest.TestCase):
     """Only the rows that moved may be written back."""
 
     def setUp(self):
-        import main
-        self.main = main
+        import us_excel
+        self.main = us_excel
 
     def test_single_row(self):
         self.assertEqual(self.main._contiguous_runs([4]), [(4, 4)])
@@ -347,8 +347,8 @@ class TitleBarThrottleTests(unittest.TestCase):
     """Rewriting the window caption repaints the window; do it sparingly."""
 
     def setUp(self):
-        import main
-        self.main = main
+        import us_excel
+        self.main = us_excel
 
     def test_window_status_stores_a_tuple(self):
         """The stored value is (text, timestamp), not bare text."""
@@ -367,20 +367,20 @@ class PerCycleWriteGatingTests(unittest.TestCase):
 
     def test_oi_number_format_is_gated(self):
         import inspect
-        import main
-        src = inspect.getsource(main._write_to_excel)
+        import us_excel
+        src = inspect.getsource(us_excel._write_to_excel)
         self.assertIn("_oi_fmt_done", src)
 
     def test_user_date_format_is_gated(self):
         import inspect
-        import main
-        src = inspect.getsource(main.update_user_dates)
+        import us_excel
+        src = inspect.getsource(us_excel.update_user_dates)
         self.assertIn("_user_fmt_done", src)
 
     def test_row_level_diff_is_used(self):
         import inspect
-        import main
-        src = inspect.getsource(main._write_to_excel)
+        import us_excel
+        src = inspect.getsource(us_excel._write_to_excel)
         self.assertIn("_block_values", src)
         self.assertIn("_contiguous_runs", src)
 
@@ -393,8 +393,8 @@ class PerCycleWriteGatingTests(unittest.TestCase):
         customer scrolls, so scattered changes must fall back to one write.
         """
         import inspect
-        import main
-        src = inspect.getsource(main._flush_block_writes)
+        import us_excel
+        src = inspect.getsource(us_excel._flush_block_writes)
         self.assertNotIn("for start, end in _contiguous_runs(changed):", src)
         self.assertIn("len(runs) == 1", src)
 
@@ -405,16 +405,16 @@ class PerCycleWriteGatingTests(unittest.TestCase):
         not changed and left them empty.
         """
         import inspect
-        import main
-        src = inspect.getsource(main._flush_block_writes)
+        import us_excel
+        src = inspect.getsource(us_excel._flush_block_writes)
         self.assertNotIn("grid = [[None] * width", src)
         self.assertNotIn("(4 + max_rows, width)", src)
 
     def test_header_row_is_read_once_per_sheet(self):
         """Six one-cell header reads per sheet became one row read."""
         import inspect
-        import main
-        src = inspect.getsource(main._write_to_excel)
+        import us_excel
+        src = inspect.getsource(us_excel._write_to_excel)
         self.assertIn("sheet.range((1, 1), (1, 31)).value", src)
         # No per-cell header comparison left.
         self.assertNotIn("sheet.range((1, col_l)).value !=", src)
@@ -431,8 +431,8 @@ class AutoOpenLatchTests(unittest.TestCase):
     """
 
     def setUp(self):
-        import main
-        self.main = main
+        import us_excel
+        self.main = us_excel
 
     def test_latch_exists_per_role(self):
         self.assertEqual(
@@ -447,7 +447,8 @@ class AutoOpenLatchTests(unittest.TestCase):
 
     def test_startup_open_sets_the_latch(self):
         import inspect
-        src = inspect.getsource(self.main.open_excel_files)
+        import us_workbook
+        src = inspect.getsource(us_workbook.open_excel_files)
         self.assertIn("_auto_open_done[role] = True", src)
 
     def test_only_two_places_launch_excel(self):
@@ -455,9 +456,11 @@ class AutoOpenLatchTests(unittest.TestCase):
         import inspect
         import main
         import us_workbook
+        import us_excel
         self.assertEqual(
             inspect.getsource(main).count("os.startfile(")
-            + inspect.getsource(us_workbook).count("os.startfile("),
+            + inspect.getsource(us_workbook).count("os.startfile(")
+            + inspect.getsource(us_excel).count("os.startfile("),
             2,
         )
 
@@ -482,8 +485,8 @@ class SheetStructureGuardTests(unittest.TestCase):
             return R(self._a4)
 
     def setUp(self):
-        import main
-        self.main = main
+        import us_excel
+        self.main = us_excel
 
     def test_intact_sheet_is_ok(self):
         sheet = self.FakeSheet("Call LTP")
@@ -565,8 +568,8 @@ class ParitySpotTests(unittest.TestCase):
         quote age lives in the log instead.
         """
         import inspect
-        import main
-        src = inspect.getsource(main.source_delay_note)
+        import us_excel
+        src = inspect.getsource(us_excel.source_delay_note)
         self.assertNotIn("quote {", src)
         self.assertIn("STALE", src)
         self.assertIn("SPOT MISMATCH", src)
@@ -608,8 +611,8 @@ class BlockWriteSafetyTests(unittest.TestCase):
     """
 
     def setUp(self):
-        import main
-        self.main = main
+        import us_excel
+        self.main = us_excel
 
     def test_blocks_are_written_separately(self):
         import inspect
@@ -711,8 +714,8 @@ class SubscriptionMarginTests(unittest.TestCase):
 
     def test_speed_summary_is_logged(self):
         import inspect
-        import main
-        src = inspect.getsource(main._log_speed_summary)
+        import us_excel
+        src = inspect.getsource(us_excel._log_speed_summary)
         self.assertIn('"speed"', src)
         self.assertIn("cycle_ms", src)
         self.assertIn("recalc_ms", src)

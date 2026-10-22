@@ -56,6 +56,7 @@ DEFAULT_SYMBOL = str(cfg.get("default_symbol", "AAPL")).upper()
 # ki data stale hai. NET_FAIL_LIMIT consecutive failures ke baad header me red
 # tag dikhta hai, aur connection wapas aate hi apne aap hat jaata hai.
 NET_FAIL_LIMIT = 2
+_CALC_IDS = {"automatic": -4105, "semiautomatic": 2, "manual": -4135}
 _net = {"fails": 0, "since": None}
 _net_drawn = {}   # (role, block) -> last text written to that tag cell
 
@@ -110,6 +111,7 @@ _sheet_altered = {r: False for r in ROLE_ORDER}
 _SHORT_BUILD = None
 
 _timezone_warning_logged = False
+_excel_gone_logged = False
 
 _excel_liveness_cache = None  # (monotonic_timestamp, running_bool)
 

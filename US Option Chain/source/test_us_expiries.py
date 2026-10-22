@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import databento_feed
 import main
+import us_excel
 
 
 class DefinitionChunkTests(unittest.TestCase):
@@ -83,7 +84,7 @@ class DropdownOrderTests(unittest.TestCase):
 
     def test_dropdown_uses_date_order(self):
         import inspect
-        src = inspect.getsource(main.update_expiry_dropdowns)
+        src = inspect.getsource(us_excel.update_expiry_dropdowns)
         self.assertIn("by_date=True", src)
 
 

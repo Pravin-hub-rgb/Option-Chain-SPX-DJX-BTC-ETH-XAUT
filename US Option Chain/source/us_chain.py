@@ -566,11 +566,12 @@ async def expiry_roller():
                         print(f"Expiry write-back error ({sym}): {e}", flush=True)
             except Exception as e:
                 print(f"Expiry roller error ({sym}): {e}", flush=True)
-    import main as _main
+    import us_excel as _main
 
 
 
 async def process_pending_dates():
+    import us_excel as _main
     global _pending_date_loads
     while True:
         if _pending_date_loads:
