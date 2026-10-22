@@ -621,7 +621,7 @@ class BlockWriteSafetyTests(unittest.TestCase):
         self.assertNotIn("sheet.range((5, 1), (4 + max_rows, width))", src)
         self.assertNotIn("excel_blocks_batched", src)
         # Each block is written on its own.
-        self.assertIn("for bi, block, chain, n_rows, runs in pending:", src)
+        self.assertIn("for bi, block, chain, n_rows, runs, prev in pending:", src)
         self.assertIn("block[\"start\"]", src)
 
     def test_a_failed_block_write_does_not_stop_the_others(self):
@@ -923,6 +923,30 @@ class ComTaxTests(unittest.TestCase):
         src = inspect.getsource(self.main._probe_calc_state_after_restore)
         self.assertIn("30.0", src)
         self.assertIn("us_state._calc_state_probe", src)
+
+
+
+class UnprotectedMergeTests(unittest.TestCase):
+    """The unprotected window writes one merged span, not many small ones."""
+
+
+    def setUp(self):
+        import us_excel
+        self.main = us_excel
+
+    def test_scattered_runs_become_one_span_write(self):
+        import inspect
+
+        src = inspect.getsource(self.main._flush_block_writes)
+        self.assertIn("merged_rows", src)
+        self.assertNotIn("for start, end in runs:", src)
+        self.assertIn("excel_rows_written", src)
+
+    def test_unchanged_rows_carry_the_previous_values(self):
+        import inspect
+
+        src = inspect.getsource(self.main._flush_block_writes)
+        self.assertIn("list(prev[i])", src)
 
 
 if __name__ == "__main__":

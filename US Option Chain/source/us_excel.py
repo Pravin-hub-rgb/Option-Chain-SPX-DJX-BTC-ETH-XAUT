@@ -1060,7 +1060,7 @@ def _write_to_excel(role):
                         us_state._cycle_wrote = True
                         # The Excel write is deferred to the end of the block
                         # loop, so all of this sheet's blocks go out together.
-                        pending_writes.append((bi, block, chain, n_rows, runs))
+                        pending_writes.append((bi, block, chain, n_rows, runs, prev))
                     else:
                         _performance_metrics.record(role, "excel_range_skipped", 0.0, rows=n_rows)
                 finally:
@@ -1173,9 +1173,10 @@ def _flush_block_writes(sheet, role, pending):
       call.
     - When we could not get manual calculation - Excel was busy, or a dialog
       was up - every cell written can trigger a recalculation of the
-      customer's own workbook. That is the case that made their sheet crawl, so
-      write as few cells as possible: only the rows that moved, one call per
-      contiguous run.
+      customer's own workbook. That is the case that made their sheet crawl.
+      Scattered runs are merged into one span-write whose unchanged rows
+      carry the previous values, so the dirty set stays small in Excel's
+      eyes while the number of COM calls stays at one.
 
     Either way each block is written on its own, into its own columns, so a
     block that did not change is never touched.
@@ -1185,7 +1186,7 @@ def _flush_block_writes(sheet, role, pending):
     started = time.perf_counter()
     protected = _calc_session.get("owned") and not _calc_session.get("failed")
     try:
-        for bi, block, chain, n_rows, runs in pending:
+        for bi, block, chain, n_rows, runs, prev in pending:
             try:
                 if protected:
                     if len(runs) == 1:
@@ -1203,16 +1204,26 @@ def _flush_block_writes(sheet, role, pending):
                         ).value = chain
                 else:
                     # Unprotected window: every cell can trigger a recalc of
-                    # the customer's workbook, so touch as few cells as we can.
+                    # the customer's workbook, so the write window is one
+                    # merged span instead of one call per contiguous run.
                     if runs and len(runs) <= 8:
-                        for start, end in runs:
-                            sheet.range(
-                                (5 + start, block["start"]),
-                                (4 + end, block["start"] + 8),
-                            ).value = chain.iloc[start : end + 1].values
+                        lo = runs[0][0]
+                        hi = runs[-1][1]
+                        merged_rows = []
+                        for i in range(lo, hi + 1):
+                            in_run = any(start <= i <= end for start, end in runs)
+                            if in_run:
+                                merged_rows.append(list(chain.iloc[i].values))
+                            elif prev is not None and i < len(prev):
+                                merged_rows.append(list(prev[i]))
+                            else:
+                                merged_rows.append(list(chain.iloc[i].values))
+                        sheet.range(
+                            (5 + lo, block["start"]),
+                            (4 + hi, block["start"] + 8),
+                        ).value = merged_rows
                         _performance_metrics.record(
-                            role, "excel_rows_written", 0.0,
-                            rows=sum(end - start + 1 for start, end in runs),
+                            role, "excel_rows_written", 0.0, rows=hi - lo + 1
                         )
                     else:
                         sheet.range((5, block["start"])).options(
