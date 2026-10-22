@@ -386,6 +386,30 @@ def ensure_api_key() -> str | None:
     return key
 
 
+def clear_saved_key() -> None:
+    """Forget the key stored on disk so the next ensure asks for a new one.
+
+    This fires when the saved key is rejected by Databento's API (expired or
+    revoked). Without it, ensure_api_key would hand the same dead key back
+    on every call and the customer would never be asked again.
+    """
+    path = key_path()
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            ctypes.windll.kernel32.SetFileAttributesW(path, 0x80)
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        try:
+            with open(path, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write("\n")
+        except OSError:
+            pass
+
+
 def _db():
     import databento
 

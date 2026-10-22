@@ -129,5 +129,77 @@ class LockFileTests(unittest.TestCase):
         self.assertIn("RuntimeError", src)
 
 
+class DatabentoKeyGateTests(unittest.TestCase):
+    """A key saved on disk can die at any time; the app must not open on it."""
+
+    def _gate(self, ensure, validate, calls):
+        return main._ensure_working_databento_key(
+            _ensure=ensure,
+            _validate=validate,
+            _drop=lambda: calls.append("drop"),
+            _error=lambda msg: calls.append(("error", msg)),
+            _exit=lambda code: calls.append(("exit", code)),
+        )
+
+    @staticmethod
+    def _errors(calls):
+        return [msg for call in calls if isinstance(call, tuple)
+                and call[0] == "error" for msg in call[1:]]
+
+    def test_dead_saved_key_is_wiped_and_asked_again(self):
+        keys = iter(["db-expired", "db-new"])
+        attempts = []
+
+        def ensure():
+            key = next(keys)
+            attempts.append(key)
+            return key
+
+        def validate(key):
+            return (False, "Databento rejected this key.") if key.endswith(
+                "expired"
+            ) else (True, "")
+
+        calls = []
+        self.assertEqual("db-new", self._gate(ensure, validate, calls))
+        self.assertEqual(["drop"], [c for c in calls if c == "drop"])
+        self.assertEqual(1, len(self._errors(calls)))
+
+    def test_dead_key_twice_exits_instead_of_looping_dialogs(self):
+        calls = []
+
+        def ensure():
+            return "db-expired-from-env"
+
+        with self.assertRaises(SystemExit):
+            self._gate(ensure, lambda key: (False, "rejected"), calls)
+        self.assertTrue(
+            any(("exit", 1) == c for c in calls),
+            calls,
+        )
+
+    def test_cancelled_dialog_closes_the_app(self):
+        calls = []
+
+        def ensure():
+            return None
+
+        with self.assertRaises(SystemExit):
+            self._gate(ensure, lambda key: (True, ""), calls)
+        self.assertTrue(any(("exit", 1) == c for c in calls))
+
+    def test_first_error_message_reaches_the_dialog(self):
+        calls = []
+
+        def ensure():
+            return "db-k"
+
+        with self.assertRaises(SystemExit):
+            self._gate(ensure, lambda key: (False, "Cannot reach Databento."), calls)
+        self.assertTrue(
+            any("Cannot reach Databento" in m for m in self._errors(calls))
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

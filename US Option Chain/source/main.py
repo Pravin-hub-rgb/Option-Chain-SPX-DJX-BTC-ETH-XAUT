@@ -68,11 +68,88 @@ async def main_async():
     )
 
 
-def _start_databento():
-    """Resolve the per-PC key and start the live feed.
+def _ensure_working_databento_key(
+    _ensure=None, _validate=None, _drop=None, _error=None, _exit=None
+):
+    """Gate the app behind a key Databento actually accepts.
 
-    The Databento key is mandatory: if it cannot be resolved (env / key file /
-    first-run dialog all empty or cancelled) the app exits with an error box.
+    The key can sit on disk from a run months ago and be dead by now (expired
+    subscription, rotation). This runs BEFORE anything opens: Excel, templates
+    and polling all stay shut until a live key is present. A rejected key is
+    wiped from disk and asked for again; a cancel/blank exits the app.
+    """
+    ensure = _ensure or databento_feed.ensure_api_key
+    validate = _validate or databento_feed.validate_api_key
+    drop = _drop or databento_feed.clear_saved_key
+    error = _error or show_error
+    exit_ = _exit or os._exit
+    last_rejected = None
+    while True:
+        try:
+            key = ensure()
+        except Exception as e:
+            feed_log(
+                "databento_key_error", error=type(e).__name__, detail=str(e)[:180]
+            )
+            try:
+                append_app_exception("resolving Databento API key", e)
+            except OSError:
+                pass
+            error(
+                "Could not resolve the Databento API key.\n\n"
+                f"{type(e).__name__}: {e}\n\n"
+                "Contact the owner for a valid key."
+            )
+            exit_(1)
+            raise SystemExit(1)
+        if not key:
+            feed_log("databento_no_key", note="dialog cancelled or blank")
+            error(
+                "Databento API key required.\n\n"
+                "Enter the Databento API key to continue.\n"
+                "The key is stored only on this PC, never in the app folder.\n"
+                "App will close."
+            )
+            exit_(1)
+            raise SystemExit(1)
+        ok, detail = validate(key)
+        if ok:
+            feed_log("databento_key_ok", masked=databento_feed.mask_key(key))
+            return key
+        feed_log(
+            "databento_key_rejected",
+            masked=databento_feed.mask_key(key),
+            detail=detail[:180],
+        )
+        drop()
+        # A dead key that keeps coming back (a dead env var for example) must
+        # not trap the app in an endless ask loop.
+        broke = key == last_rejected
+        last_rejected = key
+        error(
+            "The saved Databento key was rejected.\n\n"
+            f"{detail}\n\n"
+            "A new key will be asked for. The option chain will not open "
+            "until a valid key is entered."
+        )
+        if broke:
+            error(
+                "The same key keeps being rejected, so it is coming from the "
+                "DATABENTO_API_KEY environment variable and cannot be replaced "
+                "by the app.\n\n"
+                "Remove that variable or paste a valid key there, then run "
+                "again. App will close."
+            )
+            exit_(1)
+            raise SystemExit(1)
+
+
+def _start_databento():
+    """Resolve a live Databento key and start the feed.
+
+    The key is validated against Databento's API here, before any Excel
+    window or workbook exists. A dead key loops back to the entry dialog
+    until a live one is inside, or the app exits.
     """
     global _databento_feed
     from importlib.util import find_spec
@@ -83,29 +160,7 @@ def _start_databento():
             "Reinstall the application or contact the owner."
         )
         os._exit(1)
-    try:
-        key = databento_feed.ensure_api_key()
-    except Exception as e:
-        feed_log("databento_key_error", error=type(e).__name__, detail=str(e)[:180])
-        try:
-            append_app_exception("resolving Databento API key", e)
-        except OSError:
-            pass
-        show_error(
-            "Could not resolve the Databento API key.\n\n"
-            f"{type(e).__name__}: {e}\n\n"
-            "Contact the owner for a valid key."
-        )
-        os._exit(1)
-    if not key:
-        feed_log("databento_no_key", note="dialog cancelled or blank")
-        show_error(
-            "Databento API key required.\n\n"
-            "Enter the Databento API key to continue.\n"
-            "The key is stored only on this PC, never in the app folder.\n"
-            "App will close."
-        )
-        os._exit(1)
+    key = _ensure_working_databento_key()
     _databento_feed = databento_feed.DatabentoFeed(key, event_log=feed_log)
     us_state._databento_feed = _databento_feed
     feed_log("databento_key_loaded", masked=databento_feed.mask_key(key))
