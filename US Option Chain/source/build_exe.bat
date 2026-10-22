@@ -58,7 +58,7 @@ rem separate .sha256 file that used to be shipped beside the ZIP. Support now
 rem reads build_id from startup_diag.log instead.
 rem Only files that actually ship count towards the hash. Tests and scratch
 rem scripts are not part of the delivered product, so editing a test must not
-remake the build id.
+rem remake the build id.
 set "BUILD_SHA=source-local"
 for /f "delims=" %%i in ('python -c "import hashlib,pathlib; r=pathlib.Path('.'); EX=('license.json',); fs=sorted(p for p in r.iterdir() if p.is_file() and p.suffix.lower() in {'.py','.json','.spec'} and not p.name.startswith(('_','test_')) and p.name not in EX); h=hashlib.sha256(); [h.update(p.name.encode()+b'\0'+p.read_bytes()) for p in fs]; print('src-'+h.hexdigest()[:12])"') do set "BUILD_SHA=%%i"
 > "dist\%PRODUCT_EXE%\build_info.txt" echo product=us
@@ -80,7 +80,7 @@ if errorlevel 8 (
 )
 
 rem Excel templates (also auto-created at runtime, but ship pre-built)
-python -c "import main; main.ensure_excel_file('spx'); main.ensure_excel_file('djx'); main.ensure_excel_file('stock')"
+python -c "import us_workbook; us_workbook.ensure_excel_file('spx'); us_workbook.ensure_excel_file('djx'); us_workbook.ensure_excel_file('stock')"
 if exist "spx_option_chain.xlsx" copy /y "spx_option_chain.xlsx" "%PKG%\" >nul
 if exist "djx_option_chain.xlsx" copy /y "djx_option_chain.xlsx" "%PKG%\" >nul
 if exist "us_stock_option_chain.xlsx" copy /y "us_stock_option_chain.xlsx" "%PKG%\" >nul

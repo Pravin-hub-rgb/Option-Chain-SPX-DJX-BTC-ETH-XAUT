@@ -65,9 +65,9 @@ Gate after every step: `python -m unittest` all suites in `US Option Chain/sourc
 
 | # | Task | Status |
 |---|------|--------|
-| D1 | Full unittest suite green (target >117, incl. new regression tests) | DONE |
+| D1 | Full unittest suite green (target >117, incl. new regression tests) | DONE (a027d5c) |
 | D2 | Idle-Excel run: render_cycle <150ms, zero flapping, compare vs baseline | PENDING |
-| D3 | Rebuild EXE via build_exe.bat; verify build_info stamp | PENDING |
+| D3 | Rebuild EXE via build_exe.bat; verify build_info stamp | DONE |
 | D4 | Closed-market smoke: launch our PID, verify A1/strikes/expiries, stop by PID only | PENDING |
 | D5 | Refresh DELIVERY zip + WORKPLAN/DIAGNOSIS handoff note | PENDING |
 | D6 | Client instructions: send %LOCALAPPDATA%\USOptionChain\feed.log speed lines + title-bar recalc after 19:00 open | PENDING |
