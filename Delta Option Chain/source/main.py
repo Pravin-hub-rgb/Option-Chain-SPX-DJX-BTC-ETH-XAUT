@@ -196,6 +196,10 @@ _FIRST_SIGHT_BOUND = 300
 # Per (asset, block) payload signature, so an unchanged chain is not rewritten
 # to Excel at all.
 _block_payload = {}
+# Per (asset, block) previous rows, so a change inside the block can be
+# written as one span that carries the unchanged rows instead of a
+# whole-block repaint or one call per scattered row.
+_block_values = {}
 _block_hidden = {}
 available_dates = {"BTC": [], "ETH": [], "XAUT": []}
 _dropdown_sig = {}
@@ -1314,19 +1318,19 @@ def build_option_chain(asset, expiry_iso, range_val=50):
     return merged[available], pcr
 
 
-def update_user_dates(asset, book, sheet):
+def update_user_dates(asset, book, sheet, pre=None):
     """Read date cells only — HTTP loads are queued to date_loader (never blocks event loop)."""
-    for i, cell in enumerate(["D3", "O3", "Z3"]):
+    for i, col3 in enumerate((4, 15, 26)):
         if i >= n_blocks(asset):
             # block not shown (e.g. XAUT 3rd) — keep its date cell empty
-            rng = sheet.range(cell)
-            if rng.value not in (None, ""):
+            rng = sheet.range((3, col3))
+            if cell_value(pre, sheet, 3, col3) not in (None, ""):
                 _set_date_cell(rng, "")
             user_pinned[asset][i] = False
             _date_req_sig.pop((asset, i), None)
             continue
-        rng = sheet.range(cell)
-        val = rng.value
+        rng = sheet.range((3, col3))
+        val = cell_value(pre, sheet, 3, col3)
         if val is None or (isinstance(val, str) and val.strip() == ""):
             _set_date_cell(rng, iso_to_user(active_expiries[asset][i]))
             user_pinned[asset][i] = False
@@ -1400,8 +1404,19 @@ def excel_apps_count(xw):
 
 _excel_liveness_cache = None  # (monotonic_timestamp, running_bool)
 
+# True only while THIS window holds Excel in manual (we set it and will
+# put it back). The write path can go row-granularity when we own the
+# mode; when somebody else owns the sheet everything degrades to one
+# merged span so the customer's workbook recalc is hit exactly once.
+_bulk_owning_manual = False
 
-def excel_process_running(max_age=1.0):
+# (monotonic_stamp, second-pass flag) for the post-restore
+# CalculationState probe; the flag only needs one COM read per half
+# minute.
+_calc_state_probe = None
+
+
+def excel_process_running(max_age=2.0):
     """True if any EXCEL.EXE is alive, checked without touching COM.
 
     When Excel crashes or is killed, the cached COM server is a dead reference.
@@ -1462,6 +1477,50 @@ def find_open_book(xw, fname):
                 log_excel_exception(asset, e, "reading open workbook path")
                 continue
     return None
+
+
+def _contiguous_runs(indices):
+    """Merge changed-row indices into contiguous (start, end) runs.
+
+    Writing once per contiguous run used to cost a COM call per run; each
+    round-trip costs about 33ms, so a dozen scattered moves froze the
+    sheet for roughly a third of a second. Runs give the writer one
+    addressable span instead.
+    """
+    if not indices:
+        return []
+    runs = []
+    start = previous = indices[0]
+    for index in indices[1:]:
+        if index == previous + 1:
+            previous = index
+        else:
+            runs.append((start, previous))
+            start = previous = index
+    runs.append((start, previous))
+    return runs
+
+
+def cell_value(pre, sheet, row, col):
+    """Read one cell from the merged 4x31 pre-read, falling back to COM.
+
+    The sheet's status strip (A2/B2, the three date cells D3/O3/Z3 and
+    the block header texts) fits inside rows 1-4, columns 1-31, so one
+    block read per sheet replaces about a dozen individual cell reads
+    every cycle. Individual reads only happen if the merged one failed.
+    """
+    if pre is not None:
+        try:
+            block = pre[row - 1][col - 1]
+        except Exception:
+            return None
+        return block if block is not None else None
+    if sheet is None:
+        return None
+    try:
+        return sheet.range((row, col)).value
+    except Exception:
+        return None
 
 
 def force_usd_block_formats(sheet, block, asset, bi, n_rows):
@@ -1768,13 +1827,27 @@ def _write_to_excel(asset):
         excel_connected[asset] = True
         excel_startup_notice_shown[asset] = False
         show_status(book, asset, "LIVE")
-        record_excel_connection(asset, "connected", f"workbook={fname}; {excel_environment_detail(book)}")
+        if _excel_connection_status.get(asset) != "connected":
+            record_excel_connection(
+                asset, "connected", f"workbook={fname}; {excel_environment_detail(book)}"
+            )
+        else:
+            record_excel_connection(asset, "connected", "")
         sheet = cached_sheet
         if sheet is None:
             sheet = book.sheets[0]
             _sheet_cache[asset] = sheet
 
-        v = sheet.range("A2").value
+        # One merged read for the whole status strip; any per-cell read
+        # below falls back through cell_value() only if this failed.
+        try:
+            pre_rows = sheet.range((1, 1), (4, 31)).value
+            pre = pre_rows if isinstance(pre_rows, list) and isinstance(pre_rows[0], list) else None
+        except Exception as e:
+            log_excel_exception(asset, e, "merged status strip read")
+            pre = None
+
+        v = cell_value(pre, sheet, 2, 1)
         if isinstance(v, str):
             try:
                 v = float(v.strip())
@@ -1785,14 +1858,14 @@ def _write_to_excel(asset):
         # B2 hint — re-write only if missing (user can't permanently lose it)
         try:
             b2 = sheet.range("B2")
-            if b2.value != "Total strikes — edit A2":
+            if cell_value(pre, sheet, 2, 2) != "Total strikes — edit A2":
                 b2.value = "Total strikes — edit A2"
                 b2.font.bold = True
                 b2.font.color = (89, 89, 89)
         except Exception as e:
             log_excel_exception(asset, e, "updating worksheet instruction")
 
-        update_user_dates(asset, book, sheet)
+        update_user_dates(asset, book, sheet, pre)
 
         # expiry dropdown (list of DD/MM/YYYY dates) — refresh when list changes
         _sig = tuple(available_dates[asset])
@@ -1868,10 +1941,10 @@ def _write_to_excel(asset):
             spot_text = f"{asset} Spot: {sp:.2f} | {cnt} strikes"
             pcr_text = f"PCR: {pcr:.2f}"
             try:
-                if sheet.range((1, col_l)).value != spot_text:
+                if cell_value(pre, sheet, 1, col_l) != spot_text:
                     sheet.range((1, col_l)).value = spot_text
                     _cycle_wrote = True
-                if sheet.range((1, col_l + 4)).value != pcr_text:
+                if cell_value(pre, sheet, 1, col_l + 4) != pcr_text:
                     sheet.range((1, col_l + 4)).value = pcr_text
                     _cycle_wrote = True
             except Exception as e:
@@ -1895,9 +1968,43 @@ def _write_to_excel(asset):
                     # rewrite for no visible difference.
                     payload_sig = hash(tuple(map(tuple, chain.values.tolist())))
                     if payload_sig != _block_payload.get((asset, bi)):
+                        values = chain.values.tolist()
+                        prev = _block_values.get((asset, bi))
+                        changed = None
+                        if prev is not None and len(prev) == len(values):
+                            changed = [i for i in range(len(values)) if list(prev[i]) != list(values[i])]
+                        runs = _contiguous_runs(changed) if changed else []
+                        protected = _bulk_owning_manual
+                        try:
+                            if protected and len(runs) == 1:
+                                start, end = runs[0]
+                                sheet.range(
+                                    (5 + start, block["start"]),
+                                    (4 + end, block["start"] + 8),
+                                ).value = chain.iloc[start : end + 1].values
+                            elif not protected and runs and len(runs) <= 8:
+                                lo = runs[0][0]
+                                hi = runs[-1][1]
+                                merged_rows = []
+                                for i in range(lo, hi + 1):
+                                    in_run = any(s <= i <= e for s, e in runs)
+                                    if in_run:
+                                        merged_rows.append(list(values[i]))
+                                    elif i < len(prev):
+                                        merged_rows.append(list(prev[i]))
+                                    else:
+                                        merged_rows.append(list(values[i]))
+                                sheet.range(
+                                    (5 + lo, block["start"]),
+                                    (4 + hi, block["start"] + 8),
+                                ).value = merged_rows
+                            else:
+                                sheet.range((5, block["start"])).options(index=False, header=False).value = chain
+                            _cycle_wrote = True
+                        except Exception as e:
+                            log_excel_exception(asset, e, f"writing chain rows block {bi + 1}")
                         _block_payload[(asset, bi)] = payload_sig
-                        sheet.range((5, block["start"])).options(index=False, header=False).value = chain
-                        _cycle_wrote = True
+                        _block_values[(asset, bi)] = values
                     else:
                         _performance_metrics.record(asset, "excel_range_skipped", 0.0, rows=cnt)
                 finally:
@@ -2228,9 +2335,10 @@ def _begin_excel_bulk_mode():
                 # If the workbook was already on automatic, Excel will
                 # recalculate by itself once we restore. Semiautomatic does
                 # the same for ordinary formulas.
-                global _bulk_will_recalc
+                global _bulk_will_recalc, _bulk_owning_manual
                 _bulk_will_recalc = state["calc"] in ("automatic", "semiautomatic")
                 app.calculation = "manual"
+                _bulk_owning_manual = True
         except Exception as e:
             log_excel_exception("ALL", e, "switching to manual calculation")
             state["calc"] = None
@@ -2239,6 +2347,8 @@ def _begin_excel_bulk_mode():
         return None
 
     def restore():
+        global _bulk_owning_manual
+        _bulk_owning_manual = False
         app = state.get("app")
         if app is None:
             return
@@ -2331,6 +2441,30 @@ def _time_recalc(wrote):
     return elapsed
 
 
+def _probe_calc_state_after_restore():
+    """One CalculationState COM read per half minute, instead of per cycle.
+
+    The probe only asks whether Excel still owed a recalculation after the
+    restore, which is a slow-changing signal; reading it every cycle added
+    a round-trip per pass for no extra insight.
+    """
+    global _calc_state_probe
+    if _app_cache is None:
+        return
+    now = time.monotonic()
+    cached = _calc_state_probe
+    if cached is not None and now - cached[0] < 30.0:
+        _performance_metrics.record("ALL", "excel_recalc_second_pass", cached[1])
+        return
+    try:
+        state = int(_app_cache.api.CalculationState)
+    except Exception:
+        return
+    hit = 1.0 if state != 0 else 0.0
+    _calc_state_probe = (now, hit)
+    _performance_metrics.record("ALL", "excel_recalc_second_pass", hit)
+
+
 def render_cycle():
     """One full pass over every workbook, inside a single bulk-mode window.
 
@@ -2365,10 +2499,7 @@ def render_cycle():
                 # calculating or pending, restoring started a second,
                 # duplicated pass and the cost is being paid twice.
                 try:
-                    if _app_cache is not None and int(_app_cache.api.CalculationState) != 0:
-                        _performance_metrics.record("ALL", "excel_recalc_second_pass", 1.0)
-                    else:
-                        _performance_metrics.record("ALL", "excel_recalc_second_pass", 0.0)
+                    _probe_calc_state_after_restore()
                 except Exception:
                     pass
             except Exception as e:
@@ -2376,6 +2507,7 @@ def render_cycle():
         elapsed = time.perf_counter() - started
         _performance_metrics.record("ALL", "render_cycle", elapsed)
         # Never leave the trader in manual calculation between write windows.
+        # (kept: the watchdog stays exactly once per cycle, in render_cycle)
         try:
             ensure_calculation_not_stranded()
         except Exception:
