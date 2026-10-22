@@ -30,7 +30,7 @@ Baseline numbers (idle machine, this morning): render_cycle avg 191ms / max 311m
 |---|------|--------|
 | 0 | .gitignore extended (DELIVERY/, client package/, RUN-THIS/, GIT-BACKUP/, *.exe, *.xlsx, *.bak, .pytest_cache/) | DONE |
 | 0 | git init -b main, remote origin attached, SSH auth tested OK (Pravin-hub-rgb) | DONE |
-| 0 | git fetch, reconcile with remote history, baseline commit, push | PENDING |
+| 0 | git fetch, reconcile with remote history, baseline commit, push | DONE (baseline 0e17db3, history preserved from 4703491) |
 | A1 | Move shared globals into `us_state.py`; import check + 117 tests; commit | PENDING |
 | A2 | Extract `us_licensing.py` (~500 LOC key/licence/dialogs); verify; commit | PENDING |
 | A3 | Extract `us_workbook.py` (~220 LOC template/ensure/open); verify; commit | PENDING |

@@ -2029,6 +2029,78 @@ MANUAL_WATCHDOG_SECONDS = 4.0
 # busy, so a "did the restore work?" check built on it can pass falsely and leave
 # the trader stuck on manual. Set AND verify through the raw API with these ids.
 _CALC_IDS = {"automatic": -4105, "semiautomatic": 2, "manual": -4135}
+_CALC_ID_NAMES = {-4105: "automatic", 2: "semiautomatic", -4135: "manual"}
+
+# Calculation-mode churn tracking: any observed transition between Excel's
+# raw calculation id from one render cycle to the next is counted, whoever
+# caused it (this tool, the sibling chain product, or the customer). On a
+# healthy session the counter stays flat; the moment the two tools start
+# fighting over the mode it climbs every few seconds, which the summary log
+# line makes visible without any profiling.
+_last_observed_calc_raw = None
+_calc_churn_count = 0
+_calc_churn_summary_after = 0.0
+_CALC_CHURN_SUMMARY_SECONDS = 60.0
+
+_calc_watchdog_skip_logged_at = 0.0
+
+
+def _observe_raw_calc(raw):
+    """Count a transition of Excel's calculation mode between cycles.
+
+    raw comes from the read `_begin_excel_bulk_mode` already does every
+    cycle, so this adds no COM round-trips. An unreadable value (None)
+    resets the baseline so a single glitch is not mistaken for a flip.
+    """
+    global _last_observed_calc_raw, _calc_churn_count, _calc_churn_summary_after
+    if raw is None:
+        _last_observed_calc_raw = None
+        return
+    previous = _last_observed_calc_raw
+    _last_observed_calc_raw = raw
+    if previous is None or previous == raw:
+        return
+    _calc_churn_count += 1
+    now = time.time()
+    if now >= _calc_churn_summary_after:
+        _calc_churn_summary_after = now + _CALC_CHURN_SUMMARY_SECONDS
+        feed_log(
+            "calc_switch_summary",
+            churn_total=_calc_churn_count,
+            last_from=_CALC_ID_NAMES.get(previous, str(previous)),
+            last_to=_CALC_ID_NAMES.get(raw, str(raw)),
+            note="cumulative calculation-mode transitions seen between cycles",
+        )
+
+
+def _other_chain_tool_holds():
+    """True when the current manual window belongs to a still-running tool.
+
+    The 4s watchdog must never rescue a mode a live tool owns: the sibling
+    chain product deliberately holds manual between its sheets, and flipping
+    to automatic underneath it made Excel flap every few seconds whenever
+    both tools ran together.
+    """
+    global _calc_watchdog_skip_logged_at
+    try:
+        holds = calc_mode_guard.other_holder_alive(PRODUCT_ID)
+    except Exception as e:
+        feed_log(
+            "calc_watchdog_holdercheck_error",
+            error=type(e).__name__,
+            detail=str(e)[:150],
+        )
+        return False
+    if not holds:
+        return False
+    now = time.time()
+    if now - _calc_watchdog_skip_logged_at >= 60.0:
+        _calc_watchdog_skip_logged_at = now
+        feed_log(
+            "calc_watchdog_skip_holder",
+            note="another chain tool holds manual calculation; watchdog left it alone",
+        )
+    return True
 
 
 def _raw_calc_mode(app):
@@ -2064,6 +2136,8 @@ def ensure_calculation_not_stranded(app=None):
         _manual_since = now
         return
     if now - _manual_since < MANUAL_WATCHDOG_SECONDS:
+        return
+    if _other_chain_tool_holds():
         return
     try:
         if _set_calc_mode(app, "automatic"):
@@ -2131,6 +2205,7 @@ def _begin_excel_bulk_mode():
                 raw = int(app.api.Calculation)
             except Exception:
                 raw = None
+            _observe_raw_calc(raw)
             current = {
                 -4105: "automatic",   # xlCalculationAutomatic
                 2: "semiautomatic",   # xlCalculationSemiautomatic

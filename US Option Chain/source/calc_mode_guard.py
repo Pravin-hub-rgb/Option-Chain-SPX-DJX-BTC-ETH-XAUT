@@ -204,6 +204,28 @@ def release(product):
     clear_record()
 
 
+def other_holder_alive(product):
+    """True if a live process other than `product` still holds the record.
+
+    The 4s watchdogs in both tools must not rescue a manual window that a
+    running tool still owns: the sibling chain tool deliberately holds manual
+    for as long as it keeps writing sheets, and flipping to automatic
+    underneath it is exactly the flapping the guard exists to prevent.
+    """
+    data = _read()
+    if data is None:
+        return False
+    holders = data.get("holders")
+    if not isinstance(holders, dict):
+        return False
+    for key, pid in holders.items():
+        if str(key) == str(product):
+            continue
+        if _process_alive(pid):
+            return True
+    return False
+
+
 def pending_recovery():
     """(should_restore, mode, reason) for a record left behind by a dead run."""
     data = _read()
