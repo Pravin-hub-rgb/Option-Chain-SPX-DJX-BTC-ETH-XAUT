@@ -38,7 +38,7 @@ Baseline numbers (idle machine, this morning): render_cycle avg 191ms / max 311m
 | A5 | Extract `us_chain.py` (~1,100 LOC symbol state, expiry, build, pollers); verify; commit | DONE (149e75e) |
 | A6 | Extract `us_excel.py` (~1,700 LOC all COM writes, bulk mode, render cycle); verify; commit | DONE (df519d7) |
 | A7 | Extract `us_instance.py` (lock/pid/guard + calc-mode lifecycle); verify; commit | DONE (96a69ae) |
-| A8 | Slim main.py to wiring (main_async, startup, feed start/stop); print_chain to us_chain, flush to us_performance; full suite; commit | DONE |
+| A8 | Slim main.py to wiring (main_async, startup, feed start/stop); print_chain to us_chain, flush to us_performance; full suite; commit | DONE (3be49ed) |
 
 Gate after every step: `python -m unittest` all suites in `US Option Chain/source` + `python -c "import main"` passes.
 
@@ -54,7 +54,7 @@ Gate after every step: `python -m unittest` all suites in `US Option Chain/sourc
 
 | # | Task | Status |
 |---|------|--------|
-| C1 | Calc-mode flapping: skip watchdog while `_calc_session.owned`; keep ownership in already-manual branch | PENDING |
+| C1 | Calc-mode flapping: skip watchdog while `_calc_session.owned`; keep ownership in already-manual branch | DONE (4 CalcFlapGuardTests) |
 | C2 | COM-tax: excel_info computed only on connection-change; 1 merged block-read replaces ~9 single-cell reads/role; 1 watchdog call/cycle; gate CalculationState probe to 30s; tasklist cache 2s | PENDING |
 | C3 | Unprotected fallback: merge scattered runs into one span-write (unchanged rows carried from prev values) | PENDING |
 | C4 | Feed: pollers use wait=False after initial sync; universe timeout 30s->5s; reconnect resubscribe on worker thread (no _sub_lock hold); subscribe log only added>0; prune _quotes to target set; single lock section in _on_record | PENDING |

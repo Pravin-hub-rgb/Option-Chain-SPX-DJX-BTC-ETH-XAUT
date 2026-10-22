@@ -722,5 +722,156 @@ class SubscriptionMarginTests(unittest.TestCase):
         self.assertIn("spot_quote_age_s", src)
 
 
+
+class CalcFlapGuardTests(unittest.TestCase):
+    """Session-owned manual calculation must not flap.
+
+    The watchdog used to fight our own write window, and the already-manual
+    branch used to drop the ownership flag every cycle, so the mode flipped
+    automatic / manual every couple of seconds and Excel recalculated on
+    nearly every visible move.
+    """
+
+    def setUp(self):
+        import us_state
+
+        self.session = dict(us_state._calc_session)
+        self.app_cache = us_state._app_cache
+        self.manual_since = us_state._manual_since
+
+    def tearDown(self):
+        import us_state
+
+        us_state._calc_session.clear()
+        us_state._calc_session.update(self.session)
+        us_state._app_cache = self.app_cache
+        us_state._manual_since = self.manual_since
+
+    def test_watchdog_steps_aside_while_we_own_manual(self):
+        import us_state
+        import us_excel
+
+        class DeadApp:
+            @property
+            def version(self):
+                raise AssertionError("watchdog must not touch Excel")
+
+        app = DeadApp()
+        us_state._calc_session["owned"] = True
+        us_state._calc_session["failed"] = False
+        us_excel.ensure_calculation_not_stranded(app)
+        self.assertEqual(us_state._manual_since, 0.0)
+
+    def test_watchdog_fires_outside_our_session(self):
+        import us_state
+        import us_excel
+        import time
+
+        class FlippableApp:
+            def __init__(self):
+                self.mode = -4135
+
+            @property
+            def version(self):
+                return "16.0"
+
+            @property
+            def api(self):
+                probe = self
+                class Api:
+                    @property
+                    def Calculation(self):
+                        return probe.mode
+
+                    @Calculation.setter
+                    def Calculation(self, value):
+                        probe.mode = value
+                return Api()
+
+            @property
+            def _calc_value(self):
+                return self.mode
+
+            @property
+            def Calculation(self):
+                return self.mode
+
+        app = FlippableApp()
+        us_state._calc_session.pop("owned", None)
+        us_state._manual_since = time.time() - (us_state.MANUAL_WATCHDOG_SECONDS + 5)
+        us_excel.ensure_calculation_not_stranded(app)
+        self.assertEqual(app.mode, -4105)
+        self.assertEqual(us_state._manual_since, 0.0)
+
+    def test_already_manual_branch_keeps_the_ownership(self):
+        import us_state
+        import us_excel
+
+        class ManualApp:
+            def __init__(self):
+                self._screen = True
+
+            @property
+            def version(self):
+                return "16.0"
+
+            @property
+            def screen_updating(self):
+                return self._screen
+
+            @screen_updating.setter
+            def screen_updating(self, value):
+                self._screen = value
+
+            @property
+            def api(self):
+                probe = self
+                class Api:
+                    @property
+                    def Calculation(self):
+                        return -4135
+                return Api()
+
+        app = ManualApp()
+        us_state._calc_session["owned"] = True
+        us_state._calc_session["failed"] = False
+        us_excel._begin_excel_bulk_mode(app)
+        self.assertTrue(us_state._calc_session.get("owned"))
+
+    def test_already_manual_branch_disowns_a_foreign_manual(self):
+        import us_state
+        import us_excel
+
+        class ManualApp:
+            def __init__(self):
+                self._screen = True
+
+            @property
+            def version(self):
+                return "16.0"
+
+            @property
+            def screen_updating(self):
+                return self._screen
+
+            @screen_updating.setter
+            def screen_updating(self, value):
+                self._screen = value
+
+            @property
+            def api(self):
+                probe = self
+                class Api:
+                    @property
+                    def Calculation(self):
+                        return -4135
+                return Api()
+
+        app = ManualApp()
+        us_state._calc_session["owned"] = False
+        us_excel._begin_excel_bulk_mode(app)
+        self.assertFalse(us_state._calc_session.get("owned"))
+
+
 if __name__ == "__main__":
     unittest.main()

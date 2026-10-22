@@ -1405,6 +1405,8 @@ def ensure_calculation_not_stranded(app=None):
         app = us_state._app_cache
     if app is None:
         return
+    if _calc_session.get("owned") and not _calc_session.get("failed"):
+        return
     try:
         mode = _raw_calc_mode(app)
     except Exception:
@@ -1500,7 +1502,8 @@ def _begin_excel_bulk_mode(app=None):
                 # it would "restore" the other tool's temporary setting and
                 # leave the customer's Excel stuck on manual calculation.
                 state["calc"] = None
-                _calc_session["owned"] = False
+                if not _calc_session.get("owned"):
+                    _calc_session["owned"] = False
             else:
                 state["calc"] = current or "automatic"
                 # Written BEFORE Excel is changed. If this process dies inside
