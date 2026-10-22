@@ -89,9 +89,9 @@ async def flush_performance_metrics():
     from us_licensing import show_error
 
     now = time.monotonic()
-    if now - _last_performance_flush < 30:
+    if now - us_state._last_performance_flush < 30:
         return
-    lines = _performance_metrics.summary_lines(now)
+    lines = us_state._performance_metrics.summary_lines(now)
     try:
         await asyncio.to_thread(append_performance_summary, lines)
     except OSError as e:

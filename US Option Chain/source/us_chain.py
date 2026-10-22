@@ -22,11 +22,16 @@ from us_state import (
     live_data, oi_roots, role_symbol, spot_cmp, user_pinned,
 )
 from us_diagnostics import append_runtime_warning, build_id, feed_log
-from us_spot import _databento_spot
+from us_spot import (
+    PARITY_SANITY_PCT, PARITY_TOLERANCE_POINTS, PARITY_TOLERANCE_PCT,
+    SPOT_POLL_SECONDS, SPOT_STALE_SECONDS, _databento_spot, _parity_log_at,
+    _parity_spot, _parity_spot_cache, _yahoo_spot_fetch, note_spot,
+    refresh_tencent_spot_cache, spot_source_for,
+)
 from us_time import eastern_now, filter_expiry_dates
 from us_workbook import (
-    base_root, clean_symbol, default_k1, is_index_symbol, is_locked_role,
-    normalize_symbol, safe_float,
+    base_root, clean_symbol, default_k1, excel_path, is_index_symbol,
+    is_locked_role, normalize_symbol, safe_float,
 )
 from excel_helpers import prefer_expiry_root
 

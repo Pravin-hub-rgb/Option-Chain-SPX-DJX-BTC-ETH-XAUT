@@ -22,6 +22,7 @@ from us_diagnostics import (
     feed_log,
 )
 from us_licensing import ensure_license, show_error
+from us_excel import display_loop
 from us_workbook import INDEX_SYMBOLS, open_excel_files
 from us_instance import (
     kill_previous_instances, recover_calc_mode, _emergency_restore,
