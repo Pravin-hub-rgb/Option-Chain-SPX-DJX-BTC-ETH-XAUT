@@ -251,6 +251,9 @@ def _quote_quality(bid, ask, oi, ltp):
     return (real_book, 1 if safe_float(ltp) > 0 else 0, safe_float(oi))
 
 
+_synced_symbols: set[str] = set()
+
+
 def _fetch_databento(sym):
     feed = us_state._databento_feed
     if feed is None:
@@ -259,7 +262,7 @@ def _fetch_databento(sym):
         sym,
         _databento_spot(sym),
         active_expiries.get(sym),
-        wait=True,
+        wait=sym not in _synced_symbols,
     )
     if result is None:
         errors = feed.errors()
@@ -272,6 +275,7 @@ def _fetch_databento(sym):
     if not feed.healthy() and not result[1]:
         errors = feed.errors()
         raise RuntimeError(errors[-1] if errors else "Databento live quotes not ready")
+    _synced_symbols.add(sym)
     _note_expiry_roots(sym, result[1])
     return result
 

@@ -723,7 +723,7 @@ class DatabentoFeed:
         if loading:
             if not wait:
                 return False
-            deadline = time.monotonic() + 30.0
+            deadline = time.monotonic() + 5.0
             while time.monotonic() < deadline:
                 with self._lock:
                     if self._defs.get(symbol):
@@ -1101,6 +1101,8 @@ class DatabentoFeed:
                 room=room,
             )
             missing = missing[:room]
+        if not missing:
+            return
         for start in range(0, len(missing), SUBSCRIBE_CHUNK):
             chunk = missing[start:start + SUBSCRIBE_CHUNK]
             if not chunk:
@@ -1123,8 +1125,6 @@ class DatabentoFeed:
     def _on_record(self, record) -> None:
         try:
             rtype = int(getattr(record, "rtype", 0))
-            with self._lock:
-                self._last_message = time.monotonic()
             if rtype == RTYPE_CBBO:
                 instrument_id = int(getattr(record, "instrument_id", 0))
                 raw = None
@@ -1136,13 +1136,6 @@ class DatabentoFeed:
                             raw = mapped
                     except Exception:
                         raw = None
-                if raw is None:
-                    with self._lock:
-                        raw = self._id_map.get(instrument_id)
-                if not raw:
-                    with self._lock:
-                        self._unmapped += 1
-                    return
                 bid = _price(getattr(record, "bid_px_00", 0))
                 ask = _price(getattr(record, "ask_px_00", 0))
                 if bid > 0 and ask > 0 and ask < bid:
@@ -1151,14 +1144,20 @@ class DatabentoFeed:
                 size = int(_to_float(getattr(record, "size", 0)))
                 stamp = _timestamp(getattr(record, "ts_recv", 0))
                 with self._lock:
-                    self._quotes[raw] = {
-                        "bid": bid,
-                        "ask": ask,
-                        "ltp": price,
-                        "size": size,
-                        "ts": stamp,
-                    }
-                    self._last_record = time.monotonic()
+                    self._last_message = time.monotonic()
+                    if raw is None:
+                        raw = self._id_map.get(instrument_id)
+                    if raw:
+                        self._quotes[raw] = {
+                            "bid": bid,
+                            "ask": ask,
+                            "ltp": price,
+                            "size": size,
+                            "ts": stamp,
+                        }
+                        self._last_record = time.monotonic()
+                    else:
+                        self._unmapped += 1
                 return
             if rtype == RTYPE_SYMBOL_MAPPING:
                 instrument_id = int(getattr(record, "instrument_id", 0))
@@ -1174,10 +1173,10 @@ class DatabentoFeed:
                 self._log("databento_error", code=code, detail=detail)
                 return
             if rtype == RTYPE_SYSTEM:
-                self._last_connect = time.monotonic()
                 with self._lock:
                     # A heartbeat is proof the session is alive even when no
                     # data is flowing.
+                    self._last_connect = time.monotonic()
                     self._last_message = time.monotonic()
                 return
         except Exception as exc:
@@ -1201,6 +1200,17 @@ class DatabentoFeed:
             target = set(self._target)
         if not target:
             return
+        threading.Thread(
+            target=self._resubscribe_after_reconnect,
+            args=(live, target),
+            daemon=True,
+        ).start()
+
+    def _resubscribe_after_reconnect(self, live, target) -> None:
+        # The reconnect callback cannot hold _sub_lock while it steps
+        # through the subscribe chunks: snapshot polling also takes that
+        # lock, and one long resubscribe would stall every poller until it
+        # finished.
         with self._sub_lock:
             self._subscribed.clear()
             try:
@@ -1353,6 +1363,9 @@ class DatabentoFeed:
         if targets:
             with self._lock:
                 self._target.update(targets)
+                stale = [raw for raw in self._quotes if raw not in self._target]
+                for raw in stale:
+                    self._quotes.pop(raw, None)
             with self._sub_lock:
                 self._started.wait(timeout=0.2)
                 live = self._live

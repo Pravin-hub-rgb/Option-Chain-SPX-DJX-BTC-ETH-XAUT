@@ -652,7 +652,13 @@ class LiveApiContractTests(unittest.TestCase):
     def test_reconnect_resubscribes(self):
         import inspect
         src = inspect.getsource(self.feed_module.DatabentoFeed._on_reconnect)
-        self.assertIn("self._subscribe(live, target)", src)
+        self.assertIn("threading.Thread", src)
+        self.assertIn("_resubscribe_after_reconnect", src)
+        worker = inspect.getsource(
+            self.feed_module.DatabentoFeed._resubscribe_after_reconnect
+        )
+        self.assertIn("self._subscribe(live, target)", worker)
+        self.assertIn("self._sub_lock", worker)
 
     def test_hung_session_is_dropped(self):
         import inspect
@@ -947,6 +953,55 @@ class UnprotectedMergeTests(unittest.TestCase):
 
         src = inspect.getsource(self.main._flush_block_writes)
         self.assertIn("list(prev[i])", src)
+
+
+
+class FeedPollerLagTests(unittest.TestCase):
+    """Feed calls in the hot path must not stall the pollers."""
+
+
+    def setUp(self):
+        import databento_feed
+        self.feed_module = databento_feed
+
+    def test_universe_wait_budget_is_five_seconds(self):
+        import inspect
+
+        src = inspect.getsource(self.feed_module.DatabentoFeed.ensure_universe)
+        self.assertIn("time.monotonic() + 5.0", src)
+        self.assertNotIn("time.monotonic() + 30.0", src)
+
+    def test_subscribe_log_only_when_symbols_added(self):
+        import inspect
+
+        src = inspect.getsource(self.feed_module.DatabentoFeed._subscribe)
+        self.assertIn("if not missing:", src)
+
+    def test_snapshot_prunes_quotes_to_target(self):
+        import inspect
+
+        src = inspect.getsource(self.feed_module.DatabentoFeed.snapshot)
+        self.assertIn("not in self._target", src)
+
+    def test_on_record_takes_the_lock_once_per_cbbo_record(self):
+        import inspect
+
+        src = inspect.getsource(self.feed_module.DatabentoFeed._on_record)
+        self.assertEqual(src.count("with self._lock:"), 3)
+
+    def test_chain_poller_stops_blocking_after_first_sync(self):
+        import inspect
+        import us_chain
+
+        src = inspect.getsource(us_chain._fetch_databento)
+        self.assertIn("wait=sym not in _synced_symbols", src)
+        self.assertIn("_synced_symbols.add(sym)", src)
+
+    def test_reconnect_resubscribe_runs_off_the_callback_thread(self):
+        import inspect
+
+        src = inspect.getsource(self.feed_module.DatabentoFeed._on_reconnect)
+        self.assertIn("threading.Thread", src)
 
 
 if __name__ == "__main__":
