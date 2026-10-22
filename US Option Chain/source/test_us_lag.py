@@ -415,7 +415,7 @@ class PerCycleWriteGatingTests(unittest.TestCase):
         import inspect
         import us_excel
         src = inspect.getsource(us_excel._write_to_excel)
-        self.assertIn("sheet.range((1, 1), (1, 31)).value", src)
+        self.assertIn("sheet.range((1, 1), (4, 31)).value", src)
         # No per-cell header comparison left.
         self.assertNotIn("sheet.range((1, col_l)).value !=", src)
         self.assertNotIn("sheet.range((1, col_l + 4)).value !=", src)
@@ -871,6 +871,58 @@ class CalcFlapGuardTests(unittest.TestCase):
         us_state._calc_session["owned"] = False
         us_excel._begin_excel_bulk_mode(app)
         self.assertFalse(us_state._calc_session.get("owned"))
+
+
+
+class ComTaxTests(unittest.TestCase):
+    """Per-cycle COM chatter that does not change what the trader sees.
+
+    Each Excel get/set is a round trip of tens of milliseconds, so the
+    connection detail read, the calculation-state probe, and the tasklist
+    check must all be asked far less often than once per cycle.
+    """
+
+    def setUp(self):
+        import us_excel
+        self.main = us_excel
+
+    def test_merged_block_read_replaces_per_cell_reads(self):
+        import inspect
+
+        src = inspect.getsource(self.main._write_to_excel)
+        self.assertIn("sheet.range((1, 1), (4, 31)).value", src)
+        self.assertNotIn('v = sheet.range("A2").value', src)
+
+    def test_connection_detail_is_read_only_on_change(self):
+        import inspect
+
+        src = inspect.getsource(self.main._write_to_excel)
+        self.assertIn("_excel_connection_status.get(role) != \"connected\"", src)
+
+    def test_tasklist_cache_is_two_s(self):
+        import inspect
+
+        sig = inspect.signature(self.main.excel_process_running)
+        self.assertEqual(sig.parameters["max_age"].default, 2.0)
+
+    def test_watchdog_runs_once_per_cycle(self):
+        import inspect
+
+        self.assertIn(
+            "ensure_calculation_not_stranded",
+            inspect.getsource(self.main.render_cycle),
+        )
+        self.assertNotIn(
+            "ensure_calculation_not_stranded",
+            inspect.getsource(self.main.display_loop),
+        )
+
+    def test_calc_state_probe_is_gated_to_thirty_s(self):
+        import inspect
+
+        src = inspect.getsource(self.main._probe_calc_state_after_restore)
+        self.assertIn("30.0", src)
+        self.assertIn("us_state._calc_state_probe", src)
 
 
 if __name__ == "__main__":

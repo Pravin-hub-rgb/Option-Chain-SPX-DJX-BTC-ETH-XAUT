@@ -114,6 +114,7 @@ _timezone_warning_logged = False
 _excel_gone_logged = False
 
 _excel_liveness_cache = None  # (monotonic_timestamp, running_bool)
+_calc_state_probe = None
 
 _last_rows = {}
 # How far below the live table to sweep the first time we see a block in this

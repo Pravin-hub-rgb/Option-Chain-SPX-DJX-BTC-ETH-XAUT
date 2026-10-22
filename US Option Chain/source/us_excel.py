@@ -29,7 +29,8 @@ from us_state import (
 from us_chain import (
     _header_at, _set_header_at, _short_build, active_symbols,
     available_expiries, build_option_chain, ensure_sym_state, fmt_oi,
-    iso_to_user, parse_user_date, print_chain, read_symbol_cell,
+    cell_value_from_pre, iso_to_user, parse_user_date, print_chain,
+    read_symbol_cell,
 )
 from us_spot import source_delay_note, spot_source_for
 from us_workbook import (
@@ -200,7 +201,7 @@ def excel_apps_count(xw):
         return -1
 
 
-def excel_process_running(max_age=1.0):
+def excel_process_running(max_age=2.0):
     """True if any EXCEL.EXE is alive, checked without touching COM.
 
     If Excel has crashed or been killed, the cached COM server is a dead
@@ -348,7 +349,7 @@ def update_expiry_dropdowns(sym, sheet):
             print(f"Dropdown error ({sym} {cell}): {e}", flush=True)
 
 
-def update_user_dates(sym, sheet):
+def update_user_dates(sym, sheet, pre=None):
     for i, cell in enumerate(["D3", "O3", "Z3"]):
         rng = sheet.range(cell)
         try:
@@ -361,7 +362,7 @@ def update_user_dates(sym, sheet):
                 _user_fmt_done.add(fmt_key)
         except Exception:
             pass
-        val = rng.value
+        val = cell_value_from_pre(pre, cell) if pre is not None else rng.value
         # Excel may have converted text into a datetime â€” force back to DD/MM/YYYY text
         if isinstance(val, datetime):
             rng.value = val.strftime("%d/%m/%Y")
@@ -824,26 +825,27 @@ def _write_to_excel(role):
         excel_connected[role] = True
         _excel_startup_notice_shown[role] = False
         show_status(book, role, "LIVE")
-        try:
-            excel_info = (
-                f"; excel_version={book.app.api.Version}"
-                f"; excel_operating_system={book.app.api.OperatingSystem}"
-            )
+        if _excel_connection_status.get(role) != "connected":
             try:
-                excel_details = excel_process_details(book.app.api.Hwnd)
-                excel_info += (
-                    f"; excel_process_bitness={excel_details['bitness']}"
-                    f"; excel_process_is_administrator="
-                    f"{excel_details['is_administrator']}"
+                excel_info = (
+                    f"; excel_version={book.app.api.Version}"
+                    f"; excel_operating_system={book.app.api.OperatingSystem}"
                 )
-            except (OSError, TypeError, ValueError) as e:
-                excel_info += (
-                    f"; excel_process_is_administrator=unavailable:"
-                    f"{type(e).__name__}:{e}"
-                )
-        except Exception as e:
-            excel_info = f"; excel_details_unavailable={type(e).__name__}: {e}"
-        record_excel_connection(role, "connected", f"workbook={path}{excel_info}")
+                try:
+                    excel_details = excel_process_details(book.app.api.Hwnd)
+                    excel_info += (
+                        f"; excel_process_bitness={excel_details['bitness']}"
+                        f"; excel_process_is_administrator="
+                        f"{excel_details['is_administrator']}"
+                    )
+                except (OSError, TypeError, ValueError) as e:
+                    excel_info += (
+                        f"; excel_process_is_administrator=unavailable:"
+                        f"{type(e).__name__}:{e}"
+                    )
+            except Exception as e:
+                excel_info = f"; excel_details_unavailable={type(e).__name__}: {e}"
+            record_excel_connection(role, "connected", f"workbook={path}{excel_info}")
         sheet = cached_sheet
         if sheet is None:
             sheet = book.sheets[0]
@@ -879,7 +881,16 @@ def _write_to_excel(role):
                 role, "worksheet_setup", time.perf_counter() - formatting_started
             )
 
-        new_sym = read_symbol_cell(sheet, role)
+        try:
+            pre = sheet.range((1, 1), (4, 31)).value
+        except Exception as e:
+            log_excel_exception(role, e, "reading the header block")
+            pre = None
+        if pre is not None and (not pre or not isinstance(pre[0], (list, tuple))):
+            pre = None
+        header_values = list(pre[0]) if pre else []
+
+        new_sym = read_symbol_cell(sheet, role, pre=pre)
         if new_sym and new_sym != role_symbol[role]:
             print(f"[{role}] symbol {role_symbol[role]} -> {new_sym}", flush=True)
             role_symbol[role] = new_sym
@@ -902,7 +913,7 @@ def _write_to_excel(role):
         sym = role_symbol[role]
         ensure_sym_state(sym)
 
-        v = sheet.range("A2").value
+        v = cell_value_from_pre(pre, "A2") if pre is not None else sheet.range("A2").value
         if isinstance(v, str) and v.strip() and not v.strip().replace(".", "", 1).isdigit():
             sheet.range("A2").value = None
             v = None
@@ -917,7 +928,7 @@ def _write_to_excel(role):
                 pass
 
         try:
-            update_user_dates(sym, sheet)
+            update_user_dates(sym, sheet, pre=pre)
         except Exception as e:
             print(f"update_user_dates ({sym}): {e}", flush=True)
             log_excel_exception(role, e, "reading expiry input cells")
@@ -938,18 +949,6 @@ def _write_to_excel(role):
                 desired = MAX_A2
                 sheet.range("A2").value = desired
             range_val = max(desired, 1)
-
-        # Read the whole header row once.
-        #
-        # Every COM call into Excel costs about 33ms on this machine, no
-        # matter how small the range is, so asking for one cell at a time is
-        # what made the sheet feel slow: six reads per sheet, every cycle.
-        # One read of A1:AE1 covers all three blocks.
-        try:
-            header_values = list(sheet.range((1, 1), (1, 31)).value or [])
-        except Exception as e:
-            log_excel_exception(role, e, "reading the header row")
-            header_values = []
 
         # Blocks of this sheet whose data changed and still has to be written.
         pending_writes = []
@@ -1325,13 +1324,8 @@ def render_cycle():
                 # If we already recalculated inside the window, restoring
                 # automatic should find nothing left to do. A second pass means
                 # the cost is being paid twice.
-                try:
-                    if us_state._app_cache is not None and int(us_state._app_cache.api.CalculationState) != 0:
-                        _performance_metrics.record("ALL", "excel_recalc_second_pass", 1.0)
-                    else:
-                        _performance_metrics.record("ALL", "excel_recalc_second_pass", 0.0)
-                except Exception:
-                    pass
+                if us_state._app_cache is not None:
+                    _probe_calc_state_after_restore()
             except Exception as e:
                 log_excel_exception("ALL", e, "leaving bulk mode")
         elapsed = time.perf_counter() - started
@@ -1342,6 +1336,21 @@ def render_cycle():
         except Exception:
             pass
         _log_speed_summary(elapsed)
+
+
+def _probe_calc_state_after_restore():
+    now = time.monotonic()
+    cached = us_state._calc_state_probe
+    if cached is not None and now - cached[0] < 30.0:
+        _performance_metrics.record("ALL", "excel_recalc_second_pass", cached[1])
+        return
+    try:
+        state = int(us_state._app_cache.api.CalculationState)
+    except Exception:
+        return
+    hit = 1.0 if state != 0 else 0.0
+    us_state._calc_state_probe = (now, hit)
+    _performance_metrics.record("ALL", "excel_recalc_second_pass", hit)
 
 
 def _log_speed_summary(cycle_ms):
@@ -1669,11 +1678,6 @@ async def display_loop():
                 _last_excel_exception.clear()
             render_seconds = time.perf_counter() - render_started
             _performance_metrics.record("ALL", "render_cycle", render_seconds)
-            # Never leave the trader in manual calculation between write windows.
-            try:
-                ensure_calculation_not_stranded()
-            except Exception:
-                pass
             if render_seconds > REFRESH:
                 _performance_metrics.record(
                     "ALL", "refresh_overrun", render_seconds - REFRESH

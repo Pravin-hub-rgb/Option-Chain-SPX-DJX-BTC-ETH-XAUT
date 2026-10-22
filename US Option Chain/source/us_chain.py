@@ -174,18 +174,18 @@ def fmt_oi(val):
     return f"${val:.0f}"
 
 
-def read_symbol_cell(sheet, role):
+def read_symbol_cell(sheet, role, pre=None):
     locked = default_k1(role) if is_locked_role(role) else None
     if locked is not None:
         # locked â€” force fixed ticker (user edits overwritten)
-        if sheet.range(SYMBOL_CELL).value != locked:
+        if cell_value_from_pre(pre, SYMBOL_CELL) != locked:
             sheet.range(SYMBOL_CELL).value = locked
         return locked
     # Unlocked (stock): never write back into K1 while the user is typing.
     # Rewriting the cell every cycle fights the user's keystrokes and makes
     # typed text disappear. Just read + normalize internally; the cell keeps
     # exactly what the user typed.
-    raw = sheet.range(SYMBOL_CELL).value
+    raw = cell_value_from_pre(pre, SYMBOL_CELL)
     return normalize_symbol(raw) or role_symbol["stock"] or DEFAULT_SYMBOL
 
 
@@ -759,3 +759,20 @@ def print_chain(sym):
                     parts.append(f"{float(v):>10.2f}")
             print("  ".join(parts))
         print()
+
+def cell_value_from_pre(pre, ref):
+    """Value at an A1-style ref from a sheet.values block, or None."""
+    if pre is None:
+        return None
+    col = 0
+    i = 0
+    while i < len(ref) and ref[i].isalpha():
+        col = col * 26 + (ord(ref[i].upper()) - 64)
+        i += 1
+    try:
+        row = int(ref[i:])
+    except ValueError:
+        return None
+    if row < 1 or row > len(pre) or col < 1 or col > len(pre[row - 1] or []):
+        return None
+    return pre[row - 1][col - 1]
