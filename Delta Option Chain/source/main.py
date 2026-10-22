@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import json
 import os
+import random
 import sys
 import platform
 import re
@@ -54,6 +55,11 @@ BASE_DIR = config.base_dir()
 # Identifies this tool inside the shared calculation-mode record, so Delta and
 # the US tool running together in one Excel instance do not fight over it.
 PRODUCT_ID = "delta"
+
+# The executable is named for the product, so the process name alone says which
+# tool it is. The customer can see it in Task Manager, and the instance guard
+# never has to guess the product from the folder.
+PRODUCT_EXE = "delta_option_chain.exe"
 
 # The most recent bulk-mode restore callable, so an exit path that never
 # reaches render_cycle's finally can still put Excel back.
@@ -572,21 +578,135 @@ def _session():
     return s
 
 
+# ---------------------------------------------------------------------------
+# Feed observability.
+#
+# The tool used to fail silently: a REST error became "0 contracts", a block
+# lost its expiry, the header showed "--" and the trader was never told why.
+# Every request and every probe now lands in a size-capped log, and the state
+# is surfaced in the sheet header.
+# ---------------------------------------------------------------------------
+FEED_LOG_DIR = os.path.join(os.environ.get("LOCALAPPDATA", "."), "DeltaOptionChain")
+FEED_LOG_PATH = os.path.join(FEED_LOG_DIR, "feed.log")
+FEED_LOG_MAX_BYTES = 2 * 1024 * 1024          # rotate at 2 MB; this runs 24/7
+STALE_FLAG_SECONDS = 10.0
+
+# asset -> {state, detail, retry_in, last_good_ts, last_good_label}
+feed_state = {"BTC": {"state": "LOADING", "detail": "", "retry_in": 0.0,
+                      "last_good_ts": 0.0, "last_good_label": "never"},
+              "ETH": {"state": "LOADING", "detail": "", "retry_in": 0.0,
+                      "last_good_ts": 0.0, "last_good_label": "never"},
+              "XAUT": {"state": "LOADING", "detail": "", "retry_in": 0.0,
+                       "last_good_ts": 0.0, "last_good_label": "never"}}
+
+
+def feed_log(event, **fields):
+    """Append one structured line to the rotating feed log. Never raises."""
+    try:
+        os.makedirs(FEED_LOG_DIR, exist_ok=True)
+        try:
+            if (os.path.exists(FEED_LOG_PATH)
+                    and os.path.getsize(FEED_LOG_PATH) > FEED_LOG_MAX_BYTES):
+                os.replace(FEED_LOG_PATH, FEED_LOG_PATH + ".1")
+        except OSError:
+            pass
+        ts = datetime.now().astimezone().isoformat(timespec="milliseconds")
+        body = " ".join(f"{k}={_flat(v)}" for k, v in fields.items())
+        with open(FEED_LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write(f"{ts} {event} {body}\n")
+    except Exception:
+        pass
+
+
+def _flat(v):
+    """One-line, bounded, safe for a log file."""
+    t = str(v).replace("\r", " ").replace("\n", " ")
+    return t if len(t) <= 200 else t[:200] + f"...(+{len(t) - 200})"
+
+
+def set_feed_state(asset, state, detail="", retry_in=0.0):
+    st = feed_state.setdefault(asset, {})
+    st["state"] = state
+    st["detail"] = detail
+    st["retry_in"] = retry_in
+    feed_log("state", asset=asset, state=state, detail=detail,
+             retry_in=round(retry_in, 1))
+
+
+def note_feed_good(asset, label=""):
+    st = feed_state.setdefault(asset, {})
+    st["state"] = "OK"
+    st["detail"] = ""
+    st["retry_in"] = 0.0
+    st["last_good_ts"] = time.time()
+    if label:
+        st["last_good_label"] = label
+
+
+def feed_header_note(asset):
+    """Text for the sheet header, or "" when there is nothing to say."""
+    st = feed_state.get(asset) or {}
+    state = st.get("state", "OK")
+    if state == "OK":
+        age = time.time() - (st.get("last_good_ts") or 0)
+        if st.get("last_good_ts") and age > STALE_FLAG_SECONDS:
+            return f"STALE: last good {st.get('last_good_label', '')}".strip()
+        return ""
+    last = st.get("last_good_label", "never")
+    return f"{state}: {st.get('detail', '')} (last good {last})".strip()
+
+
 def _get_json(url, params):
-    """GET with keep-alive session, 429 backoff and one socket-reset retry."""
+    """GET with keep-alive session, 429 backoff and one socket-reset retry.
+
+    Every failure is now logged with enough detail to act on: endpoint, params,
+    HTTP status, exception type, the head of the body and how long it took.
+    A 429 honours Retry-After instead of guessing.
+    """
     last = None
+    started = time.perf_counter()
     for attempt in range(3):
         try:
             resp = _session().get(url, params=params, timeout=HTTP_TIMEOUT)
             if resp.status_code == 429:
+                retry_after = resp.headers.get("Retry-After")
+                try:
+                    wait = float(retry_after)
+                except (TypeError, ValueError):
+                    wait = 1.5 * (attempt + 1)
+                wait = min(max(wait, 0.5), 30.0)
+                feed_log("rest_429", url=url.split("/v2/")[-1],
+                         params=_flat(params), attempt=attempt + 1,
+                         retry_after=retry_after, wait_s=wait)
                 last = requests.HTTPError("429 Too Many Requests")
-                time.sleep(1.5 * (attempt + 1))
+                time.sleep(wait)
                 continue
             resp.raise_for_status()
             return resp.json()
         except (requests.ConnectionError, requests.exceptions.ChunkedEncodingError) as e:
             last = e
+            feed_log("rest_conn", url=url.split("/v2/")[-1], params=_flat(params),
+                     attempt=attempt + 1, error=type(e).__name__, detail=str(e)[:180])
             time.sleep(0.4)
+        except Exception as e:
+            last = e
+            body = ""
+            status = None
+            r = locals().get("resp")
+            if r is not None:
+                status = getattr(r, "status_code", None)
+                try:
+                    body = r.text[:180]
+                except Exception:
+                    body = ""
+            feed_log("rest_error", url=url.split("/v2/")[-1], params=_flat(params),
+                     attempt=attempt + 1, status=status,
+                     error=type(e).__name__, detail=str(e)[:180], body=body,
+                     elapsed_ms=round((time.perf_counter() - started) * 1000, 1))
+            break
+    feed_log("rest_failed", url=url.split("/v2/")[-1], params=_flat(params),
+             error=type(last).__name__ if last else "unknown",
+             elapsed_ms=round((time.perf_counter() - started) * 1000, 1))
     raise last
 
 
@@ -730,10 +850,34 @@ def apply_tickers(asset, tickers, expiry_iso):
 
 
 def probe_expiry_count(asset, expiry_iso):
+    """Contracts for one expiry.
+
+    Returns (count, state). 'OK' means a real count. 'ERROR' means the request
+    failed and the count is meaningless -- these must never be confused, which
+    is exactly how a transient failure used to look like 'no contracts'.
+    """
     try:
-        return len(fetch_tickers(asset, iso_to_dmy(expiry_iso)))
-    except Exception:
-        return 0
+        tickers = fetch_tickers(asset, iso_to_dmy(expiry_iso))
+        n = len(tickers)
+        # HTTP 200 is not proof of good data: check the symbols really belong to
+        # this expiry before trusting the count.
+        _yy, _mm, _dd = expiry_iso.split("-")
+        suffix = f"{_dd}{_mm}{_yy[2:]}"          # symbols carry DDMMYY
+        ok_suffix = sum(1 for t in tickers if suffix in str(t.get("symbol", "")))
+        matched = (ok_suffix == n) if n else True
+        feed_log("probe_ok", asset=asset, expiry=expiry_iso, rows=n,
+                 suffix_ok=ok_suffix, suffix_checked=matched)
+        if n == 0:
+            feed_log("probe_no_contracts", asset=asset, expiry=expiry_iso, rows=0)
+            return 0, "NO_CONTRACTS"
+        if not matched:
+            feed_log("probe_suffix_mismatch", asset=asset, expiry=expiry_iso,
+                     rows=n, suffix_ok=ok_suffix, suffix=suffix, level="warn")
+        return n, "OK"
+    except Exception as e:
+        feed_log("probe_error", asset=asset, expiry=expiry_iso,
+                 error=type(e).__name__, detail=str(e)[:180])
+        return 0, "ERROR"
 
 
 async def oi_poller(asset):
@@ -870,7 +1014,29 @@ async def expiry_roller(asset):
             counts = await asyncio.gather(
                 *[asyncio.to_thread(probe_expiry_count, asset, d) for d in probe_dates]
             )
-            with_data = [d for d, c in zip(probe_dates, counts) if c > 0]
+            states = [st for _, st in counts]
+            nums = [n for n, _ in counts]
+            with_data = [d for d, n in zip(probe_dates, nums) if n > 0]
+
+            # Retry once with jittered backoff when every probe failed. A single
+            # bad round must not be allowed to strip the sheet.
+            feed_log("roller_decision", asset=asset, probe_dates=probe_dates,
+                     nums=nums, states=states, with_data=with_data,
+                     active_before=list(active_expiries[asset]),
+                     n_blocks=n_blocks(asset))
+
+            if not with_data and "ERROR" in states:
+                feed_log("roller_all_probes_failed", asset=asset,
+                         expiry_count=len(probe_dates), states=states)
+                await asyncio.sleep(2.0 + random.uniform(0, 1.5))
+                counts = await asyncio.gather(
+                    *[asyncio.to_thread(probe_expiry_count, asset, d)
+                      for d in probe_dates]
+                )
+                nums = [n for n, _ in counts]
+                with_data = [d for d, n in zip(probe_dates, nums) if n > 0]
+                feed_log("roller_retry_result", asset=asset,
+                         recovered=bool(with_data), rows=nums)
 
             pinned_vals = [active_expiries[asset][i] for i in range(n_blocks(asset)) if user_pinned[asset][i]]
             # only auto-assign expiries that actually have contracts;
@@ -887,11 +1053,23 @@ async def expiry_roller(asset):
                 slot += 1
                 if tgt == cur:
                     continue
+                if not with_data and cur:
+                    # Every probe failed. Keep the expiry we already have: the
+                    # trader keeps the last good chain on screen (flagged stale)
+                    # instead of watching the sheet blank out for a timeout.
+                    set_feed_state(asset, "ERROR",
+                                   "no expiry data from Delta", retry_in=0.0)
+                    continue
                 if tgt:
                     await asyncio.to_thread(load_expiry_tickers, asset, tgt)
+                    note_feed_good(asset, iso_to_user(tgt))
                 changed_slots.append((i, cur, tgt))
                 active_expiries[asset][i] = tgt
                 active_expiries_dmy[asset][i] = iso_to_dmy(tgt) if tgt else None
+
+            feed_log("roller_result", asset=asset,
+                     active_after=list(active_expiries[asset]),
+                     changed=len(changed_slots))
 
             if changed_slots:
                 try:
@@ -1844,6 +2022,58 @@ def _write_to_excel(asset):
             )
 
 
+_manual_since = 0.0
+MANUAL_WATCHDOG_SECONDS = 4.0
+
+# xlwings' .calculation getter hands back a stale/garbage value while Excel is
+# busy, so a "did the restore work?" check built on it can pass falsely and leave
+# the trader stuck on manual. Set AND verify through the raw API with these ids.
+_CALC_IDS = {"automatic": -4105, "semiautomatic": 2, "manual": -4135}
+
+
+def _raw_calc_mode(app):
+    return int(app.api.Calculation)
+
+
+def _set_calc_mode(app, name):
+    app.api.Calculation = _CALC_IDS[name]
+    return _raw_calc_mode(app) == _CALC_IDS[name]
+
+
+def ensure_calculation_not_stranded(app=None):
+    """Safety net: a trader must never be left in manual calculation.
+
+    If Excel is still on manual well after any write window should have closed,
+    put it back. Without this, one failed restore leaves every formula the
+    trader types silently uncalculated, with no visible cause.
+    """
+    global _manual_since
+    if app is None:
+        app = _app_cache
+    if app is None:
+        return
+    try:
+        mode = _raw_calc_mode(app)
+    except Exception:
+        return
+    now = time.time()
+    if mode != -4135:                       # not manual
+        _manual_since = 0.0
+        return
+    if _manual_since == 0.0:
+        _manual_since = now
+        return
+    if now - _manual_since < MANUAL_WATCHDOG_SECONDS:
+        return
+    try:
+        if _set_calc_mode(app, "automatic"):
+            _manual_since = 0.0
+            feed_log("calc_watchdog_restored",
+                     note="Excel was stranded on manual calculation")
+    except Exception as e:
+        feed_log("calc_watchdog_error", error=type(e).__name__, detail=str(e)[:150])
+
+
 def _begin_excel_bulk_mode():
     """Suspend repaint + recalculation for the duration of one render cycle.
 
@@ -1938,10 +2168,29 @@ def _begin_excel_bulk_mode():
         if app is None:
             return
         if state.get("calc") is not None:
-            try:
-                app.calculation = state["calc"]
-            except Exception as e:
-                log_excel_exception("ALL", e, "restoring calculation mode")
+            # Verify the restore actually took. A single setter call can fail
+            # while Excel is busy, and leaving the trader in manual calculation
+            # means every formula they type silently refuses to compute.
+            want = state["calc"]
+            ok = False
+            for attempt in range(3):
+                try:
+                    ok = _set_calc_mode(app, want)
+                    if ok:
+                        break
+                    feed_log("calc_restore_retry", attempt=attempt + 1,
+                             want=want, got=_raw_calc_mode(app))
+                except Exception as e:
+                    log_excel_exception("ALL", e, "restoring calculation mode")
+                    feed_log("calc_restore_error", attempt=attempt + 1,
+                             error=type(e).__name__, detail=str(e)[:150])
+                time.sleep(0.5)
+            if not ok:
+                try:
+                    feed_log("calc_restore_FAILED", want=want, got=_raw_calc_mode(app),
+                             note="trader left in manual calculation")
+                except Exception:
+                    pass
         if state.get("calc_guarded"):
             # Only drop our claim once Excel has actually been put back.
             try:
@@ -2015,6 +2264,14 @@ def render_cycle():
     recalculation suspended, then one restore.
     """
     started = time.perf_counter()
+    # TEST SCAFFOLD - not part of the product. Set OC_TEST_PAUSE=1 to keep the
+    # process alive and attached to Excel but skip every write, so a test can
+    # separate "the tool is running" from "the tool is writing". No cell, no UI.
+    if os.environ.get("OC_TEST_PAUSE") == "1":
+        _performance_metrics.record("ALL", "render_cycle", time.perf_counter() - started)
+        return
+
+
 
     global _cycle_wrote
     _cycle_wrote = False
@@ -2043,6 +2300,11 @@ def render_cycle():
                 log_excel_exception("ALL", e, "leaving bulk mode")
         elapsed = time.perf_counter() - started
         _performance_metrics.record("ALL", "render_cycle", elapsed)
+        # Never leave the trader in manual calculation between write windows.
+        try:
+            ensure_calculation_not_stranded()
+        except Exception:
+            pass
 
 
 async def flush_performance_metrics():
@@ -2268,7 +2530,7 @@ def kill_previous_instances():
             matches = []
             if kernel32.Process32First(snap, ctypes.byref(entry)):
                 while True:
-                    if entry.szExeFile.decode(errors="ignore").lower() == "optionchain.exe":
+                    if entry.szExeFile.decode(errors="ignore").lower() == PRODUCT_EXE:
                         matches.append(int(entry.th32ProcessID))
                     if not kernel32.Process32Next(snap, ctypes.byref(entry)):
                         break

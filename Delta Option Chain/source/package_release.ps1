@@ -16,13 +16,19 @@ $requiredFiles = @(
     'xaut_chain.xlsx',
     'config.json',
     'README.txt',
-    'diagnose_excel_addins.ps1'
+    'diagnose_excel_addins.ps1',
+    'optionchain.product'
 )
 foreach ($relativePath in $requiredFiles) {
     $path = Join-Path $appDirectory $relativePath
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "Required release file is missing: $path"
     }
+}
+
+$productId = (Get-Content -LiteralPath (Join-Path $appDirectory 'optionchain.product') -Raw).Trim()
+if ($productId -ne 'delta') {
+    throw "Unexpected product identity marker in release: '$productId'"
 }
 
 $runtimeDirectory = Join-Path $appDirectory '_internal\pywin32_system32'

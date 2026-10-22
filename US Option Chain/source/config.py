@@ -19,7 +19,6 @@ def load_config():
         "spx_symbol": "SPX",
         "djx_symbol": "DJX",
         "default_symbol": "AAPL",
-        "data_source": "auto",
     }
     try:
         with open(path) as f:

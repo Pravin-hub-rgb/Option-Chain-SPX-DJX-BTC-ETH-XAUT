@@ -1,45 +1,49 @@
 @echo off
-REM Delta Option Chain onedir build. Distribute the complete dist\OptionChain folder.
+REM Delta Option Chain onedir build. Distribute the complete dist\delta_option_chain folder.
+REM The executable is named for the product so the customer can tell the two
+REM tools apart in Task Manager, and so the instance guard never has to guess
+REM which product a running process belongs to.
 REM --noupx is required: UPX re-compresses every archive on top of PyInstaller's
 REM own zlib pass and was killing the build at the "Building PKG (CArchive)" step.
 REM matplotlib/scipy/PyQt5/PIL are excluded because the warn log already reports
 REM them as missing-or-optional; they are not imported by main.py.
 REM Do NOT exclude pandas, numpy, tkinter, xlwings, openpyxl or lxml - all required.
 cd /d "%~dp0"
-python -m PyInstaller --noconfirm --clean --onedir --noconsole --noupx --name OptionChain --collect-all xlwings --collect-all openpyxl --hidden-import win32com --hidden-import win32com.client --hidden-import pythoncom --hidden-import pywintypes --hidden-import win32timezone --exclude-module matplotlib --exclude-module scipy --exclude-module PyQt5 --exclude-module PIL main.py > "%temp%\b_delta_final.log" 2>&1
+set "PRODUCT_EXE=delta_option_chain"
+python -m PyInstaller --noconfirm --clean --onedir --noconsole --noupx --name %PRODUCT_EXE% --collect-all xlwings --collect-all openpyxl --hidden-import win32com --hidden-import win32com.client --hidden-import pythoncom --hidden-import pywintypes --hidden-import win32timezone --exclude-module matplotlib --exclude-module scipy --exclude-module PyQt5 --exclude-module PIL main.py > "%temp%\b_delta_final.log" 2>&1
 if errorlevel 1 (
   echo EXITCODE=1 >> "%temp%\b_delta_final.log"
   exit /b 1
 )
 echo EXITCODE=0 >> "%temp%\b_delta_final.log"
-> "dist\OptionChain\optionchain.product" echo delta
+> "dist\%PRODUCT_EXE%\optionchain.product" echo delta
 REM Stamp the build so the tool can report which build it is. This replaces the
 REM separate .sha256 file that used to be shipped beside the ZIP: the customer
 REM could not download that from Drive, and could not act on it even if they
 REM could. Now they send startup_diag.log and support reads build_id from it.
 set "BUILD_SHA=local"
 for /f "delims=" %%i in ('git -C "%~dp0..\..\GIT-BACKUP" rev-parse --short HEAD 2^>nul') do set "BUILD_SHA=%%i"
-> "dist\OptionChain\build_info.txt" echo product=delta
->> "dist\OptionChain\build_info.txt" echo build_sha=%BUILD_SHA%
->> "dist\OptionChain\build_info.txt" echo build_date=%DATE% %TIME%
-copy /Y "*.xlsx" "dist\OptionChain\" >nul
+> "dist\%PRODUCT_EXE%\build_info.txt" echo product=delta
+>> "dist\%PRODUCT_EXE%\build_info.txt" echo build_sha=%BUILD_SHA%
+>> "dist\%PRODUCT_EXE%\build_info.txt" echo build_date=%DATE% %TIME%
+copy /Y "*.xlsx" "dist\%PRODUCT_EXE%\" >nul
 if errorlevel 1 exit /b 1
-copy /Y "config.json" "dist\OptionChain\" >nul
+copy /Y "config.json" "dist\%PRODUCT_EXE%\" >nul
 if errorlevel 1 exit /b 1
 REM license.json is deliberately NOT copied. It is the owner's activation file,
 REM not a client asset: shipping it would let anyone run the tool unlocked.
 REM On first run the app creates it itself once a valid product key is entered.
-if exist "dist\OptionChain\license.json" del /Q "dist\OptionChain\license.json"
-copy /Y "..\client package\README.txt" "dist\OptionChain\" >nul
+if exist "dist\%PRODUCT_EXE%\license.json" del /Q "dist\%PRODUCT_EXE%\license.json"
+copy /Y "..\client package\README.txt" "dist\%PRODUCT_EXE%\" >nul
 if errorlevel 1 exit /b 1
-copy /Y "..\client package\diagnose_excel_addins.ps1" "dist\OptionChain\" >nul
+copy /Y "..\client package\diagnose_excel_addins.ps1" "dist\%PRODUCT_EXE%\" >nul
 if errorlevel 1 exit /b 1
-copy /Y "..\client package\instruction.txt" "dist\OptionChain\" >nul
+copy /Y "..\client package\instruction.txt" "dist\%PRODUCT_EXE%\" >nul
 if errorlevel 1 exit /b 1
 REM Refresh the client package folder from this build. Without this step the
 REM client package kept whatever EXE was there from an earlier build, so the
-REM ZIP and the folder on disk could be different programs entirely.
-xcopy /E /I /Y /Q "dist\OptionChain" "..\client package" >nul
+REM client ZIP and the folder on disk could be different programs entirely.
+xcopy /E /I /Y /Q "dist\%PRODUCT_EXE%" "..\client package" >nul
 if exist "..\client package\license.json" del /Q "..\client package\license.json"
 powershell -NoProfile -ExecutionPolicy Bypass -File "package_release.ps1"
 if errorlevel 1 exit /b 1

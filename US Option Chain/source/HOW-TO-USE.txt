@@ -1,0 +1,96 @@
+US OPTION CHAIN - CLIENT SETUP AND TROUBLESHOOTING
+==================================================
+
+FIRST RUN
+---------
+1. Unzip the package anywhere you like (for example C:\OptionChain).
+2. Double click us_option_chain.exe.
+3. It asks for the ACTIVATION KEY. Enter the key you were given.
+   It is saved next to us_option_chain.exe as license.json. Do not move or
+   delete that file, or you will be asked for the key again.
+4. It asks for your DATABENTO API KEY. This is your own key from Databento
+   (it starts with "db-"). It is saved on this computer only, under
+   %LOCALAPPDATA%\USOptionChain\databento.key, and is never sent anywhere.
+5. Excel opens with three workbooks: spx_option_chain, djx_option_chain and
+   us_stock_option_chain. Leave them open.
+
+ONLY ONE COPY AT A TIME
+-----------------------
+Run one copy. If you start it again, the new one takes over from the old
+one by itself, so a second window never writes to the same sheets.
+
+If a second copy is already running and cannot be stopped, the new one says
+so and closes rather than both writing to the same workbooks.
+
+If Option Chain and the Delta Option Chain are both open in the same Excel,
+that is fine - each keeps its own workbooks. But only the one whose
+workbook is in front will appear to update while you are scrolling it.
+
+WHAT EACH WORKBOOK DOES
+-----------------------
+SPX and DJX are locked to the SPX and DJX indices. The stock workbook's
+symbol cell is K1 - type a ticker there (for example ADBE) and press Enter.
+
+The cell colours show which strikes are in the money: green calls below the
+index, red puts above it, and the yellow row is the at-the-money strike.
+Open interest is official end-of-day OI, so it does not change during the
+session. Live bid, ask and last price do.
+
+IF THE SHEETS LOOK FROZEN OR SCROLLING STUTTERS
+------------------------------------------------
+1. Do not leave a cell in edit mode. If you have clicked into a cell and it
+   is in edit mode (the cursor is in the cell and the formula bar is
+   active), Excel will not let any other program write to it. Press Escape
+   or click a different cell.
+2. Close any Excel dialog that is open, including the "Data Connections"
+   or "Security Warning" prompts.
+3. Close third party Excel add-ins while you are trading with this tool.
+   A busy add-in stops Excel from accepting a calculation-mode change, and
+   every refresh then makes Excel recalculate your whole workbook.
+4. Close any other file that is called spx_option_chain.xlsx,
+   djx_option_chain.xlsx or us_stock_option_chain.xlsx. Excel will not
+   open two workbooks with the same name, so the tool will use the copy you
+   already have open - but it is cleaner to have only one.
+
+HOW TO TELL IF IT IS WORKING
+----------------------------
+The workbook title bar shows:
+
+    SPX  |  Option Chain <build>  |  LIVE  19:42:03
+
+LIVE means data is arriving. If it says NO LIVE QUOTES the market is closed
+or the exchange is not sending quotes for that contract; the sheet still
+shows the ladder, the open interest and the index level.
+
+If it shows a recalc time, for example "recalc 340ms", that is how long
+YOUR OWN workbook took to recalculate after the tool updated the chain. If
+that number is large, your workbook is the slow part, not this tool.
+
+THE LOG FILE
+------------
+Everything the tool does is recorded in:
+
+    %LOCALAPPDATA%\USOptionChain\feed.log
+
+If anything ever looks wrong, please send that file back to us. It is the
+fastest way for us to see exactly what happened.
+
+CHECKING THE INDEX LEVEL AGAINST A WEBSITE
+----------------------------------------
+The index level in the header is LIVE. It is the official S&P 500 index
+level from S&P Dow Jones, which is what the SPX options are priced against.
+
+Most websites that show an "SPX" price are showing the CBOE quote, which is
+published on a fifteen minute cycle. That is why the number there can be a
+few points behind the number here, and it is not an error.
+
+To compare against a live number, use one of these:
+
+    https://finance.yahoo.com/quote/%5EGSPC/     <- live  (use ^GSPC, not ^SPX)
+    https://finance.yahoo.com/quote/%5EDJI/      <- live  (Dow, for the DJX sheet)
+
+On TradingView use SP:SPX for the live index, or the S&P futures
+CME_MINI:ES1!. On Barchart use $ES for the live futures.
+
+Avoid comparing against ^SPX or $SPX on those sites: those are the
+fifteen minute delayed CBOE quotes.

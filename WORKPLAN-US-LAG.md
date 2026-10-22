@@ -1,0 +1,73 @@
+# US Option Chain — Lag Fix & Refactor Workplan
+
+Owner: opencode session | Started: 2026-10-22
+Repo: remote `origin` = `git@github.com:Pravin-hub-rgb/Option-Chain-SPX-DJX-BTC-ETH-XAUT.git` (branch `main`)
+
+## Standing rules
+
+- Never kill or stop any process we did not start. Other trading bots are live on this machine.
+  Our own launched test processes are tracked by exact PID and stopped only by that PID after verifying it is ours.
+- No Chinese or garbled text in code, commits, docs, or chat.
+- Every module move is a pure move: no logic changes mixed in. Tests are the gate for every step.
+- Never commit secrets: license.json, *.key, databento.key, .env*, kg.dat, dxc_kg.dat, KeyGen folders stay ignored.
+
+## Diagnosis summary (evidence-based, 2026-10-22)
+
+| # | Cause | Evidence |
+|---|-------|----------|
+| 1 | Calc-mode flapping every ~4.5s: `ensure_calculation_not_stranded` (4s watchdog, never checks ownership) vs "hold manual for session" design; next cycle drops ownership | main.py:3365-3399, 3477-3478, called 2x/cycle at 3239+3620 |
+| 2 | ~45 fixed Excel COM round-trips per 0.5s cycle even with nothing to write | main.py:2728-2745 excel_info per cycle/role, single-cell reads, 2x watchdog probes, CalculationState probe, tasklist 1s. Measured idle: render_cycle 190ms |
+| 3 | Both-tools collision: Delta restores automatic after each window while US grabs/holds/flaps manual | Delta main.py:2172-2191 vs US session-hold; shared calc_mode_guard.py |
+| 4 | Live-market write amplification: spot header rewritten every cycle, full-block writes when >8 scattered runs, Calculate() app-wide every cycle | main.py:1128, 2907-2925, 3093-3122, 3167 |
+| 5 | Feed stalls: 30s semaphore-starving universe load, reconnect resubscribe under _sub_lock with 0.12s chunks, no-op subscribe logging (~695 lines/run), unbounded _quotes copies | databento_feed.py:726-731, 1204-1214, 1116-1121, 1373-1374 |
+| 6 | Monolith risk: US main.py 4,167 LOC (bad-edit history: 2 misfires tonight by other bot) | repo structure |
+
+Baseline numbers (idle machine, this morning): render_cycle avg 191ms / max 311ms; excel_pass 44-50ms per role; recalc skipped (nothing written). Target after fixes: <150ms idle cycle, zero flap.
+
+## Track A — Git safety net + modular split (pure moves, test-gated)
+
+| # | Task | Status |
+|---|------|--------|
+| 0 | .gitignore extended (DELIVERY/, client package/, RUN-THIS/, GIT-BACKUP/, *.exe, *.xlsx, *.bak, .pytest_cache/) | DONE |
+| 0 | git init -b main, remote origin attached, SSH auth tested OK (Pravin-hub-rgb) | DONE |
+| 0 | git fetch, reconcile with remote history, baseline commit, push | PENDING |
+| A1 | Move shared globals into `us_state.py`; import check + 117 tests; commit | PENDING |
+| A2 | Extract `us_licensing.py` (~500 LOC key/licence/dialogs); verify; commit | PENDING |
+| A3 | Extract `us_workbook.py` (~220 LOC template/ensure/open); verify; commit | PENDING |
+| A4 | Extract `us_spot.py` (~500 LOC Yahoo/Tencent/parity/cache); verify; commit | PENDING |
+| A5 | Extract `us_chain.py` (~1,100 LOC symbol state, expiry, build, pollers); verify; commit | PENDING |
+| A6 | Extract `us_excel.py` (~1,400 LOC all COM writes, bulk mode, render cycle); verify; commit | PENDING |
+| A7 | Extract `us_instance.py` (~270 LOC lock/pid/guard); verify; commit | PENDING |
+| A8 | Slim main.py to ~400 LOC wiring (main_async, exit hooks); full suite; commit | PENDING |
+
+Gate after every step: `python -m unittest` all suites in `US Option Chain/source` + `python -c "import main"` passes.
+
+## Track B — Delta (crypto open tonight) — validate shared protocol, do NOT ship client build
+
+| # | Task | Status |
+|---|------|--------|
+| B1 | Delta: calc-mode restore respects other holder (skip restore automatic if another guard holder alive) | PENDING |
+| B2 | Log `excel_calc_mode_churn` counter in Delta | PENDING |
+| B3 | Live local test on tonight's crypto session with measure_strategy/latency_harness; keep client build untouched | PENDING |
+
+## Track C — US lag fixes (land after split; each fix = one module + one test)
+
+| # | Task | Status |
+|---|------|--------|
+| C1 | Calc-mode flapping: skip watchdog while `_calc_session.owned`; keep ownership in already-manual branch | PENDING |
+| C2 | COM-tax: excel_info computed only on connection-change; 1 merged block-read replaces ~9 single-cell reads/role; 1 watchdog call/cycle; gate CalculationState probe to 30s; tasklist cache 2s | PENDING |
+| C3 | Unprotected fallback: merge scattered runs into one span-write (unchanged rows carried from prev values) | PENDING |
+| C4 | Feed: pollers use wait=False after initial sync; universe timeout 30s->5s; reconnect resubscribe on worker thread (no _sub_lock hold); subscribe log only added>0; prune _quotes to target set; single lock section in _on_record | PENDING |
+| C5 | Both-tools coexistence: port B1 protocol into US; no fight over calc mode | PENDING |
+| C6 | Observability: `calc_mode_flap` counter + 30s summary log line | PENDING |
+
+## Track D — Build, verify, ship (before US open ~19:00 IST)
+
+| # | Task | Status |
+|---|------|--------|
+| D1 | Full unittest suite green (target >117, incl. new regression tests) | PENDING |
+| D2 | Idle-Excel run: render_cycle <150ms, zero flapping, compare vs baseline | PENDING |
+| D3 | Rebuild EXE via build_exe.bat; verify build_info stamp | PENDING |
+| D4 | Closed-market smoke: launch our PID, verify A1/strikes/expiries, stop by PID only | PENDING |
+| D5 | Refresh DELIVERY zip + WORKPLAN/DIAGNOSIS handoff note | PENDING |
+| D6 | Client instructions: send %LOCALAPPDATA%\USOptionChain\feed.log speed lines + title-bar recalc after 19:00 open | PENDING |

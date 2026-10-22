@@ -1,0 +1,21 @@
+{
+  "variant": "A",
+  "condition": "on",
+  "sheet": "StratA",
+  "seconds_requested": 60,
+  "precondition_exchange_feed_live": true,
+  "exchange_feed": {
+    "frames": 121,
+    "distinct": 80,
+    "first": 83545.8,
+    "last": 83452.8
+  },
+  "precondition_tool_header_live": false,
+  "tool_header": {
+    "samples": 0,
+    "distinct_moves": 0,
+    "first": null,
+    "last": null
+  },
+  "ABORTED": "tool header never went live"
+}

@@ -1,0 +1,100 @@
+{
+  "variant": "A",
+  "condition": "off",
+  "sheet": "StratA",
+  "minutes": 10.0,
+  "started": "19:44:58",
+  "gate_clean_slate": true,
+  "clean_slate_detail": {
+    "excel_open": false,
+    "tool_open": false
+  },
+  "gate_feed_live": true,
+  "feed_info": {
+    "frames": 528,
+    "distinct": 274
+  },
+  "wall_seconds": 601.0,
+  "cpu_avg_pct": 0.5,
+  "cpu_p95_pct": 1.5,
+  "cpu_max_pct": 9.2,
+  "cpu_samples": 589,
+  "ui_probe_avg_ms": 1.65,
+  "ui_probe_max_ms": 10.3,
+  "ui_probe_over_1s": 0,
+  "not_responding": [],
+  "ticks_sampled": 588,
+  "chain_ticks_with_change": 0,
+  "strategy_ticks_with_change": 0,
+  "volatile_changes": 0,
+  "chain_cells_changed_per_tick": {
+    "avg": 0,
+    "max": 0,
+    "ticks_total": 588
+  },
+  "strategy_cells_changed_per_tick": {
+    "avg": 0,
+    "max": 0,
+    "ticks_total": 588
+  },
+  "typing_avg_ms": 34.3,
+  "typing_median_ms": 32.4,
+  "typing_p95_ms": 40.7,
+  "typing_worst_ms": 48.0,
+  "typing_retries": 0,
+  "perf": {
+    "excel_recalc_second_pass": {
+      "count": 20,
+      "avg_ms": 0.0,
+      "max_ms": 0.0
+    },
+    "excel_recalc_skip_mode": {
+      "count": 18,
+      "avg_ms": 0.0,
+      "max_ms": 0.0
+    },
+    "refresh_overrun": {
+      "count": 1,
+      "avg_ms": 2192.42,
+      "max_ms": 2192.42
+    },
+    "render_cycle": {
+      "count": 20,
+      "avg_ms": 432.47,
+      "max_ms": 520.8
+    },
+    "chain_build": {
+      "count": 40,
+      "avg_ms": 3.44,
+      "max_ms": 5.26
+    },
+    "excel_formatting": {
+      "count": 40,
+      "avg_ms": 5.65,
+      "max_ms": 9.19
+    },
+    "excel_pass": {
+      "count": 20,
+      "avg_ms": 91.86,
+      "max_ms": 120.93
+    },
+    "excel_range_skipped": {
+      "count": 19,
+      "avg_ms": 0.0,
+      "max_ms": 0.0
+    },
+    "excel_range_write": {
+      "count": 40,
+      "avg_ms": 14.46,
+      "max_ms": 29.99
+    },
+    "excel_recalc": {
+      "count": 20,
+      "avg_ms": 3.73,
+      "max_ms": 4.87
+    }
+  },
+  "feed_errors": {},
+  "mem_start_mb": 243,
+  "mem_end_mb": 252
+}

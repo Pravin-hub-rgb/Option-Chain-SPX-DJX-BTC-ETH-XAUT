@@ -1,0 +1,18 @@
+{
+  "header": "BTC Spot: 83207.70 | 30 strikes",
+  "duration_s": 312.1,
+  "typing_avg_ms": 45.4,
+  "typing_p95_ms": 138.6,
+  "typing_worst_ms": 148.2,
+  "cpu_avg_pct": 23.3,
+  "cpu_p95_pct": 43.1,
+  "ui_probe_avg_ms": 3.01,
+  "ui_probe_max_ms": 61.4,
+  "ui_probe_over_1s": 0,
+  "not_responding": [],
+  "chain_ticks_with_change": 94,
+  "chain_cells_median": 76,
+  "chain_cells_max": 190,
+  "strategy_ticks_with_change": 47,
+  "strategy_cells_median": 76
+}

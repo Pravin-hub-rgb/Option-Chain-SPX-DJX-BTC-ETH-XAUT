@@ -40,6 +40,22 @@ class PerformanceMetrics:
         self._started = time.monotonic() if now is None else now
 
 
+def color_signature(strikes, spot, n_rows):
+    """Fingerprint of everything the ITM/ATM colouring depends on.
+
+    Two equal signatures mean the picture on screen is identical, so the block
+    does not need repainting. Spot is part of it because the call and put
+    boundaries are derived from spot, not only from the strike ladder — that is
+    what used to leave stale colours behind when the price moved.
+    """
+    if not strikes:
+        return (n_rows, 0, 0, 0)
+    calls_below = bisect_left(strikes, spot)
+    puts_above = bisect_right(strikes, spot)
+    atm_index = min(range(len(strikes)), key=lambda i: abs(strikes[i] - spot))
+    return (n_rows, calls_below, puts_above, atm_index)
+
+
 def itm_color_ranges(block, strikes, spot):
     """Return contiguous ranges matching the old per-row ITM coloring logic."""
     if not strikes:

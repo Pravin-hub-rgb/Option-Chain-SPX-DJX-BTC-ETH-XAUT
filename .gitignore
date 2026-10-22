@@ -1,13 +1,3 @@
-# build artifacts — regenerate from source
-*.build/
-*.dist/
-*.onefile-build/
-build/
-dist/
-__pycache__/
-*.pyc
-*.spec.bak
-
 # secrets and activation state — NEVER commit
 .env
 .env.*
@@ -30,13 +20,27 @@ instance_guard.log
 startup_diag.log
 feed.log
 
+# build artifacts — regenerate from source
+build/
+dist/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.spec.bak
+*.zip
+*.exe
+*.xlsx
+*.bak
+
+# packaged/pre-built trees and manual backups — binaries, not source
+DELIVERY/
+client package/
+RUN-THIS/
+GIT-BACKUP/
+_rebuild_check/
+
 # Excel lock files
 ~$*.xlsx
 
-# big delivery binaries — they are rebuildable from source
-Delta Option Chain/client package/OptionChain.exe
-US Option Chain/client package/OptionChain.exe
-US Option Chain/source/dist/
-US Option Chain/source/build/
-DELIVERY/
-*.zip
+# local tool state
+.commandcode/

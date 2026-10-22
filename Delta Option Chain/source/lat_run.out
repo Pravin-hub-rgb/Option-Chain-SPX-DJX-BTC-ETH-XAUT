@@ -1,0 +1,35 @@
+plan: rest 45s, ws 81s, independent 54s
+expiry under test: 08-10-2026
+subscribing to 72 option symbols
+
+--- REST (expiry_date snapshot) ---
+  samples        : 22
+  data_age_s avg : 5.647
+  data_age_s min : 1.080
+  data_age_s p95 : 10.026
+  data_age_s max : 10.787
+  age < 2s       : 13.6%
+  age < 1s       : 0.0%
+  rtt_ms avg     : 72.2
+
+--- WebSocket (v2/ticker) ---
+  samples        : 1080
+  data_age_s avg : 1.337
+  data_age_s min : 0.577
+  data_age_s p95 : 2.241
+  data_age_s max : 2.356
+  age < 2s       : 86.7%
+  age < 1s       : 28.2%
+
+--- WebSocket (independent client) ---
+  samples        : 119
+  data_age_s avg : 1.645
+  data_age_s min : 0.750
+  data_age_s p95 : 3.715
+  data_age_s max : 3.715
+  age < 2s       : 69.7%
+  age < 1s       : 19.3%
+
+no paired samples for comparison (streams not concurrent)
+
+log written to latency_log.csv

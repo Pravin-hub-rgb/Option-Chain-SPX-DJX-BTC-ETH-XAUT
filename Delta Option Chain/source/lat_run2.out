@@ -1,0 +1,50 @@
+plan: rest 45s, ws 81s, independent 54s
+expiry under test: 08-10-2026
+subscribing to 72 option symbols
+
+--- REST (expiry_date snapshot) ---
+  samples        : 22
+  data_age_s avg : 6.717
+  data_age_s min : 1.776
+  data_age_s p95 : 10.727
+  data_age_s max : 10.958
+  age < 2s       : 4.5%
+  age < 1s       : 0.0%
+  rtt_ms avg     : 92.5
+
+--- WebSocket (v2/ticker) ---
+  samples        : 1152
+  data_age_s avg : 1.251
+  data_age_s min : 0.583
+  data_age_s p95 : 1.904
+  data_age_s max : 2.073
+  age < 2s       : 99.6%
+  age < 1s       : 22.4%
+
+--- WebSocket (app stream, concurrent) ---
+  samples        : 1872
+  data_age_s avg : 1.430
+  data_age_s min : 0.583
+  data_age_s p95 : 2.456
+  data_age_s max : 2.594
+  age < 2s       : 84.9%
+  age < 1s       : 18.2%
+
+--- WebSocket (independent client, concurrent) ---
+  samples        : 120
+  data_age_s avg : 1.760
+  data_age_s min : 1.027
+  data_age_s p95 : 2.484
+  data_age_s max : 2.658
+  age < 2s       : 60.0%
+  age < 1s       : 0.0%
+
+--- app ws vs independent ws, paired within 1s ---
+  paired samples : 720
+  diff avg       : +0.0000
+  diff abs max   : 0.0000
+  diff abs mean  : 0.0000
+  consistent sign: False
+  VERDICT        : OK - no fixed offset
+
+log written to latency_log.csv

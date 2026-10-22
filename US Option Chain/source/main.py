@@ -1,7 +1,7 @@
 """
 US Stock / S&P 500 Option Chain Tool
-Primary: BigClawd free brokerage chain (near real-time, no key).
-Fallback: CBOE delayed quotes (~15 min) when primary is down.
+Primary: Databento OPRA live when an API key is configured.
+Fallback: BigClawd free brokerage chain then CBOE delayed quotes.
 Three Excel files auto-open (Delta-style):
   spx_option_chain.xlsx       -> locked to SPX (S&P500 index)
   djx_option_chain.xlsx       -> locked to DJX (Dow index)
@@ -11,7 +11,6 @@ Shared cache by symbol; one process drives all books.
 
 import asyncio
 import atexit
-import calendar
 import hashlib
 import hmac
 import math
@@ -20,7 +19,9 @@ import platform
 import re
 import shutil
 import subprocess
+import threading
 import time
+from collections import defaultdict
 from datetime import date, datetime, timedelta
 
 import pandas as pd
@@ -28,6 +29,7 @@ import requests
 
 import config
 import calc_mode_guard
+import databento_feed
 from us_diagnostics import (
     append_app_exception,
     append_connection_event,
@@ -37,15 +39,17 @@ from us_diagnostics import (
     build_id,
     write_startup_diagnostics,
 )
-from us_performance import PerformanceMetrics, itm_color_ranges
+from us_performance import PerformanceMetrics, color_signature, itm_color_ranges
 from product_identity import identify_product_directory
 from excel_helpers import (
     find_book_and_app_in_apps,
+    find_book_by_name_in_apps,
     prefer_expiry_root,
     refresh_delay,
     reopen_due,
     should_restore_calculation,
     workbook_name_is_open_in_apps,
+    workbook_name_open_anywhere_in_apps,
 )
 from us_time import eastern_now, filter_expiry_dates
 
@@ -55,23 +59,33 @@ BASE_DIR = config.base_dir()
 # the Delta tool running together in one Excel instance do not fight over it.
 PRODUCT_ID = "us"
 
+# The executable is named for the product, so the process name alone says which
+# tool it is. The customer can see it in Task Manager, and the instance guard
+# never has to guess the product from the folder - which is what went wrong
+# when both packages were extracted into the same place.
+PRODUCT_EXE = "us_option_chain.exe"
+
 # The most recent bulk-mode restore callable, so an exit path that never
 # reaches the render loop's finally can still put Excel back.
 _last_bulk_restore = None
 
-# Trader controls read from the sheet: pause and minimum interval.
 
 cfg = config.load_config()
 
 POLL_GAP = float(cfg.get("poll_gap_seconds", 2))
 ROUND_PAUSE = float(cfg.get("round_pause_seconds", 2))
 EXPIRY_REFRESH = float(cfg.get("expiry_refresh_seconds", 60))
-REFRESH = float(cfg.get("refresh_interval_seconds", 0.1))
+REFRESH = float(cfg.get("refresh_interval_seconds", 0.5))
+# How often each symbol's chain is rebuilt. The old loop rebuilt all three in
+# one pass and slept between passes, so every symbol was about six seconds
+# behind. Each symbol now has its own period.
+SYMBOL_POLL_SECONDS = float(cfg.get("symbol_poll_seconds", 0.5))
+# Floor on how often the same symbol may be rebuilt. Small, because the data
+# is already in memory from the live feed.
+SOURCE_MIN_INTERVAL = float(cfg.get("source_min_interval_seconds", 0.25))
 SPX_SYMBOL = str(cfg.get("spx_symbol", "SPX")).upper()
 DJX_SYMBOL = str(cfg.get("djx_symbol", "DJX")).upper()
 DEFAULT_SYMBOL = str(cfg.get("default_symbol", "AAPL")).upper()
-
-SOURCE = str(cfg.get("data_source", "auto")).lower()  # auto | bigclawd | cboe
 
 # Product key: scrambled = (DDMMYYYY ^ mask8) ^ vmask(variant); all digits vary
 # key = scrambled*10000 + variant*100 + SHA256 check (100 variants/date, sab valid)
@@ -145,9 +159,6 @@ def net_paint(sheet, role, bi, col_l):
         return
     _net_drawn[(role, bi)] = tag
 
-BIGCLAWD_CHAIN = "https://bigclawd.com/api/v1/trading/options/chain/{}"
-BIGCLAWD_QUOTE = "https://bigclawd.com/api/v1/trading/quote/{}"
-CBOE_URL = "https://cdn.cboe.com/api/global/delayed_quotes/options/{}.json"
 YAHOO_CHART = "https://query1.finance.yahoo.com/v8/finance/chart/{}?interval=1d&range=1d"
 HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
@@ -159,8 +170,6 @@ INDEX_SYMBOLS = {
     "SPX", "SPXW", "XSP", "DJX", "DJXW", "NDX", "NDXP",
     "VIX", "VIXW", "RUT", "RUTW", "OEX", "XEO",
 }
-# BigClawd brokerage feed does not serve these index chains (503)
-_BIGCLAWD_NO_INDEX = {"DJX", "DJXW", "XSP", "SPXW", "OEX", "XEO"}
 
 
 def clean_symbol(sym):
@@ -240,21 +249,8 @@ def standard_expiries(sym, all_expiries):
     return std + weekly
 
 
-def cboe_symbol(sym):
-    """CBOE CDN path: indices use underscore prefix (_SPX, _DJX)."""
-    s = clean_symbol(sym)
-    if is_index_symbol(s):
-        return f"_{s}"
-    return s
-
-
-def bigclawd_strike_count(sym):
-    # Index chains are huge / flaky at strike_count=100 — use 50 (API default)
-    return 50 if is_index_symbol(sym) else 100
-
-# sticky preferred source per symbol after first success; "auto" tries BigClawd then CBOE
-_source_choice = {}
-
+# Configured once in main(), after the owner/customer key has been resolved.
+_databento_feed = None
 ROLE_FILES = {
     "spx": "spx_option_chain.xlsx",
     "djx": "djx_option_chain.xlsx",
@@ -295,7 +291,6 @@ def ensure_sym_state(sym):
 
 MONTHS = {"JAN": "01", "FEB": "02", "MAR": "03", "APR": "04", "MAY": "05", "JUN": "06",
           "JUL": "07", "AUG": "08", "SEP": "09", "OCT": "10", "NOV": "11", "DEC": "12"}
-MONTHS_REV = {v: k for k, v in MONTHS.items()}
 
 BLOCK_COLS = [
     {"start": 1,  "atm": "A", "call_start": "A", "call_end": "D", "put_start": "F", "put_end": "I"},
@@ -306,10 +301,14 @@ BLOCK_COLS = [
 CHAIN_COLS = ["Call LTP", "Call Bid", "Call Ask", "Call OI",
               "strike", "Put OI", "Put Bid", "Put Ask", "Put LTP"]
 
-OPT_RE = re.compile(r"^([A-Z]+)(\d{6})([CP])(\d{8})$")
-
 _rate_lock = asyncio.Lock()
+# Serialises access to the shared Databento feed so two symbols never mutate
+# it at the same time. It does not add any delay of its own.
+_feed_access = asyncio.Semaphore(1)
 _last_source_call = 0.0
+# Last rebuild time per symbol, so the same symbol is not rebuilt twice in a
+# row while another symbol is still waiting its turn.
+_last_symbol_call = {}
 _pending_date_loads = []
 _dropdown_sig = {}
 _refetch_now = False
@@ -393,22 +392,6 @@ def log_excel_exception(role, exc, context="Excel/COM update"):
         append_app_exception(f"{context} for {role}", exc)
     except OSError as log_error:
         print(f"Could not log {context} traceback ({role}): {log_error}", flush=True)
-
-
-def month_end(d_year, d_month):
-    return date(d_year, d_month, calendar.monthrange(d_year, d_month)[1])
-
-
-def current_month_end(today=None):
-    today = today or date.today()
-    return month_end(today.year, today.month)
-
-
-def next_month_end(today=None):
-    today = today or date.today()
-    if today.month == 12:
-        return month_end(today.year + 1, 1)
-    return month_end(today.year, today.month + 1)
 
 
 def key_to_date(key):
@@ -545,11 +528,23 @@ def ask_product_key():
         win.bind("<Escape>", lambda e: on_cancel())
         win.protocol("WM_DELETE_WINDOW", on_cancel)
 
-        # center on screen
+        # center on the primary display and force focus, otherwise Windows can
+        # restore the dialog onto a secondary monitor where nobody sees it
         win.update_idletasks()
-        x = (win.winfo_screenwidth() - 480) // 2
-        y = (win.winfo_screenheight() - 200) // 2
+        try:
+            sw = win.winfo_screenwidth()
+            sh = win.winfo_screenheight()
+        except Exception:
+            sw, sh = 1920, 1080
+        x = max(0, (sw - 480) // 2)
+        y = max(0, (sh - 200) // 2)
         win.geometry(f"+{x}+{y}")
+        try:
+            win.lift()
+            win.focus_force()
+        except Exception:
+            pass
+        entry.focus_set()
 
         root.wait_window(win)
         try:
@@ -769,14 +764,35 @@ def ensure_excel_file(role):
 def open_excel_files():
     if platform.system() != "Windows":
         return
+    import xlwings as xw
     for role in ROLE_ORDER:
-        path = ensure_excel_file(role)
+        path = excel_path(role)
         try:
             os.remove(path + ":Zone.Identifier")
         except OSError:
             pass
+        # If the workbook is already open in Excel, don't open it again.
+        # Opening a second copy with the same name throws "same name" errors,
+        # and openpyxl cannot load a file Excel has locked anyway.
+        try:
+            book = find_open_book(xw, path)
+            if book is not None:
+                # Already open - the customer opened it themselves, so the
+                # tool must never open it again behind their back.
+                _auto_open_done[role] = True
+                continue
+        except Exception:
+            pass
+        # Workbook not open — ensure the file exists, then open it.
+        try:
+            ensure_excel_file(role)
+        except Exception as e:
+            print(f"ensure_excel_file failed ({role}): {e}", flush=True)
         try:
             os.startfile(path)
+            # We have now opened it. If the customer closes it later, it stays
+            # closed.
+            _auto_open_done[role] = True
         except OSError as e:
             show_error(f"Could not open {ROLE_FILES[role]}:\n{e}")
             try:
@@ -812,14 +828,12 @@ def read_symbol_cell(sheet, role):
         if sheet.range(SYMBOL_CELL).value != locked:
             sheet.range(SYMBOL_CELL).value = locked
         return locked
+    # Unlocked (stock): never write back into K1 while the user is typing.
+    # Rewriting the cell every cycle fights the user's keystrokes and makes
+    # typed text disappear. Just read + normalize internally; the cell keeps
+    # exactly what the user typed.
     raw = sheet.range(SYMBOL_CELL).value
-    sym = normalize_symbol(raw)
-    if not sym:
-        sheet.range(SYMBOL_CELL).value = role_symbol["stock"] or DEFAULT_SYMBOL
-        return role_symbol["stock"] or DEFAULT_SYMBOL
-    if sym != str(raw).strip():
-        sheet.range(SYMBOL_CELL).value = sym
-    return sym
+    return normalize_symbol(raw) or role_symbol["stock"] or DEFAULT_SYMBOL
 
 
 def iso_to_user(iso):
@@ -858,28 +872,42 @@ def parse_user_date(s):
     return None
 
 
-def yymmdd_to_iso(yymmdd):
-    return f"20{yymmdd[0:2]}-{yymmdd[2:4]}-{yymmdd[4:6]}"
-
-
 async def throttled(fn, *args, **kwargs):
+    """Rate-limit a fetch, per symbol.
+
+    This used to be one global gate: every fetch had to wait until two
+    seconds after the previous one had *started*, and the lock was held for
+    the whole wait. With three symbols that put every symbol about six
+    seconds behind, which is what the client was seeing.
+
+    The data now comes from a live WebSocket, so the fetch is a local read
+    of the quotes already in memory. There is no remote service to protect,
+    so the only thing worth limiting is how often the *same* symbol is
+    rebuilt. The actual feed access is serialised by a semaphore so two
+    symbols never mutate the feed at once, but no artificial delay is added.
+    """
     global _last_source_call
-    async with _rate_lock:
-        now = time.monotonic()
-        wait = _last_source_call + POLL_GAP - now
-        if wait > 0:
-            await asyncio.sleep(wait)
-        _last_source_call = time.monotonic()
-        for attempt in range(3):
-            try:
+    key = args[0] if args else None
+    now = time.monotonic()
+    last = _last_symbol_call.get(key, 0.0)
+    wait = last + SOURCE_MIN_INTERVAL - now
+    if wait > 0:
+        await asyncio.sleep(wait)
+    _last_source_call = time.monotonic()
+    if key is not None:
+        _last_symbol_call[key] = time.monotonic()
+    for attempt in range(3):
+        try:
+            async with _feed_access:
                 return await asyncio.to_thread(fn, *args, **kwargs)
-            except Exception as e:
-                if attempt == 2:
-                    raise
-                backoff = 15 * (attempt + 1)
-                print(f"Fetch error, retry in {backoff}s: {e}", flush=True)
-                await asyncio.sleep(backoff)
-                _last_source_call = time.monotonic()
+        except Exception as e:
+            if attempt == 2:
+                raise
+            backoff = 15 * (attempt + 1)
+            print(f"Fetch error, retry in {backoff}s: {e}", flush=True)
+            await asyncio.sleep(backoff)
+            if key is not None:
+                _last_symbol_call[key] = time.monotonic()
 
 
 def _price(ltp, bid, ask):
@@ -912,19 +940,39 @@ def _quote_quality(bid, ask, oi, ltp):
 YAHOO_SPOT_CANDIDATES = {
     "SPX": ("^GSPC", "^SPX"),
     "SPXW": ("^GSPC", "^SPX"),
-    "DJX": ("^DJX",),
-    "DJXW": ("^DJX",),
+    # ^DJX is a 15 minute old feed; ^DJI is live. The DJX index is 1/100 of
+    # the Dow, so the scale below puts it on the same footing.
+    "DJX": ("^DJI", "^DJX"),
+    "DJXW": ("^DJI", "^DJX"),
     "RUT": ("^RUT",),
     "NDX": ("^NDX",),
+    "NDXP": ("^NDX",),
     "VIX": ("^VIX",),
 }
+# Yahoo quotes the Dow in full points; the DJX index is one hundredth of it.
+YAHOO_SCALE = {"^DJI": 0.01}
 
 
 def yahoo_spot(sym):
-    """Freshest Yahoo spot — prefer live aliases over delayed ^SPX-style feeds."""
+    """Spot from Yahoo, served from the shared cache.
+
+    Yahoo's real-time feeds (^GSPC, ^DJI, ^NDX) are genuinely live - about a
+    second or two old. Its ^SPX, ^DJX, ^RUT and ^VIX feeds are fifteen
+    minutes old, so the age of every quote is checked and the freshest one
+    wins.
+    """
     root = clean_symbol(sym)
+    return spot_for_symbol(root)
+
+
+def _yahoo_spot_fetch(root):
+    """Fetch Yahoo candidates for a root and store the freshest quote."""
     if is_index_symbol(root):
-        candidates = list(YAHOO_SPOT_CANDIDATES.get(root, (f"^{root}",)))
+        candidates = list(
+            YAHOO_SPOT_CANDIDATES.get(root)
+            or YAHOO_SPOT_CANDIDATES.get(base_root(root))
+            or (f"^{root}",)
+        )
     else:
         candidates = [root]
     now = time.time()
@@ -943,219 +991,593 @@ def yahoo_spot(sym):
             if not result:
                 continue
             meta = result.get("meta") or {}
-            price = safe_float(meta.get("regularMarketPrice")) or safe_float(
-                meta.get("chartPreviousClose")
-            )
-            if price <= 0:
+            raw_ts = meta.get("regularMarketTime")
+            price = safe_float(meta.get("regularMarketPrice"))
+            used_fallback = False
+            if not price or price <= 0:
+                price = safe_float(meta.get("chartPreviousClose"))
+                used_fallback = True
+            if not price or price <= 0:
                 continue
-            ts = safe_float(meta.get("regularMarketTime")) or now
+            ts = safe_float(raw_ts) or now
             age = abs(now - ts)
+            scale = YAHOO_SCALE.get(cand, 1.0)
+            if age > 60:
+                # Only worth recording the ones that are too old to use.
+                feed_log(
+                    "spot_yahoo_stale",
+                    root=root,
+                    cand=cand,
+                    price=price,
+                    age_s=round(age, 1),
+                )
             if best_price is None or age < best_age:
-                best_price, best_age = price, age
+                best_price, best_age = price * scale, age
             if age <= 10:
-                return price
+                break
         except Exception:
             continue
+    if best_price is not None:
+        _store_spot(root, best_price, best_age, "yahoo")
     return best_price
 
 
+TENCENT_QUOTE = "https://qt.gtimg.cn/q={}"
+# Tencent mirrors the US indices under its own tickers. usINX is the S&P 500
+# index, usDJI the Dow and usNDX the Nasdaq-100; usIXIC is the Nasdaq
+# Composite. Verified live: all three returned a price, a previous close and a
+# timestamp, with no API key.
+# NOTE the scale divisor. Tencent quotes the full DJIA (52002), but the Cboe
+# DJX index that DJX options actually settle against is 1/100 of that (520.02).
+# Using the raw value would put every DJX strike deep ITM and invert the
+# ITM/ATM colouring, so it is divided back down.
+TENCENT_SCALE = {"usDJI": 0.01}
+TENCENT_ROOT_SCALE = {"XSP": 0.1}
+TENCENT_SPOT = {
+    "SPX": ("usINX",),
+    "SPXW": ("usINX",),
+    "XSP": ("usINX",),
+    "DJX": ("usDJI",),
+    "DJXW": ("usDJI",),
+    "NDX": ("usNDX",),
+    "NDXP": ("usNDX",),
+    "VIX": ("usVIX",),
+    "RUT": ("usRUT",),
+}
+
+# --- shared spot cache ----------------------------------------------------
+#
+# The index spot used to be fetched inside the chain poll: one blocking HTTP
+# request per symbol per round, about 800ms each. Three symbols meant the
+# displayed spot was up to six seconds old, and a slow Tencent held the whole
+# poll loop up.
+#
+# One background task now refreshes every source once a second and the chain
+# poll reads the cache.
+#
+# The cache keeps the FRESHEST quote seen for each root, whichever source it
+# came from, and records how old that quote is. This matters because the free
+# feeds are not all live: Yahoo's ^GSPC and ^DJI are real-time, but its ^SPX,
+# ^DJX, ^RUT and ^VIX feeds are fifteen minutes old, and Tencent's free
+# endpoint was measured serving a quote that was twenty to thirty seconds old
+# and alternating between two stale values. Taking the freshest of both is
+# what stops the index level from jumping about.
+_spot_cache = {}          # root -> (price, age_seconds, source, monotonic, quote_ts)
+_spot_lock = threading.Lock()
+SPOT_POLL_SECONDS = float(cfg.get("spot_poll_seconds", 1.0))
+# How long a cached quote is offered before the tool stops serving it and falls
+# back to the last known value. This is only a backstop for "we stopped
+# refreshing"; the real freshness test is the quote's own age, checked against
+# SPOT_STALE_SECONDS. It used to be three seconds, and because one slow HTTP
+# request could hold up the whole refresh, the cache expired on nearly half
+# the lookups - which left the index level trailing by seconds and looking
+# like it disagreed with the real price.
+SPOT_MAX_AGE = float(cfg.get("spot_max_age", 12.0))
+# How old a quote may be before it is treated as stale. A stale index level
+# would place the ATM row wrongly, so it is rejected rather than used.
+SPOT_STALE_SECONDS = float(cfg.get("spot_stale_seconds", 90.0))
+# Put-call parity: the interest rate used to discount the strike to present.
+# It only matters for expiries more than a few days out; on a same-day
+# option the discount is zero.
+PARITY_RATE = float(cfg.get("parity_rate", 0.045))
+# How far the parity spot and the external index quote may differ before it
+# is treated as a disagreement worth flagging.
+PARITY_TOLERANCE_POINTS = float(cfg.get("parity_tolerance_points", 3.0))
+PARITY_TOLERANCE_PCT = float(cfg.get("parity_tolerance_pct", 0.002))
+# A book wider than this is too thin for its mid to be an index level. Near
+# expiry the quotes go thin and a wide spread would make the parity jump
+# around, so in that case the parity is not used at all.
+PARITY_MAX_SPREAD = float(cfg.get("parity_max_spread", 2.0))
+PARITY_MAX_SPREAD_PCT = float(cfg.get("parity_max_spread_pct", 0.05))
+# If the parity level lands this far from the external quote it is wrong, not
+# the external quote, and it is thrown away rather than allowed near the ATM
+# row.
+PARITY_SANITY_PCT = float(cfg.get("parity_sanity_pct", 0.05))
+# Last parity spot per symbol, and the current disagreement with the external
+# quote. Both are surfaced in the log so the source of the spot is never a
+# guess.
+_parity_spot_cache = {}
+_spot_divergence = {}
+_parity_log_at = {}
+
+
+def _store_spot(root, price, age, source):
+    """Keep the newest quote seen for a root, from any source.
+
+    "Newest" means the quote with the latest timestamp, not the one with the
+    smallest age. Those are not the same thing: a feed that is two seconds
+    behind on the wall clock keeps reporting a younger-looking age, so
+    choosing by age would hold on to an old quote and freeze the index level.
+    The timestamp is derived from the quote's own age, so both feeds can be
+    compared fairly.
+    """
+    if price is None or price <= 0:
+        return
+    if age is None:
+        age = 0.0
+    quote_ts = time.time() - float(age)
+    with _spot_lock:
+        prev = _spot_cache.get(root)
+        if prev is None or quote_ts > prev[4]:
+            _spot_cache[root] = (
+                float(price), float(age), source, time.monotonic(), quote_ts
+            )
+            # Publish straight to the displayed value as well. The chain poll
+            # only runs about once a second, so without this the index level
+            # on screen trailed the real price by up to that much.
+            spot_cmp[root] = float(price)
+
+
+def spot_for_symbol(sym):
+    """Freshest cached spot for a symbol, or None if nothing fresh is held."""
+    root = clean_symbol(sym)
+    with _spot_lock:
+        hit = _spot_cache.get(root)
+    if not hit:
+        return None
+    price, age, _source, fetched = hit[0], hit[1], hit[2], hit[3]
+    if time.monotonic() - fetched > SPOT_MAX_AGE:
+        # We have not refreshed recently, so this is not a current quote.
+        return None
+    # The quote's own age does not disqualify it. A quote that is hours old
+    # is still the last known index level, and the trader is better served by
+    # seeing that, clearly flagged as stale, than by seeing zero. The header
+    # shows STALE when the level is old.
+    return price
+
+
+def spot_source_for(sym):
+    """Which feed supplied the cached spot, and how old that quote is."""
+    root = clean_symbol(sym)
+    with _spot_lock:
+        hit = _spot_cache.get(root)
+    if not hit:
+        return None, None
+    return hit[2], hit[1]
+
+
+def _tencent_feed_age_seconds(stamp):
+    """Age of a Tencent quote, in seconds, from its exchange timestamp.
+
+    Tencent returns "YYYY-MM-DD HH:MM:SS" in US Eastern time. Returns None
+    when the stamp cannot be understood.
+    """
+    if not stamp:
+        return None
+    try:
+        quoted = datetime.strptime(stamp.strip(), "%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return None
+    try:
+        eastern, available = eastern_now(warning=lambda *a, **k: None)
+    except Exception:
+        return None
+    if not available or eastern is None:
+        return None
+    now = eastern.replace(tzinfo=None)
+    return max(0.0, (now - quoted).total_seconds())
+
+
+def _tencent_parse(body):
+    """Parse a Tencent quote body into {ticker: (raw_price, feed_time)}.
+
+    Handles the batched form (q=usINX,usDJI,usVIX) as well as a single
+    ticker, so one request can serve every index we might need.
+    """
+    out = {}
+    for line in body.strip().split("\n"):
+        if '="' not in line:
+            continue
+        key = line.split("=")[0].replace("v_", "").strip()
+        try:
+            parts = line.split('="', 1)[1].rstrip('";').split("~")
+            if len(parts) < 4 or not parts[3]:
+                continue
+            out[key] = (float(parts[3]), parts[30] if len(parts) > 30 else "")
+        except (ValueError, IndexError):
+            continue
+    return out
+
+
+def refresh_tencent_spot_cache():
+    """One HTTP request for every index ticker, then serve them from memory."""
+    tickers = sorted({c for v in TENCENT_SPOT.values() for c in v})
+    if not tickers:
+        return
+    try:
+        resp = requests.get(
+            TENCENT_QUOTE.format(",".join(tickers)),
+            headers=HTTP_HEADERS,
+            timeout=8,
+        )
+        if resp.status_code != 200:
+            feed_log("spot_tencent_http", status=resp.status_code)
+            return
+        resp.encoding = "gbk"
+        parsed = _tencent_parse(resp.text)
+        for ticker, (raw, stamp) in parsed.items():
+            age = _tencent_feed_age_seconds(stamp)
+            for root, cands in TENCENT_SPOT.items():
+                if ticker not in cands:
+                    continue
+                scale = TENCENT_SCALE.get(ticker, 1.0) * TENCENT_ROOT_SCALE.get(root, 1.0)
+                _store_spot(root, raw * scale, age, "tencent")
+    except Exception as e:
+        feed_log("spot_batch_error", error=type(e).__name__, detail=str(e)[:150])
+
+
+def tencent_spot(sym):
+    """Spot from Tencent for index roots, served from the shared cache."""
+    root = clean_symbol(sym)
+    cands = TENCENT_SPOT.get(root) or TENCENT_SPOT.get(base_root(root))
+    if not cands:
+        return None
+    price = spot_for_symbol(root)
+    if price is not None:
+        feed_log("spot_tencent_ok", symbol=sym, price=price)
+    return price
+
+
+def _tencent_fetch_direct(root, cands, root_scale):
+    for cand in cands:
+        try:
+            resp = requests.get(TENCENT_QUOTE.format(cand), headers=HTTP_HEADERS,
+                                timeout=10)
+            if resp.status_code != 200:
+                feed_log("spot_tencent_http", symbol=root, cand=cand,
+                         status=resp.status_code)
+                continue
+            resp.encoding = "gbk"
+            hit = _tencent_parse(resp.text).get(cand)
+            if not hit:
+                continue
+            raw, stamp = hit
+            age = _tencent_feed_age_seconds(stamp)
+            scale = TENCENT_SCALE.get(cand, 1.0) * root_scale
+            price = raw * scale
+            _store_spot(root, price, age, "tencent")
+            feed_log("spot_tencent_ok", symbol=root, cand=cand, price=price,
+                     feed_time=stamp, scale=scale)
+            return price
+        except Exception as e:
+            feed_log("spot_tencent_error", symbol=root, cand=cand,
+                     error=type(e).__name__, detail=str(e)[:150])
+    return None
+
+
+def _years_to_expiry(expiry_iso):
+    """Calendar years from today to an expiry date."""
+    try:
+        exp = datetime.strptime(str(expiry_iso), "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return 0.0
+    return max(0.0, (exp - date.today()).days / 365.0)
+
+
+def _parity_spot(rows, spot_hint):
+    """Index spot from put-call parity on our own live chain.
+
+    Put-call parity gives  C - P = S - K*e^(-rT),  so
+
+        S = K*e^(-rT) + (call mid - put mid)
+
+    The quotes used here are the ones the sheet is already showing, so the
+    answer is real time, needs no extra subscription, and can never disagree
+    with the chain on screen. It is the fallback and the cross-check for the
+    external index quote, which is a free endpoint that can go stale, rate
+    limit or simply disappear.
+    """
+    if not rows:
+        return None
+    expiry = None
+    calls = {}
+    puts = {}
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        if expiry is None:
+            expiry = r.get("expiry")
+        elif r.get("expiry") != expiry:
+            continue
+        strike = r.get("strike")
+        if not strike:
+            continue
+        rtype = str(r.get("type") or "").lower()
+        if rtype.startswith("c"):
+            calls[strike] = r
+        elif rtype.startswith("p"):
+            puts[strike] = r
+    common = set(calls) & set(puts)
+    if not common:
+        return None
+    if spot_hint:
+        strike = min(common, key=lambda s: abs(s - spot_hint))
+    else:
+        strike = max(
+            common,
+            key=lambda s: (calls[s].get("oi") or 0) + (puts[s].get("oi") or 0),
+        )
+
+    def mid(row):
+        bid = row.get("bid") or 0.0
+        ask = row.get("ask") or 0.0
+        if bid > 0 and ask > 0:
+            return (bid + ask) / 2.0
+        return row.get("ltp") or 0.0
+
+    def spread_ok(row):
+        """Reject a book so wide that its mid is meaningless.
+
+        Near expiry the quotes go thin and the bid/ask can be tens of points
+        wide. A mid taken across such a spread is not an index level, it is a
+        guess, so the parity is not used at all in that case.
+        """
+        bid = row.get("bid") or 0.0
+        ask = row.get("ask") or 0.0
+        if bid <= 0 or ask <= 0 or ask < bid:
+            return False
+        mid_price = (bid + ask) / 2.0
+        if mid_price <= 0:
+            return False
+        return (ask - bid) <= max(PARITY_MAX_SPREAD, mid_price * PARITY_MAX_SPREAD_PCT)
+
+    call_row = calls[strike]
+    put_row = puts[strike]
+    if not spread_ok(call_row) or not spread_ok(put_row):
+        return None
+    call_mid = mid(call_row)
+    put_mid = mid(put_row)
+    if call_mid <= 0 or put_mid <= 0:
+        return None
+    discounted = strike * math.exp(-PARITY_RATE * _years_to_expiry(expiry))
+    return discounted + (call_mid - put_mid)
+
+
 def _fresher_spot(sym, cboe_or_chain_spot):
-    """Prefer Yahoo spot for indexes when available (CBOE current_price can be stale)."""
+    """Index spot: the freshest of the live feeds, the chain payload last.
+
+    Both free feeds are refreshed every second by the background spot task
+    and the cache keeps whichever quote is younger. Yahoo's ^GSPC and ^DJI are
+    genuinely real time; Tencent's free endpoint was measured serving a quote
+    twenty to thirty seconds old that alternated between two stale values,
+    which is what made the index level appear to jump about.
+    """
     if not is_index_symbol(sym):
         return cboe_or_chain_spot
-    y = yahoo_spot(sym)
-    if y:
-        return y
+    best = spot_for_symbol(sym)
+    if best:
+        return best
+    feed_log("spot_cache_miss", symbol=sym, note="using the chain payload spot")
     return cboe_or_chain_spot
 
 
-def _fetch_cboe(sym):
-    cboe_sym = cboe_symbol(sym)
-    url = CBOE_URL.format(cboe_sym)
-    # index payloads can be multi-MB (_SPX ~13MB)
-    timeout = 60 if is_index_symbol(sym) else 20
-    resp = requests.get(url, headers=HTTP_HEADERS, timeout=timeout)
-    resp.raise_for_status()
-    data = resp.json()["data"]
-    rows = []
-    expiries = set()
-    for o in data.get("options", []):
-        m = OPT_RE.match(str(o.get("option", "")))
-        if not m:
-            continue
-        _root, yymmdd, cp, strike_raw = m.groups()
-        expiry = yymmdd_to_iso(yymmdd)
-        expiries.add(expiry)
-        strike = int(strike_raw) / 1000.0
-        if strike <= 0:
-            continue
-        bid = safe_float(o.get("bid"))
-        ask = safe_float(o.get("ask"))
-        if _is_no_quote(bid, ask):
-            bid = ask = 0.0
-        rows.append({
-            "contract": str(o.get("option", "")),
-            "root": _root,
-            "strike": strike,
-            "type": "call" if cp == "C" else "put",
-            "ltp": _price(o.get("last_trade_price"), bid, ask),
-            "bid": bid,
-            "ask": ask,
-            "oi": safe_float(o.get("open_interest")),
-            "volume": safe_float(o.get("volume")),
-            "iv": safe_float(o.get("iv")),
-            "delta": safe_float(o.get("delta")),
-            "expiry": expiry,
-        })
-    # CBOE packs DJX+DJXW / SPX+SPXW on same strike — keep one per (expiry,type,strike)
-    want_root = clean_symbol(sym)
-    # Standard (non-weekly) root always wins over the weekly one — DJX > DJXW,
-    # SPX > SPXW. Weekly chains are often illiquid yet can show a *tighter*
-    # stale book, so scoring by quote quality first would wrongly promote the
-    # mini contract. Root match is the dominant key; quality only breaks ties
-    # when the same root appears twice.
-    by_key = {}
-    for r in rows:
-        k = (r["expiry"], r["type"], r["strike"])
-        prev = by_key.get(k)
-        if prev is None:
-            by_key[k] = r
-            continue
-        prev_score = (
-            1 if prev.get("root") == want_root else 0,
-            *_quote_quality(prev["bid"], prev["ask"], prev["oi"], prev["ltp"]),
-        )
-        new_score = (
-            1 if r.get("root") == want_root else 0,
-            *_quote_quality(r["bid"], r["ask"], r["oi"], r["ltp"]),
-        )
-        if new_score[:1] != prev_score[:1]:
-            # different root (standard vs weekly) -> standard wins outright
-            if new_score[0] > prev_score[0]:
-                by_key[k] = r
-        elif new_score > prev_score:
-            by_key[k] = r
-    rows = list(by_key.values())
-    _note_expiry_roots(sym, rows)
-    spot = _fresher_spot(sym, safe_float(data.get("current_price")) or None)
-    return spot, rows, sorted(expiries), "cboe"
+
+# ---------------------------------------------------------------------------
+# Feed observability for the US tool.
+#
+# The failure this exists to prevent: BigClawd 503s on index chains, the tool
+# quietly falls back to CBOE, and the trader spends the session looking at
+# 15-minute-old prices believing they are live. Nothing said so.
+# ---------------------------------------------------------------------------
+FEED_LOG_DIR = os.path.join(os.environ.get("LOCALAPPDATA", "."), "USOptionChain")
+FEED_LOG_PATH = os.path.join(FEED_LOG_DIR, "feed.log")
+FEED_LOG_MAX_BYTES = 2 * 1024 * 1024
+STALE_SPOT_SECONDS = 60.0
+
+# How old each symbol's spot is, and which source last served it.
+spot_served_at = {}
+spot_source = {}
+spot_first_seen = {}
 
 
-def _fetch_bigclawd(sym):
-    root = clean_symbol(sym)
-    is_idx = is_index_symbol(root)
-    resp = requests.get(
-        BIGCLAWD_CHAIN.format(root),
-        headers=HTTP_HEADERS,
-        params={"strike_count": bigclawd_strike_count(root)},
-        timeout=45 if is_idx else 25,
-    )
-    resp.raise_for_status()
-    payload = resp.json()
-    expiries = set()
-    rows = []
-    for block in payload.get("expirations") or []:
-        expiry = str(block.get("date") or "")
-        if not expiry:
-            continue
-        expiries.add(expiry)
-        for side_key, side in (("calls", "call"), ("puts", "put")):
-            for o in block.get(side_key) or []:
-                strike = safe_float(o.get("strike"))
-                if strike <= 0:
-                    continue
-                bid = safe_float(o.get("bid"))
-                ask = safe_float(o.get("ask"))
-                if _is_no_quote(bid, ask):
-                    bid = ask = 0.0
-                g = o.get("greeks") or {}
-                contract = f"{root}{expiry[2:4]}{expiry[5:7]}{expiry[8:10]}"
-                contract += ("C" if side == "call" else "P")
-                contract += f"{int(round(strike * 1000)):08d}"
-                rows.append({
-                    "contract": contract,
-                    "strike": strike,
-                    "type": side,
-                    "ltp": _price(o.get("last"), bid, ask),
-                    "bid": bid,
-                    "ask": ask,
-                    "oi": safe_float(o.get("open_interest")),
-                    "volume": safe_float(o.get("volume")),
-                    "iv": safe_float(o.get("implied_volatility")),
-                    "delta": safe_float(g.get("delta")),
-                    "expiry": expiry,
-                    "root": root,
-                })
+def _flat(v):
+    """One-line, bounded, safe for a log file."""
+    t = str(v).replace("\r", " ").replace("\n", " ")
+    return t if len(t) <= 200 else t[:200] + f"...(+{len(t) - 200})"
 
-    _note_expiry_roots(sym, rows)
 
-    spot = None
+def feed_log(event, **fields):
+    """Append one structured line to the rotating feed log. Never raises."""
     try:
-        q = requests.get(BIGCLAWD_QUOTE.format(root), headers=HTTP_HEADERS, timeout=10)
-        if q.status_code == 200:
-            spot = safe_float(q.json().get("price")) or None
+        os.makedirs(FEED_LOG_DIR, exist_ok=True)
+        try:
+            if (os.path.exists(FEED_LOG_PATH)
+                    and os.path.getsize(FEED_LOG_PATH) > FEED_LOG_MAX_BYTES):
+                os.replace(FEED_LOG_PATH, FEED_LOG_PATH + ".1")
+        except OSError:
+            pass
+        ts = datetime.now().astimezone().isoformat(timespec="milliseconds")
+        body = " ".join(f"{k}={_flat(v)}" for k, v in fields.items())
+        with open(FEED_LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write(f"{ts} {event} {body}\n")
     except Exception:
         pass
-    if spot is None and rows:
-        # fall back: no single spot field on chain; leave None and keep prior
-        spot = spot_cmp.get(sym)
-    spot = _fresher_spot(sym, spot)
 
-    return spot, rows, sorted(expiries), "bigclawd"
+
+def note_spot(sym, spot, source_name):
+    """Record spot plus when it was actually served."""
+    now = time.time()
+    first = spot_first_seen.setdefault(sym, now)
+    if spot_cmp.get(sym) != spot:
+        spot_first_seen[sym] = now
+    spot_served_at[sym] = now
+    spot_source[sym] = source_name
+    spot_cmp[sym] = spot
+
+
+def spot_age_seconds(sym):
+    served = spot_served_at.get(sym) or 0.0
+    if not served:
+        return float("inf")
+    return time.time() - served
+
+
+def source_delay_note(sym):
+    """Text for the header showing the live Databento feed status."""
+    name = spot_source.get(sym)
+    parts = []
+    if name == "databento":
+        feed = _databento_feed
+        parts.append(feed.status_text() if feed is not None else "LIVE")
+    age = spot_age_seconds(sym)
+    if age != float("inf") and age > STALE_SPOT_SECONDS:
+        parts.append(f"STALE ({int(age)}s)")
+    # Say so when the index level from the external feed and the level implied
+    # by our own option chain disagree. One of them is wrong and the trader
+    # should not have to guess which.
+    diff = _spot_divergence.get(sym)
+    if diff:
+        parts.append(f"SPOT MISMATCH {diff:.1f}")
+    return " | ".join(parts)
+
+
+def _databento_spot(sym):
+    prior = spot_cmp.get(sym)
+    # The background spot task keeps the cache warm for every symbol, index
+    # and stock alike, so this never waits on the network.
+    cached = spot_for_symbol(sym)
+    if cached:
+        return cached
+    if is_index_symbol(sym):
+        return _fresher_spot(sym, prior)
+    return yahoo_spot(sym) or prior
+
+
+def _fetch_databento(sym):
+    feed = _databento_feed
+    if feed is None:
+        raise RuntimeError("Databento key is not configured")
+    result = feed.snapshot(
+        sym,
+        _databento_spot(sym),
+        active_expiries.get(sym),
+        wait=True,
+    )
+    if result is None:
+        errors = feed.errors()
+        raise RuntimeError(errors[-1] if errors else "Databento chain not ready")
+    # No quote record in the last few seconds is normal outside trading
+    # hours, and it is not a reason to throw the chain away. The contract
+    # list, the strikes and the open interest all come from Databento and
+    # remain correct; only the live bid/ask/LTP are missing, and the header
+    # says so. Failing here used to leave the sheet completely blank.
+    if not feed.healthy() and not result[1]:
+        errors = feed.errors()
+        raise RuntimeError(errors[-1] if errors else "Databento live quotes not ready")
+    _note_expiry_roots(sym, result[1])
+    return result
 
 
 def fetch_symbol_payload(sym):
-    """Return (spot, rows, expiries, source_name). Honors config data_source."""
+    """Return (spot, rows, expiries, source_name). Databento is mandatory."""
     root = clean_symbol(sym)
-    forced = SOURCE if SOURCE in ("bigclawd", "cboe") else None
-    if forced:
-        order = [forced]
-    else:
-        preferred = _source_choice.get(sym)
-        # index roots BigClawd cannot serve -> CBOE first (skip doomed 503)
-        if root in _BIGCLAWD_NO_INDEX:
-            base = ["cboe", "bigclawd"]
-        elif is_index_symbol(root):
-            base = ["bigclawd", "cboe"]
-        else:
-            base = ["bigclawd", "cboe"]
-        if preferred:
-            order = [preferred] + base
-        else:
-            order = base
-        # de-dupe while keeping order
-        seen = set()
-        order = [x for x in order if not (x in seen or seen.add(x))]
-
     errors = []
-    for name in order:
-        try:
-            if name == "bigclawd":
-                result = _fetch_bigclawd(sym)
-            else:
-                result = _fetch_cboe(sym)
-            if _source_choice.get(sym) != name:
-                _source_choice[sym] = name
-                print(f"[{sym}] data source: {name}", flush=True)
-            return result
-        except Exception as e:
-            errors.append(f"{name}: {e}")
-            if forced:
-                raise
-            print(f"[{sym}] {name} failed, trying next: {e}", flush=True)
-    raise RuntimeError("; ".join(errors) or "no data source")
+    try:
+        result = _fetch_databento(sym)
+    except Exception as e:
+        errors.append(f"databento: {e}")
+        feed_log("source_failed", symbol=sym, root=root, source="databento",
+                 error=type(e).__name__, detail=str(e)[:180])
+        raise RuntimeError("; ".join(errors) or "no data source")
+    spot_source_name, spot_age = spot_source_for(sym)
+    feed_log("source_ok", symbol=sym, root=root, source="databento",
+             spot=(result[0] if result else None),
+             spot_feed=spot_source_name,
+             spot_age_s=(int(spot_age) if spot_age is not None else None),
+             rows=(len(result[1]) if result and len(result) > 1 else None))
+    return result
 
 
 async def load_symbol(sym):
     ensure_sym_state(sym)
     spot, rows, expiries, _src = await throttled(fetch_symbol_payload, sym)
-    if spot:
-        spot_cmp[sym] = spot
 
-    all_known_expiries[sym] = expiries
+    # Put-call parity from our own chain, as a fallback and a cross-check for
+    # the external index quote.
+    #
+    # The external quote is a free endpoint and can go stale, rate limit or
+    # disappear. The parity spot is computed from the very quotes the sheet
+    # is showing, so it is always real time and always consistent with the
+    # chain. When the external quote is missing or old, the parity spot keeps
+    # the index level moving instead of freezing it.
+    if is_index_symbol(sym) and rows:
+        parity = _parity_spot(rows, spot)
+        if parity and parity > 0:
+            _parity_spot_cache[sym] = (parity, time.monotonic())
+            ext_age = spot_source_for(sym)[1]
+            external_is_stale = (
+                spot is None
+                or (ext_age is not None and ext_age > SPOT_STALE_SECONDS)
+            )
+            if spot is not None:
+                # Hard sanity limit. If the parity level is nowhere near the
+                # external one the parity is wrong, not the external quote,
+                # and it must not be allowed near the ATM row.
+                if abs(parity - spot) > abs(spot) * PARITY_SANITY_PCT:
+                    feed_log("spot_parity_rejected", symbol=sym,
+                             external=round(spot, 4), parity=round(parity, 4))
+                    parity = None
+            if parity and external_is_stale:
+                feed_log("spot_from_parity", symbol=sym, parity=round(parity, 4),
+                         external=spot, external_age_s=ext_age)
+                spot = parity
+            elif parity is not None and spot is not None:
+                diff = abs(parity - spot)
+                tol = max(PARITY_TOLERANCE_POINTS, abs(spot) * PARITY_TOLERANCE_PCT)
+                if diff > tol:
+                    _spot_divergence[sym] = diff
+                    feed_log("spot_divergence", symbol=sym,
+                             external=round(spot, 4), parity=round(parity, 4),
+                             diff=round(diff, 4))
+                else:
+                    _spot_divergence.pop(sym, None)
+                # Record the cross-check now and then, so it is always visible
+                # which source is moving and how far apart they are, rather
+                # than having to guess.
+                last = _parity_log_at.get(sym, 0.0)
+                if time.monotonic() - last > 30:
+                    _parity_log_at[sym] = time.monotonic()
+                    feed_log("spot_parity_check", symbol=sym,
+                             external=round(spot, 4), parity=round(parity, 4),
+                             diff=round(diff, 4),
+                             external_age_s=ext_age)
+
+    if spot:
+        note_spot(sym, spot, _src)
+
+    if expiries:
+        all_known_expiries[sym] = expiries
     if active_expiries[sym] == [None, None, None]:
-        dates = available_expiries(expiries, sym)
-        active_expiries[sym] = (dates[:3] + [None, None, None])[:3]
+        # Only re-pick when we actually have expiry data. If this fetch came
+        # back empty the previously assigned expiries stay in place and the
+        # trader keeps seeing the last good chain, flagged stale, instead of
+        # watching the block blank itself out.
+        dates = available_expiries(all_known_expiries[sym], sym)
+        if dates:
+            active_expiries[sym] = (dates[:3] + [None, None, None])[:3]
+        else:
+            feed_log("expiry_none_available", symbol=sym,
+                     note="no expiry list; keeping previous assignment")
 
     # full replace — drops stale foreign-root / expired keys after source switch
     fresh = {}
@@ -1167,17 +1589,25 @@ async def load_symbol(sym):
     return {"options": rows, "n": len(rows)}
 
 
-def available_expiries(all_expiries, sym=None):
-    """Expiries to offer, standard (non-weekly) contracts first.
+def available_expiries(all_expiries, sym=None, by_date=False):
+    """Expiries to offer.
 
-    Date order alone makes the default slots land on the weekly mini chain for
-    indices, so ordering is re-ranked by whether the expiry actually carries
-    the base root (DJX/SPX). Weekly expiries stay selectable, just not first.
+    The default slots prefer the standard (non-weekly) chain, because an index
+    like SPX also lists a daily mini chain and the mini chain is thin, with
+    poor open interest and wide quotes. Those expiries are still offered, just
+    not in the first slots.
+
+    The drop-down the customer picks from is ordered by date, nearest first.
+    That is what a trader expects to see, and it is what their own broker
+    shows: the chain they want is almost always the next expiry out, and with
+    a standard-first list the near dailies were buried at the bottom.
     """
     now, eastern_available = eastern_now(warning=_log_timezone_fallback)
     dates = filter_expiry_dates(all_expiries, now, eastern_available)
     if sym is None:
         return dates
+    if by_date:
+        return sorted(dates)
     return standard_expiries(sym, dates)
 
 
@@ -1204,24 +1634,99 @@ async def init_symbol(sym):
     print(f"[{sym}] expiries: {', '.join(active_expiries[sym])}", flush=True)
 
 
-async def data_poller():
+async def symbol_poller(sym):
+    """Rebuild one symbol's chain on its own period.
+
+    Each symbol used to be rebuilt only once per shared round, so with three
+    symbols every one of them was about six seconds behind. Each symbol now
+    has its own task, and the work is short enough that they do not queue
+    behind each other.
+    """
     global _refetch_now
     while True:
+        started = time.monotonic()
         try:
-            for sym in active_symbols():
-                await load_symbol(sym)
-            syms = active_symbols()
-            spots = ", ".join(f"{s}={spot_cmp.get(s)}" for s in syms)
-            print(f"[poll] {spots} rows={sum(len(live_data.get(s) or {}) for s in syms)}", flush=True)
+            await load_symbol(sym)
             net_note(True)
-            _refetch_now = False
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            print(f"Poller error ({','.join(active_symbols())}): {e}", flush=True)
+            print(f"Poller error ({sym}): {type(e).__name__}: {e}", flush=True)
             net_note(False)
-        if _refetch_now:
-            await asyncio.sleep(POLL_GAP)
-        else:
-            await asyncio.sleep(ROUND_PAUSE)
+        elapsed = time.monotonic() - started
+        # A symbol the user just changed is rebuilt straight away.
+        delay = 0.0 if _refetch_now else SYMBOL_POLL_SECONDS
+        if delay == 0.0:
+            _refetch_now = False
+        # Sleep AFTER the work, for at least as long as the work took.
+        await asyncio.sleep(max(0.0, delay - elapsed))
+
+async def data_poller():
+    """Keep one poller per symbol, starting and stopping as symbols change.
+
+    A poller that dies is restarted. A task left in the map after it has
+    finished is never replaced, so a single failure would silently freeze one
+    symbol for the rest of the session.
+    """
+    tasks = {}
+    try:
+        while True:
+            wanted = active_symbols()
+            for sym in wanted:
+                task = tasks.get(sym)
+                if task is None or task.done():
+                    if task is not None:
+                        # Recover whatever it died on instead of losing it.
+                        try:
+                            exc = task.exception()
+                        except asyncio.CancelledError:
+                            exc = "CancelledError"
+                        except Exception as e:
+                            exc = f"{type(e).__name__}: {e}"
+                        print(f"Poller for {sym} stopped ({exc}), restarting", flush=True)
+                    tasks[sym] = asyncio.create_task(symbol_poller(sym))
+            for sym in list(tasks):
+                if sym not in wanted:
+                    tasks.pop(sym).cancel()
+            await asyncio.sleep(0.5)
+    finally:
+        for task in tasks.values():
+            task.cancel()
+
+
+async def spot_poller():
+    """Keep the shared spot cache warm.
+
+    Every source is refreshed once a second and each one runs on its own, so a
+    single slow HTTP request cannot hold up the others. Waiting for all of
+    them together meant one slow feed made the cache expire, and the index
+    level on screen fell seconds behind the real price.
+    """
+    in_flight = set()
+    while True:
+        jobs = []
+        for sym in active_symbols():
+            root = clean_symbol(sym)
+            if not root:
+                continue
+            key = ("yahoo", root)
+            if key in in_flight:
+                continue
+            jobs.append((key, asyncio.to_thread(_yahoo_spot_fetch, root)))
+        key = ("tencent", None)
+        if key not in in_flight:
+            jobs.append((key, asyncio.to_thread(refresh_tencent_spot_cache)))
+        for k, coro in jobs:
+            in_flight.add(k)
+            task = asyncio.create_task(coro)
+            task.add_done_callback(lambda _t, kk=k: in_flight.discard(kk))
+        await asyncio.sleep(SPOT_POLL_SECONDS)
+
+
+def _refresh_stock_spot(sym):
+    """Refresh the cached Yahoo spot for a stock symbol."""
+    root = clean_symbol(sym)
+    return _yahoo_spot_fetch(root)
 
 
 async def expiry_roller():
@@ -1253,6 +1758,7 @@ async def expiry_roller():
                     # payload/shape must go or the new expiry's first write and
                     # recolour would be skipped as "unchanged".
                     _block_payload.clear()
+                    _colour_state.clear()
                     # write back to every open book currently showing this symbol
                     try:
                         import xlwings as xw
@@ -1294,6 +1800,7 @@ async def process_pending_dates():
                 # cached payload/shape or the first write and the first recolour
                 # of the new expiry would be suppressed.
                 _block_payload.clear()
+                _colour_state.clear()
                 print(f"[{sym}] pinned block {i + 1} -> {parsed}", flush=True)
             except Exception as e:
                 print(f"Date pin error ({sym} {parsed}): {e}", flush=True)
@@ -1416,6 +1923,13 @@ excel_miss_counts = {r: 0 for r in ROLE_ORDER}
 excel_first_attempt = {r: None for r in ROLE_ORDER}
 _excel_startup_notice_shown = {r: False for r in ROLE_ORDER}
 _reopen_after = {r: 0.0 for r in ROLE_ORDER}
+# Set once the tool has asked Excel to open a workbook. After that it never
+# asks again: a customer who closes the workbook must not watch it pop back
+# up. Re-armed only if the file itself disappears, so a deleted workbook can
+# still be recreated and opened.
+_auto_open_done = {r: False for r in ROLE_ORDER}
+# Set when a workbook's layout no longer matches what the tool writes to.
+_sheet_altered = {r: False for r in ROLE_ORDER}
 
 
 _last_window_status = {}
@@ -1436,6 +1950,59 @@ def _short_build():
     return _SHORT_BUILD
 
 
+def _header_at(header_values, col):
+    """Value of the header cell in column `col` from the cached header row."""
+    if not header_values:
+        return None
+    index = col - 1
+    if 0 <= index < len(header_values):
+        return header_values[index]
+    return None
+
+
+def _set_header_at(header_values, col, value):
+    """Keep the cached header row in step with what we just wrote."""
+    if not header_values:
+        return
+    index = col - 1
+    if 0 <= index < len(header_values):
+        header_values[index] = value
+
+
+def sheet_structure_ok(sheet, role):
+    """True when the sheet still has the layout the tool expects.
+
+    The tool writes to fixed columns. If the customer inserts or deletes a
+    column, those positions no longer line up and the tool would write over
+    their own data. A blank cell is fine - the tool is about to fill it. Only
+    a cell holding something that is not our header means the sheet was
+    restructured.
+    """
+    try:
+        a4 = sheet.range((4, 1)).value
+    except Exception:
+        return True
+    if a4 is None or str(a4).strip() == "":
+        return True
+    return str(a4).strip() == "Call LTP"
+
+
+def _contiguous_runs(indices):
+    runs = []
+    start = prev = None
+    for i in indices:
+        if start is None:
+            start = prev = i
+        elif i == prev + 1:
+            prev = i
+        else:
+            runs.append((start, prev))
+            start = prev = i
+    if start is not None:
+        runs.append((start, prev))
+    return runs
+
+
 def show_status(book, role, status, detail=""):
     """Put the tool's health where the user can see it without asking for anything.
 
@@ -1446,13 +2013,32 @@ def show_status(book, role, status, detail=""):
     build, without the customer having to do anything at all.
 
     Only written when the text actually changes, so it costs nothing per cycle.
+
+    The clock in the title is deliberately coarse. Rewriting the window caption
+    makes Excel repaint the title bar, and on a large workbook that repaint
+    lands on top of whatever the customer is doing - scrolling included - and
+    shows up as a stutter. A five second clock is still useful and does not
+    repaint the window on every refresh.
     """
+    now = time.monotonic()
+    key = id(book)
+    last = _last_window_status.get(key)
+    if last is not None:
+        last_text, last_at = last
+        if last_text.split("  ")[0] == f"{role.upper()}  |  Option Chain {_short_build()}  |  {status}":
+            # Same role/build/status: only refresh the clock every few seconds.
+            if now - last_at < 5.0:
+                return
     stamp = time.strftime("%H:%M:%S")
     title = f"{role.upper()}  |  Option Chain {_short_build()}  |  {status}  {stamp}"
-    key = id(book)
-    if _last_window_status.get(key) == title:
+    # Show how long the customer's own workbook takes to recalculate after we
+    # touch it. This is the number behind "the strategy feels slow", so it
+    # belongs where support can see it during a screen-share.
+    if _last_recalc_ms >= 50.0:
+        title += f"  |  recalc {_last_recalc_ms:.0f}ms"
+    if last is not None and last[0] == title:
         return
-    _last_window_status[key] = title
+    _last_window_status[key] = (title, now)
     try:
         book.api.Windows(1).Caption = title
     except Exception as e:
@@ -1525,6 +2111,33 @@ def find_open_book(xw, fname):
         target,
         lambda exc, context: log_excel_exception(role, exc, context),
     )
+    if book is not None:
+        return book
+    # The customer may already have this workbook open from a different folder
+    # (an old install, a copy they made, the source tree). Excel will not open
+    # a second workbook with the same name, so opening our own copy fails and
+    # leaves the tool unable to write anything. Use the copy that is already
+    # open — it is the same product, and it is the one on their screen.
+    book, _app = find_book_by_name_in_apps(
+        apps,
+        fname,
+        lambda exc, context: log_excel_exception(role, exc, context),
+    )
+    if book is not None:
+        try:
+            record_excel_connection(
+                role,
+                "attached_to_open_copy_elsewhere",
+                f"using={book.fullname} expected={os.path.abspath(fname)}",
+            )
+            feed_log(
+                "workbook_attached_elsewhere",
+                role=role,
+                using=book.fullname,
+                expected=os.path.abspath(fname),
+            )
+        except Exception:
+            pass
     return book
 
 
@@ -1547,7 +2160,9 @@ def any_book_named(xw, fname):
 
 
 def update_expiry_dropdowns(sym, sheet):
-    dates = available_expiries(all_known_expiries[sym], sym)
+    # Date order: the chain the customer wants is almost always the next
+    # expiry out, and their own broker lists them nearest first.
+    dates = available_expiries(all_known_expiries[sym], sym, by_date=True)
     if not dates:
         return
     options = [iso_to_user(d) for d in dates]
@@ -1594,7 +2209,13 @@ def update_user_dates(sym, sheet):
     for i, cell in enumerate(["D3", "O3", "Z3"]):
         rng = sheet.range(cell)
         try:
-            rng.api.NumberFormat = "@"  # text — stops Excel date conversion / #####
+            # text — stops Excel date conversion / #####
+            # Setting the format dirties the cell, so only do it once per
+            # sheet instead of on every refresh.
+            fmt_key = (id(sheet), cell)
+            if fmt_key not in _user_fmt_done:
+                rng.api.NumberFormat = "@"
+                _user_fmt_done.add(fmt_key)
         except Exception:
             pass
         val = rng.value
@@ -1635,6 +2256,19 @@ _usd_fmt_done = set()
 # expensive call in the render loop, and between ticks most rows are unchanged,
 # so an unchanged chain is skipped entirely rather than rewritten.
 _block_payload = {}
+# Last written values per (role, block), so only the rows that actually moved
+# are written back. Writing the whole block dirties every cell in it, and
+# Excel repaints the dirty region when the write window closes - that is what
+# made scrolling stutter.
+_block_values = {}
+# Cells whose number format has already been set. Setting a number format
+# dirties the cell, and doing that on every refresh is wasted work.
+_oi_fmt_done = set()
+_user_fmt_done = set()
+# Last applied ITM/ATM colouring per (role, block). Used to skip repainting
+# when the picture has not changed, so a live price tick does not dirty every
+# cell of the block and make Excel recalculate the customer's own formulas.
+_colour_state = {}
 # Rows this block used on its previous cycle, so a shrink can clear exactly
 # what was there instead of wiping a fixed block of rows every tick.
 _last_rows = {}
@@ -1646,6 +2280,57 @@ _last_performance_flush = time.monotonic()
 _performance_log_error_shown = False
 _excel_connection_status = {}
 _last_excel_exception = {}
+_cycle_wrote = False
+_bulk_will_recalc = False
+# Who owns Excel's calculation mode, for the whole session.
+#
+# "owned" is true only when this tool changed the mode itself. If Excel was
+# already on manual calculation - because the customer wants that, or because
+# the other OptionChain tool owns it - it is left exactly as it was found.
+_calc_session = {
+    "owned": False,
+    "failed": False,
+    "mode": None,
+    "app": None,
+}
+# The customer is told once, not on every cycle.
+_calc_notice_shown = False
+# Screen updating is set and restored around every write. When Excel is busy
+# that switch fails, and four failing calls a cycle make Excel busier still.
+# After a few failures the attempt is paused for a while.
+_screen_failures = 0
+_screen_blocked_until = 0.0
+_SCREEN_FAILURE_LIMIT = 3
+_SCREEN_BACKOFF_SECONDS = 60.0
+
+
+def _screen_pause_active():
+    """True while the screen-updating attempt is paused after failures."""
+    return _screen_blocked_until > time.monotonic()
+
+
+def _note_screen_ok():
+    global _screen_failures, _screen_blocked_until
+    _screen_failures = 0
+    _screen_blocked_until = 0.0
+
+
+def _note_screen_failed(exc):
+    global _screen_failures, _screen_blocked_until
+    _screen_failures += 1
+    if _screen_failures >= _SCREEN_FAILURE_LIMIT:
+        _screen_blocked_until = time.monotonic() + _SCREEN_BACKOFF_SECONDS
+        feed_log(
+            "screen_updating_paused",
+            failures=_screen_failures,
+            seconds=_SCREEN_BACKOFF_SECONDS,
+            error=type(exc).__name__,
+        )
+_last_recalc_ms = 0.0
+# Cached (book, sheet) COM objects per role — book.sheets[0] is a COM round-trip
+# every call, and it dominated the render loop. Cached and dropped on staleness.
+_book_sheet_cache = {}
+_sheet_cache = {}
 
 
 def forget_workbook_formatting(path):
@@ -1777,8 +2462,8 @@ def format_sheet(sheet, role="stock"):
             k1.color = LABEL_FILL
             k1.font.bold = True
             k1.value = default_k1(role)
-        elif not normalize_symbol(sheet.range("K1").value):
-            sheet.range("K1").value = DEFAULT_SYMBOL
+        # Stock role: K1 is user-editable — never write its value here.
+        # The initial value is set by _write_template when the file is created.
         for cell in ("D3", "O3", "Z3"):
             try:
                 sheet.range(cell).api.NumberFormat = "@"
@@ -1793,7 +2478,18 @@ def format_sheet(sheet, role="stock"):
 
 
 def force_usd_block_formats(sheet, block, n_rows):
-    """Prices = 0.00, OI = text with $ only (kills ₹ number format)."""
+    """Prices = 0.00, OI = text with $ only (kills ₹ number format).
+
+    The OI columns are already written as "$123" text by build_option_chain, so
+    the only thing needed here is the text number format that stops Excel
+    coercing them back into a number.
+
+    The previous version also walked the OI column one cell at a time to
+    convert leftovers. That was 1,206 COM round trips per block — about twelve
+    seconds for a 600-row block — and it ran again every time the row count
+    changed. It is now one bulk read and one bulk write, once per sheet, and
+    the per-cycle cost is a single range write.
+    """
     if n_rows <= 0:
         return
     c0 = block["start"]
@@ -1802,33 +2498,47 @@ def force_usd_block_formats(sheet, block, n_rows):
         sheet_key = os.path.abspath(sheet.book.fullname).lower()
     except Exception:
         sheet_key = str(id(sheet))
-    format_key = (sheet_key, c0, n_rows)
-    if format_key in _usd_fmt_done:
-        return
-    try:
-        for off in (0, 1, 2, 6, 7, 8):
-            col = get_column_letter(c0 + off)
-            sheet.range(f"{col}5:{col}{end}").api.NumberFormat = "0.00"
-        sheet.range(f"{get_column_letter(c0 + 4)}5:{get_column_letter(c0 + 4)}{end}").api.NumberFormat = "0.0#"
+    fmt_key = (sheet_key, c0, "numfmt")
+    if fmt_key not in _usd_fmt_done:
+        try:
+            for off in (0, 1, 2, 6, 7, 8):
+                col = get_column_letter(c0 + off)
+                sheet.range(f"{col}5:{col}{end}").api.NumberFormat = "0.00"
+            strike_col = get_column_letter(c0 + 4)
+            sheet.range(f"{strike_col}5:{strike_col}{end}").api.NumberFormat = "0.0#"
+            for off in (3, 5):
+                col = get_column_letter(c0 + off)
+                sheet.range(f"{col}5:{col}{end}").api.NumberFormat = "@"
+            _usd_fmt_done.add(fmt_key)
+        except Exception as e:
+            print(f"force_usd formats: {e}", flush=True)
+            log_excel_exception("EXCEL", e, "formatting option-chain cells")
+            return
+        # One-off bulk cleanup of values left as numbers or ₹ by an older
+        # build. One read and one write for the whole sheet, not per cell.
         for off in (3, 5):
             col = get_column_letter(c0 + off)
-            rng = sheet.range(f"{col}5:{col}{end}")
-            rng.api.NumberFormat = "@"
-            # rewrite numeric/₹ leftovers as $ text
-            for r in range(5, end + 1):
-                cell = sheet.range((r, c0 + off))
-                v = cell.value
-                if v is None or v == "":
-                    continue
-                if isinstance(v, (int, float)) or (isinstance(v, str) and ("₹" in v or v.startswith("$") is False and any(ch.isdigit() for ch in v))):
-                    if isinstance(v, (int, float)):
-                        cell.value = fmt_oi(v)
-                    elif "₹" in str(v) or "Rs" in str(v):
-                        cell.value = fmt_oi(v)
-        _usd_fmt_done.add(format_key)
-    except Exception as e:
-        print(f"force_usd formats: {e}", flush=True)
-        log_excel_exception("EXCEL", e, "formatting option-chain cells")
+            try:
+                rng = sheet.range(f"{col}5:{col}{end}")
+                values = rng.value
+            except Exception as e:
+                log_excel_exception("EXCEL", e, f"reading open-interest column {c0 + off}")
+                continue
+            if not values:
+                continue
+            changed = False
+            for i, v in enumerate(values):
+                if isinstance(v, (int, float)):
+                    values[i] = fmt_oi(v)
+                    changed = True
+                elif isinstance(v, str) and ("₹" in v or "Rs" in v):
+                    values[i] = fmt_oi(v)
+                    changed = True
+            if changed:
+                try:
+                    rng.value = values
+                except Exception as e:
+                    log_excel_exception("EXCEL", e, f"writing open-interest column {c0 + off}")
 
 
 _workbook_missing = {}  # path -> [first_seen_monotonic, already_notified]
@@ -1858,9 +2568,11 @@ def notice_workbook_missing(fname):
         show_error(
             "Microsoft Excel is open, but this workbook is not:\n\n"
             f"{os.path.basename(fname)}\n\n"
-            "Open it from:\n"
+            "Expected in:\n"
             f"{os.path.dirname(fname)}\n\n"
-            "OptionChain will start writing as soon as it is open."
+            "Open it from there and the tool will start writing again.\n\n"
+            "If a copy of the same file is open in another folder, close that "
+            "one first - Excel will not open two workbooks with the same name."
         )
     except Exception as e:
         print(f"Could not show workbook-missing notice: {e}", flush=True)
@@ -1878,9 +2590,36 @@ def _write_to_excel(role):
         os._exit(1)
     path = ensure_excel_file(role)
     try:
-        book = find_open_book(xw, path)
+        # Cached COM book/sheet objects — avoids enumerating all apps + all
+        # books on every cycle, which dominated the render loop. Dropped on
+        # staleness so a closed/renamed workbook recovers.
+        book = _book_sheet_cache.get(role)
+        cached_sheet = _sheet_cache.get(role)
+        if book is not None:
+            try:
+                _ = book.name
+                if cached_sheet is not None:
+                    _ = cached_sheet.name
+            except Exception as e:
+                log_excel_exception(role, e, "cached COM object went stale")
+                record_excel_connection(role, "cached_book_unresponsive", str(e))
+                book = None
+                cached_sheet = None
+                _book_sheet_cache.pop(role, None)
+                _sheet_cache.pop(role, None)
+        if book is None:
+            book = find_open_book(xw, path)
+            if book is not None:
+                _book_sheet_cache[role] = book
+                _sheet_cache.pop(role, None)
         if book is None:
             forget_workbook_formatting(path)
+            # If the file itself has gone, allow one more open: it was
+            # recreated from the template, so the customer still needs to see
+            # it. If the file is still there, they closed it on purpose and
+            # we leave it closed.
+            if not os.path.exists(path):
+                _auto_open_done[role] = False
             apps_count = excel_apps_count(xw)
             status = (
                 "excel_running_workbook_not_found"
@@ -1895,8 +2634,43 @@ def _write_to_excel(role):
             )
             if apps_count > 0:
                 now = time.monotonic()
-                if reopen_due(now, _reopen_after[role]) and not any_book_named(xw, path):
+                # Never ask Excel to open a second workbook with a name it
+                # already has open. Excel answers that with a modal "cannot
+                # open two workbooks with the same name" dialog, and the tool
+                # used to put that dialog up every twenty seconds for hours.
+                # The open copy is used instead (see find_open_book).
+                same_name_open = False
+                try:
+                    same_name_open = workbook_name_open_anywhere_in_apps(
+                        list(xw.apps),
+                        path,
+                        lambda exc, context: log_excel_exception(
+                            role, exc, context
+                        ),
+                    )
+                except Exception as e:
+                    log_excel_exception(role, e, "checking for a same-named workbook")
+                if same_name_open:
+                    record_excel_connection(
+                        role,
+                        "same_name_open_elsewhere",
+                        f"expected_workbook={path}",
+                    )
+                if (
+                    reopen_due(now, _reopen_after[role])
+                    and not any_book_named(xw, path)
+                    and not same_name_open
+                    and not _auto_open_done.get(role)
+                ):
                     _reopen_after[role] = now
+                    # Open it once, then leave it alone.
+                    #
+                    # Reopening on a timer meant that a customer who closed
+                    # the workbook - or closed Excel - watched it pop back up
+                    # every twenty seconds, and each attempt could put Excel's
+                    # "cannot open two workbooks with the same name" dialog
+                    # on screen. One attempt, then we wait for the customer.
+                    _auto_open_done[role] = True
                     try:
                         os.startfile(path)
                         record_excel_connection(
@@ -1965,7 +2739,33 @@ def _write_to_excel(role):
         except Exception as e:
             excel_info = f"; excel_details_unavailable={type(e).__name__}: {e}"
         record_excel_connection(role, "connected", f"workbook={path}{excel_info}")
-        sheet = book.sheets[0]
+        sheet = cached_sheet
+        if sheet is None:
+            sheet = book.sheets[0]
+            _sheet_cache[role] = sheet
+
+        # The tool writes to fixed columns. If the customer has inserted or
+        # deleted a column, those positions no longer line up and the tool
+        # would write over their own data. Detect it and stop rather than
+        # corrupting the sheet.
+        if not sheet_structure_ok(sheet, role):
+            if not _sheet_altered.get(role):
+                _sheet_altered[role] = True
+                record_excel_connection(role, "sheet_layout_altered", f"path={path}")
+                try:
+                    show_error(
+                        f"The layout of {os.path.basename(path)} has changed, so "
+                        "the tool has stopped writing to it.\n\n"
+                        "A column was inserted or deleted, which moves the "
+                        "chain out of the cells the tool uses, and writing "
+                        "there would overwrite your own data.\n\n"
+                        "Undo the column change, or close this workbook "
+                        "without saving so the tool can rebuild it."
+                    )
+                except Exception:
+                    pass
+            return
+
         formatting_started = time.perf_counter()
         try:
             format_sheet(sheet, role)
@@ -1974,7 +2774,7 @@ def _write_to_excel(role):
                 role, "worksheet_setup", time.perf_counter() - formatting_started
             )
 
-        global _refetch_now
+        global _refetch_now, _cycle_wrote
         new_sym = read_symbol_cell(sheet, role)
         if new_sym and new_sym != role_symbol[role]:
             print(f"[{role}] symbol {role_symbol[role]} -> {new_sym}", flush=True)
@@ -1985,6 +2785,7 @@ def _write_to_excel(role):
             # payload and shape signatures from the old one must not suppress
             # the first write or the first recolour.
             _block_payload.clear()
+            _colour_state.clear()
             _refetch_now = True
             ensure_sym_state(new_sym)
             for cell in ("D3", "O3", "Z3"):
@@ -2034,12 +2835,56 @@ def _write_to_excel(role):
                 sheet.range("A2").value = desired
             range_val = max(desired, 1)
 
+        # Read the whole header row once.
+        #
+        # Every COM call into Excel costs about 33ms on this machine, no
+        # matter how small the range is, so asking for one cell at a time is
+        # what made the sheet feel slow: six reads per sheet, every cycle.
+        # One read of A1:AE1 covers all three blocks.
+        try:
+            header_values = list(sheet.range((1, 1), (1, 31)).value or [])
+        except Exception as e:
+            log_excel_exception(role, e, "reading the header row")
+            header_values = []
+
+        # Blocks of this sheet whose data changed and still has to be written.
+        pending_writes = []
+
         for bi, block in enumerate(BLOCK_COLS):
             expiry = active_expiries[sym][bi]
             col_l = block["start"]
             if not expiry:
-                sheet.range((1, col_l)).value = f"{sym} Spot: --"
-                sheet.range((1, col_l + 4)).value = "PCR: --"
+                # Only rewrite header cells when the text actually changed.
+                # Writing an identical string still dirties the cell and forces
+                # every dependent formula to recalculate — that cost is what
+                # makes a strategy workbook feel stuck.
+                head_text = f"{sym} Spot: --"
+                pcr_text = "PCR: --"
+                try:
+                    if _header_at(header_values, col_l) != head_text:
+                        sheet.range((1, col_l)).value = head_text
+                        _set_header_at(header_values, col_l, head_text)
+                        _cycle_wrote = True
+                    if _header_at(header_values, col_l + 4) != pcr_text:
+                        sheet.range((1, col_l + 4)).value = pcr_text
+                        _set_header_at(header_values, col_l + 4, pcr_text)
+                        _cycle_wrote = True
+                except Exception as e:
+                    log_excel_exception(role, e, "writing empty-block header")
+                # Clear stale rows only when this block was previously non-empty,
+                # or on first sighting. Clearing to a fixed 2000 rows every cycle
+                # dirties thousands of cells for no visible difference.
+                prev_n = _last_rows.get((role, bi))
+                if prev_n is None or prev_n != 0:
+                    first_sight = _FIRST_SIGHT_BOUND if prev_n is None else 0
+                    last_row = max(prev_n or 0, first_sight)
+                    clear_start = get_column_letter(col_l)
+                    clear_end = get_column_letter(col_l + 8)
+                    try:
+                        sheet.range(f"{clear_start}5:{clear_end}{4 + last_row}").clear()
+                    except Exception as e:
+                        log_excel_exception(role, e, f"clearing empty block {bi + 1}")
+                _last_rows[(role, bi)] = 0
                 continue
 
             chain_started = time.perf_counter()
@@ -2054,31 +2899,65 @@ def _write_to_excel(role):
                     rows=len(chain) if chain is not None else 0,
                 )
             cnt = len(chain) if chain is not None else 0
-            sheet.range((1, col_l)).value = f"{sym} Spot: {sp:.2f} | {cnt} strikes"
-            sheet.range((1, col_l + 4)).value = f"PCR: {pcr:.2f}"
+            _head = f"{sym} Spot: {sp:.2f} | {cnt} strikes"
+            # Never let a delay go unannounced. A silent drop to the CBOE
+            # fallback means the trader is reading 15-minute-old prices, and
+            # that is exactly what "the data is stale" means to them.
+            _note = source_delay_note(sym)
+            if _note:
+                _head = f"{_head} | {_note}"
+            pcr_text = f"PCR: {pcr:.2f}"
+            try:
+                if _header_at(header_values, col_l) != _head:
+                    sheet.range((1, col_l)).value = _head
+                    _set_header_at(header_values, col_l, _head)
+                    _cycle_wrote = True
+                if _header_at(header_values, col_l + 4) != pcr_text:
+                    sheet.range((1, col_l + 4)).value = pcr_text
+                    _set_header_at(header_values, col_l + 4, pcr_text)
+                    _cycle_wrote = True
+            except Exception as e:
+                log_excel_exception(role, e, "writing chain header")
             net_paint(sheet, role, bi, col_l)
 
             if chain is not None and not chain.empty:
                 # set OI as text BEFORE write so Excel cannot coerce $223 -> INR number
                 n_rows = len(chain)
                 c0 = block["start"]
-                for off in (3, 5):
-                    try:
-                        sheet.range((5, c0 + off), (4 + n_rows, c0 + off)).api.NumberFormat = "@"
-                    except Exception as e:
-                        log_excel_exception(
-                            role, e, f"formatting open-interest column {c0 + off}"
-                        )
+                # Setting the number format dirties the cells, so do it once
+                # per block rather than on every refresh.
+                fmt_key = (role, bi, n_rows)
+                if fmt_key not in _oi_fmt_done:
+                    for off in (3, 5):
+                        try:
+                            sheet.range((5, c0 + off), (4 + n_rows, c0 + off)).api.NumberFormat = "@"
+                        except Exception as e:
+                            log_excel_exception(
+                                role, e, f"formatting open-interest column {c0 + off}"
+                            )
+                    _oi_fmt_done.add(fmt_key)
 
                 write_started = time.perf_counter()
                 try:
                     # Only write when the contents actually differ. Any data
                     # change alters the signature and forces the write, so live
                     # updates still land; unchanged blocks cost nothing.
-                    payload_sig = hash(tuple(map(tuple, chain.values.tolist())))
+                    values = chain.values.tolist()
+                    payload_sig = hash(tuple(map(tuple, values)))
                     if payload_sig != _block_payload.get((role, bi)):
+                        prev = _block_values.get((role, bi))
+                        changed = None
+                        if prev is not None and len(prev) == len(values):
+                            changed = [
+                                i for i, (a, b) in enumerate(zip(prev, values)) if a != b
+                            ]
+                        runs = _contiguous_runs(changed) if changed else []
+                        _block_values[(role, bi)] = values
                         _block_payload[(role, bi)] = payload_sig
-                        sheet.range((5, block["start"])).options(index=False, header=False).value = chain
+                        _cycle_wrote = True
+                        # The Excel write is deferred to the end of the block
+                        # loop, so all of this sheet's blocks go out together.
+                        pending_writes.append((bi, block, chain, n_rows, runs))
                     else:
                         _performance_metrics.record(role, "excel_range_skipped", 0.0, rows=n_rows)
                 finally:
@@ -2091,17 +2970,13 @@ def _write_to_excel(role):
 
                 # Clear whatever sits below the live table.
                 #
-                # This used to wipe rows 5+n to 2000 on every single cycle,
-                # for every book. That dirties a couple of thousand cells each
-                # time, which is exactly the kind of thing that makes Excel
-                # expensive for the customer when they have a strategy
-                # workbook open. Now it clears only the rows that can actually
-                # hold leftovers: what this block used, plus, on the first
-                # sighting in this run, a generous sweep to catch anything an
-                # earlier run left behind.
+                # Only clears rows that can hold leftovers: what this block used
+                # previously, plus on first sighting a generous sweep to catch
+                # anything an earlier run left behind.
                 prev_n = _last_rows.get((role, bi))
                 if prev_n is None or n_rows < prev_n:
-                    last_row = max(n_rows, prev_n or 0, _FIRST_SIGHT_BOUND)
+                    first_sight = _FIRST_SIGHT_BOUND if prev_n is None else 0
+                    last_row = max(n_rows, prev_n or 0, first_sight)
                     stale_a = (
                         f"{get_column_letter(c0)}{5 + n_rows}"
                         f":{get_column_letter(c0 + 8)}{4 + last_row}"
@@ -2122,26 +2997,30 @@ def _write_to_excel(role):
                     cs = get_column_letter(c0)
                     ce = get_column_letter(c0 + 8)
 
-                    # Recolour the whole block every cycle, clearing first.
+                    # Recolour only when the colouring actually changes.
                     #
-                    # This was gated on a "shape" signature of (row count, first
-                    # strike, last strike), but the ATM row and the ITM ranges
-                    # all derive from spot, and spot is not in the signature.
-                    # Price moving without the ladder changing size left stale
-                    # yellow and red rows behind. Repainting costs well under a
-                    # millisecond, and clearing first is what makes it correct,
-                    # since setting .color only paints over.
-                    sheet.range(f"{cs}5:{ce}{4 + n_rows}").color = None
-                    if strikes:
-                        for cell_range, color in itm_color_ranges(block, strikes, sp):
-                            sheet.range(cell_range).color = color
+                    # The colours are derived from spot: the call block below
+                    # spot is ITM green, the put block above it is ITM red, and
+                    # the ATM row is yellow. Those boundaries only move when
+                    # spot crosses a strike, which is rare. The previous code
+                    # cleared and repainted the whole block on every cycle,
+                    # which dirties every cell of a 600-row block and makes
+                    # Excel recalculate the customer's own formulas for no
+                    # visible change.
+                    colour_sig = color_signature(strikes, sp, len(strikes))
+                    if _colour_state.get((role, bi)) != colour_sig:
+                        sheet.range(f"{cs}5:{ce}{4 + n_rows}").color = None
+                        if strikes:
+                            for cell_range, color in itm_color_ranges(block, strikes, sp):
+                                sheet.range(cell_range).color = color
 
-                        atm_strike = min(strikes, key=lambda s: abs(s - sp))
-                        atm_row = strikes.index(atm_strike) + 5
+                            atm_strike = min(strikes, key=lambda s: abs(s - sp))
+                            atm_row = strikes.index(atm_strike) + 5
 
-                        atm_range = f"{block['atm']}{atm_row}:{block['put_end']}{atm_row}"
-                        sheet.range(atm_range).color = (255, 255, 0)
-                        sheet.range(atm_range).font.bold = True
+                            atm_range = f"{block['atm']}{atm_row}:{block['put_end']}{atm_row}"
+                            sheet.range(atm_range).color = (255, 255, 0)
+                            sheet.range(atm_range).font.bold = True
+                        _colour_state[(role, bi)] = colour_sig
                 finally:
                     _performance_metrics.record(
                         role,
@@ -2150,13 +3029,101 @@ def _write_to_excel(role):
                         rows=n_rows,
                     )
             else:
-                clear_start = get_column_letter(block["start"])
-                clear_end = get_column_letter(block["start"] + 8)
-                sheet.range(f"{clear_start}5:{clear_end}2000").clear()
+                # An empty block only needs clearing when it stops being empty,
+                # or on first sighting. Clearing 1000 rows every cycle was both
+                # wasteful and needlessly expensive for Excel to do.
+                prev_n = _last_rows.get((role, bi))
+                if prev_n is None or prev_n != 0:
+                    first_sight = _FIRST_SIGHT_BOUND if prev_n is None else 0
+                    last_row = max(prev_n or 0, first_sight)
+                    clear_start = get_column_letter(col_l)
+                    clear_end = get_column_letter(col_l + 8)
+                    try:
+                        sheet.range(f"{clear_start}5:{clear_end}{4 + last_row}").clear()
+                    except Exception as e:
+                        log_excel_exception(role, e, f"clearing empty chain block {bi + 1}")
+                _last_rows[(role, bi)] = 0
+
+        # Push this sheet's changed blocks out in as few COM calls as possible.
+        #
+        # Every call into Excel costs roughly 33ms on this machine whatever
+        # the range size, so three blocks written separately cost three calls
+        # and about 100ms of pure waiting. The blocks sit side by side on the
+        # sheet, so they can go out as one range with the spacer columns
+        # between them left blank.
+        if pending_writes:
+            _flush_block_writes(sheet, role, pending_writes)
     except Exception as e:
         print(f"Excel error ({role} / {role_symbol.get(role)}): {e}", flush=True)
         record_excel_connection(role, "excel_com_error", f"{type(e).__name__}: {e}")
         log_excel_exception(role, e)
+
+
+def _flush_block_writes(sheet, role, pending):
+    """Write the changed blocks of one sheet.
+
+    How the block is written depends on whether we own Excel's calculation
+    mode.
+
+    - When we have Excel in manual calculation, nothing recalculates until we
+      ask it to, so the cost is the COM calls. Write the whole block in one
+      call.
+    - When we could not get manual calculation - Excel was busy, or a dialog
+      was up - every cell written can trigger a recalculation of the
+      customer's own workbook. That is the case that made their sheet crawl, so
+      write as few cells as possible: only the rows that moved, one call per
+      contiguous run.
+
+    Either way each block is written on its own, into its own columns, so a
+    block that did not change is never touched.
+    """
+    if not pending:
+        return
+    started = time.perf_counter()
+    protected = _calc_session.get("owned") and not _calc_session.get("failed")
+    try:
+        for bi, block, chain, n_rows, runs in pending:
+            try:
+                if protected:
+                    if len(runs) == 1:
+                        start, end = runs[0]
+                        sheet.range(
+                            (5 + start, block["start"]),
+                            (4 + end, block["start"] + 8),
+                        ).value = chain.iloc[start : end + 1].values
+                        _performance_metrics.record(
+                            role, "excel_rows_written", 0.0, rows=end - start + 1
+                        )
+                    else:
+                        sheet.range((5, block["start"])).options(
+                            index=False, header=False
+                        ).value = chain
+                else:
+                    # Unprotected window: every cell can trigger a recalc of
+                    # the customer's workbook, so touch as few cells as we can.
+                    if runs and len(runs) <= 8:
+                        for start, end in runs:
+                            sheet.range(
+                                (5 + start, block["start"]),
+                                (4 + end, block["start"] + 8),
+                            ).value = chain.iloc[start : end + 1].values
+                        _performance_metrics.record(
+                            role, "excel_rows_written", 0.0,
+                            rows=sum(end - start + 1 for start, end in runs),
+                        )
+                    else:
+                        sheet.range((5, block["start"])).options(
+                            index=False, header=False
+                        ).value = chain
+            except Exception as e:
+                log_excel_exception(role, e, f"writing chain block {bi + 1}")
+    finally:
+        _performance_metrics.record(
+            role,
+            "excel_block_flush",
+            time.perf_counter() - started,
+            rows=sum(item[3] for item in pending),
+        )
 
 
 def write_to_excel(role):
@@ -2167,6 +3134,176 @@ def write_to_excel(role):
         _performance_metrics.record(
             role, "excel_pass", time.perf_counter() - started
         )
+
+
+def _time_recalc(wrote):
+    """Recalculate once inside the manual window and time it.
+
+    This is the real cost the customer feels: how long their own strategy
+    workbook takes to recalc when we change a cell it depends on. Plain
+    Application.Calculate, not CalculateUntilAsyncQueriesDone (that is for
+    asynchronous queries such as Power Query). Only done when we actually
+    wrote something and Excel was on auto/semiauto — recalculating for a
+    customer who chose manual would undo their choice.
+    """
+    global _last_recalc_ms
+    if not wrote:
+        _performance_metrics.record("ALL", "excel_recalc_skip_nowrite", 0.0)
+        return 0.0
+    if not _bulk_will_recalc:
+        _performance_metrics.record("ALL", "excel_recalc_skip_mode", 0.0)
+        return 0.0
+    app = _app_cache
+    if app is None:
+        _performance_metrics.record("ALL", "excel_recalc_skip_noapp", 0.0)
+        return 0.0
+    try:
+        started = time.perf_counter()
+        app.api.Calculate()
+        elapsed = (time.perf_counter() - started) * 1000.0
+    except Exception as e:
+        log_excel_exception("ALL", e, "forcing workbook recalculation")
+        return 0.0
+    _last_recalc_ms = elapsed
+    _performance_metrics.record("ALL", "excel_recalc", elapsed / 1000.0)
+    return elapsed
+
+
+def render_cycle():
+    """One full pass over every workbook, inside a single bulk-mode window.
+
+    Screen updating and calculation are suspended once per cycle rather than
+    once per book, so a cycle costs three writes with repaint and recalculation
+    suspended, then one restore. Returns nothing; timing is recorded in
+    _performance_metrics.
+    """
+    started = time.perf_counter()
+    global _cycle_wrote
+    _cycle_wrote = False
+
+    # If Excel would not switch to manual calculation, every cell we write
+    # makes it recalculate. Writing anyway at full speed is what made the
+    # sheet feel stuck, so slow down to a rate the customer's workbook can
+    # absorb, and tell them once what to clear.
+    if _calc_manual_failed:
+        now = time.monotonic()
+        if now - _last_unprotected_write < _UNPROTECTED_WRITE_INTERVAL:
+            _performance_metrics.record("ALL", "render_cycle_skipped_busy", 0.0)
+            return
+        _last_unprotected_write = now
+        _performance_metrics.record("ALL", "render_cycle_unprotected", 0.0)
+        if not _calc_manual_notice_shown:
+            _calc_manual_notice_shown = True
+            try:
+                show_error(
+                    "Excel would not switch to manual calculation, so the "
+                    "workbook is recalculating on every update and will feel "
+                    "slow.\n\n"
+                    "Close any Excel dialog that is open, click outside the "
+                    "cell you are editing, and close any third-party Excel "
+                    "add-in. The tool will speed back up on its own."
+                )
+            except Exception:
+                pass
+
+    restore = _begin_excel_bulk_mode(bulk_app())
+    try:
+        for role in ROLE_ORDER:
+            if not excel_process_running():
+                break
+            try:
+                write_to_excel(role)
+            except Exception as e:
+                log_excel_exception(role, e, "render pass")
+        _time_recalc(_cycle_wrote)
+    finally:
+        if restore is not None:
+            try:
+                restore()
+                # If we already recalculated inside the window, restoring
+                # automatic should find nothing left to do. A second pass means
+                # the cost is being paid twice.
+                try:
+                    if _app_cache is not None and int(_app_cache.api.CalculationState) != 0:
+                        _performance_metrics.record("ALL", "excel_recalc_second_pass", 1.0)
+                    else:
+                        _performance_metrics.record("ALL", "excel_recalc_second_pass", 0.0)
+                except Exception:
+                    pass
+            except Exception as e:
+                log_excel_exception("ALL", e, "leaving bulk mode")
+        elapsed = time.perf_counter() - started
+        _performance_metrics.record("ALL", "render_cycle", elapsed)
+        # Never leave the trader in manual calculation between write windows.
+        try:
+            ensure_calculation_not_stranded()
+        except Exception:
+            pass
+        _log_speed_summary(elapsed)
+
+
+_speed_log_at = 0.0
+
+
+def _log_speed_summary(cycle_ms):
+    """Write the whole pipeline's timings into the log every half minute.
+
+    Every future complaint should come with numbers, so one line carries the
+    whole picture: how long a cycle took, how long the customer's own workbook
+    took to recalculate, how fresh the index quote is, and how many contracts
+    are being tracked.
+    """
+    global _speed_log_at
+    now = time.monotonic()
+    if now - _speed_log_at < 30.0:
+        return
+    _speed_log_at = now
+    feed = _databento_feed
+    quotes = 0
+    if feed is not None:
+        try:
+            with feed._lock:
+                quotes = len(feed._quotes)
+        except Exception:
+            quotes = 0
+    quote_age = None
+    quote_feed = None
+    try:
+        quote_feed, quote_age = spot_source_for("SPX")
+    except Exception:
+        pass
+    feed_log(
+        "speed",
+        cycle_ms=round(cycle_ms * 1000.0, 1),
+        recalc_ms=round(_last_recalc_ms, 1) if _last_recalc_ms else 0,
+        quotes=quotes,
+        spot_quote_age_s=(round(quote_age, 1) if quote_age is not None else None),
+        spot_feed=quote_feed,
+    )
+
+
+def bulk_app():
+    """Resolve the Excel App COM object to use for bulk mode, caching it."""
+    global _app_cache
+    try:
+        import xlwings as _xw
+    except ImportError:
+        return None
+    if _app_cache is not None:
+        try:
+            _ = _app_cache.version
+            return _app_cache
+        except Exception:
+            _app_cache = None
+    try:
+        for role in ROLE_ORDER:
+            book = find_open_book(_xw, excel_path(role))
+            if book is not None:
+                _app_cache = book.app
+                return _app_cache
+    except Exception as e:
+        log_excel_exception("ALL", e, "resolving bulk-mode app")
+    return None
 
 
 def print_chain(sym):
@@ -2195,6 +3332,66 @@ def print_chain(sym):
 
 
 _app_cache = None
+
+# Set when Excel refused to switch to manual calculation. The write window
+# is then unprotected, so every cell we touch makes Excel recalculate. When
+# that happens the render loop slows itself down instead of fighting Excel,
+# and the customer is told once what to clear.
+_calc_manual_failed = False
+_calc_manual_notice_shown = False
+# When the write window is unprotected, write at most this often.
+_UNPROTECTED_WRITE_INTERVAL = 3.0
+_last_unprotected_write = 0.0
+
+
+_manual_since = 0.0
+MANUAL_WATCHDOG_SECONDS = 4.0
+
+# xlwings' .calculation getter hands back a stale value while Excel is busy, so a
+# "did the restore work?" check built on it can pass falsely and leave the trader
+# stuck on manual. Set AND verify through the raw API with these ids.
+_CALC_IDS = {"automatic": -4105, "semiautomatic": 2, "manual": -4135}
+
+
+def _raw_calc_mode(app):
+    return int(app.api.Calculation)
+
+
+def _set_calc_mode(app, name):
+    app.api.Calculation = _CALC_IDS[name]
+    return _raw_calc_mode(app) == _CALC_IDS[name]
+
+
+def ensure_calculation_not_stranded(app=None):
+    """Safety net: never leave the trader in manual calculation.
+
+    If Excel is still on manual well after any write window should have closed,
+    put it back. Otherwise one failed restore makes every formula the trader
+    types silently fail to compute.
+    """
+    global _manual_since
+    if app is None:
+        app = _app_cache
+    if app is None:
+        return
+    try:
+        mode = _raw_calc_mode(app)
+    except Exception:
+        return
+    now = time.time()
+    if mode != -4135:
+        _manual_since = 0.0
+        return
+    if _manual_since == 0.0:
+        _manual_since = now
+        return
+    if now - _manual_since < MANUAL_WATCHDOG_SECONDS:
+        return
+    try:
+        if _set_calc_mode(app, "automatic"):
+            _manual_since = 0.0
+    except Exception:
+        pass
 
 
 def _begin_excel_bulk_mode(app=None):
@@ -2234,9 +3431,14 @@ def _begin_excel_bulk_mode(app=None):
             return None
         state["app"] = app
         try:
-            if app.screen_updating:
+            if _screen_pause_active():
+                # Setting it keeps failing and Excel is busy. Stop trying for a
+                # while rather than making four failing calls every cycle.
+                state["screen"] = None
+            elif app.screen_updating:
                 state["screen"] = True
                 app.screen_updating = False
+                _note_screen_ok()
             else:
                 # Already off: either the customer turned it off, or the other
                 # OptionChain tool has it off for its own write window. Leave it
@@ -2244,6 +3446,7 @@ def _begin_excel_bulk_mode(app=None):
                 # temporary setting and leave the customer's Excel hidden.
                 state["screen"] = None
         except Exception as e:
+            _note_screen_failed(e)
             log_excel_exception("ALL", e, "disabling screen_updating")
             state["screen"] = None
         try:
@@ -2262,11 +3465,12 @@ def _begin_excel_bulk_mode(app=None):
             }.get(raw)
             if current == "manual":
                 # Already manual: either the customer wants that, or the other
-                # OptionChain tool set it for its own write window. Either way,
+                # OptionChain tool has it off for its own write window. Either way,
                 # leave it alone and do not record it for restore -- recording
                 # it would "restore" the other tool's temporary setting and
                 # leave the customer's Excel stuck on manual calculation.
                 state["calc"] = None
+                _calc_session["owned"] = False
             else:
                 state["calc"] = current or "automatic"
                 # Written BEFORE Excel is changed. If this process dies inside
@@ -2274,7 +3478,62 @@ def _begin_excel_bulk_mode(app=None):
                 # back, instead of leaving their formulas silently dead.
                 calc_mode_guard.acquire(state["calc"], PRODUCT_ID)
                 state["calc_guarded"] = True
-                app.calculation = "manual"
+                # If the workbook was already on automatic, Excel will
+                # recalculate by itself once we restore. Semiautomatic does
+                # the same for ordinary formulas.
+                global _bulk_will_recalc
+                _bulk_will_recalc = state["calc"] in ("automatic", "semiautomatic")
+                if _calc_session["failed"]:
+                    # We already know Excel will not let us change the mode.
+                    # Stop asking: every failed attempt costs a COM call and
+                    # makes Excel busier, which is the loop that made the
+                    # customer's workbook crawl.
+                    state["calc"] = None
+                    state["calc_guarded"] = False
+                else:
+                    # Take the calculation mode once, for the whole session.
+                    #
+                    # It used to be set at the start of every cycle and restored
+                    # at the end of every cycle. On the customer's machine
+                    # that switch failed almost every time, so the write window
+                    # was never protected and every cell we touched triggered a
+                    # full recalculation of their own workbook. Leaving Excel
+                    # in manual for the session and recalculating it ourselves
+                    # once per cycle is both cheaper and far less likely to
+                    # collide with the other OptionChain tool.
+                    try:
+                        app.calculation = "manual"
+                        _calc_session["owned"] = True
+                        _calc_session["mode"] = state["calc"]
+                        _calc_session["failed"] = False
+                        _calc_session["app"] = app
+                    except Exception as exc:
+                        _calc_session["failed"] = True
+                        _calc_session["owned"] = False
+                        feed_log(
+                            "calc_manual_unavailable",
+                            error=type(exc).__name__,
+                            detail=str(exc)[:120],
+                        )
+                        if not _calc_notice_shown:
+                            _calc_notice_shown = True
+                            try:
+                                show_error(
+                                    "Excel will not switch to manual calculation, "
+                                    "so the workbook recalculates on every "
+                                    "update and can feel slow.\n\n"
+                                    "This is usually one of three things:\n"
+                                    "  - a cell is in edit mode - press Escape\n"
+                                    "  - an Excel dialog is open - close it\n"
+                                    "  - an Excel add-in is busy - turn it off\n\n"
+                                    "The tool carries on and recovers on its own, "
+                                    "but Excel will be working harder than it "
+                                    "needs to until that is cleared."
+                                )
+                            except Exception:
+                                pass
+                        state["calc"] = None
+                        state["calc_guarded"] = False
         except Exception as e:
             log_excel_exception("ALL", e, "switching to manual calculation")
             state["calc"] = None
@@ -2293,14 +3552,10 @@ def _begin_excel_bulk_mode(app=None):
             _ = app.version
         except Exception:
             return
-        if state.get("calc_guarded"):
-            try:
-                current = int(app.api.Calculation)
-                if should_restore_calculation(current, calc_mode_guard.XL_MANUAL):
-                    app.calculation = state["calc"]
-                calc_mode_guard.release(PRODUCT_ID)
-            except Exception as e:
-                log_excel_exception("ALL", e, "restoring calculation mode")
+        # The calculation mode is deliberately NOT restored here. We take it
+        # once for the whole session and release it on exit, so the two
+        # OptionChain tools no longer fight over it several times a second.
+        # _emergency_restore() puts it back when the tool stops.
         if state.get("screen") is not None:
             try:
                 if not app.screen_updating:
@@ -2342,6 +3597,7 @@ async def display_loop():
                     # written" and leave them blank.
                     _excel_gone_logged = False
                     _block_payload.clear()
+                    _colour_state.clear()
                     _sheet_fmt_done.clear()
                     _usd_fmt_done.clear()
                     _dropdown_sig.clear()
@@ -2349,53 +3605,21 @@ async def display_loop():
                     for role in ROLE_ORDER:
                         _reopen_after[role] = 0.0
                     print("Excel reopened - rewriting all sheets from scratch.", flush=True)
+                    _last_excel_exception.clear()
 
-                # One bulk-mode window around all three books rather than per
-                # book, so the customer's own workbook recalculates at most once
-                # per cycle instead of once per write.
-                # Read the trader's controls once, from the first book we can
-                # reach, before deciding whether to write anything at all.
-                try:
-                    import xlwings as _xw
-                except ImportError:
-                    _xw = None
-                # Every book carries the controls, and any of them can pause.
-                # The trader should not have to know which workbook is the
-                # "real" one for the controls to work.
-                bulk_app = None
-                for role in ROLE_ORDER:
-                    try:
-                        if _xw is None:
-                            break
-                        book = find_open_book(_xw, excel_path(role))
-                        if book is None:
-                            continue
-                        if bulk_app is None:
-                            bulk_app = book.app
-                    except Exception as e:
-                        log_excel_exception(role, e, "reading trader controls")
+                render_cycle()
 
-                restore = _begin_excel_bulk_mode(bulk_app)
-                try:
-                    for role in ROLE_ORDER:
-                        if not excel_process_running():
-                            break
-                        try:
-                            write_to_excel(role)
-                        except Exception as e:
-                            log_excel_exception(role, e, "render pass")
-                finally:
-                    if restore is not None:
-                        try:
-                            restore()
-                        except Exception as e:
-                            log_excel_exception("ALL", e, "leaving bulk mode")
             elif not _excel_gone_logged:
                 _excel_gone_logged = True
                 print("Excel is not running - pausing writes until it is reopened.", flush=True)
                 _last_excel_exception.clear()
             render_seconds = time.perf_counter() - render_started
             _performance_metrics.record("ALL", "render_cycle", render_seconds)
+            # Never leave the trader in manual calculation between write windows.
+            try:
+                ensure_calculation_not_stranded()
+            except Exception:
+                pass
             if render_seconds > REFRESH:
                 _performance_metrics.record(
                     "ALL", "refresh_overrun", render_seconds - REFRESH
@@ -2463,13 +3687,14 @@ async def main_async():
             errs.append(f"{sym}: {e}")
     if errs and len(errs) >= len(active_symbols()):
         show_error(
-            "Could not reach option data sources (BigClawd / CBOE).\n\n"
+            "Could not reach option data sources (Databento / BigClawd / CBOE).\n\n"
             "Check internet connection and run again.\n\n"
             + "\n".join(errs)
         )
         return
     await asyncio.gather(
         data_poller(),
+        spot_poller(),
         expiry_roller(),
         process_pending_dates(),
         display_loop(),
@@ -2483,6 +3708,143 @@ def _instance_guard_log(message):
             fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
     except OSError:
         pass
+
+
+def _same_folder(first, second):
+    """True when two paths name the same directory."""
+    try:
+        return os.path.normcase(os.path.abspath(first)) == os.path.normcase(
+            os.path.abspath(second)
+        )
+    except Exception:
+        return False
+
+
+def _lock_path():
+    return os.path.join(BASE_DIR, "instance.lock")
+
+
+def _read_lock_pid():
+    """PID recorded in this folder's lock file, or None."""
+    try:
+        with open(_lock_path(), encoding="ascii") as fh:
+            return int(fh.read().strip().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _write_lock_pid(pid):
+    try:
+        with open(_lock_path(), "w", encoding="ascii") as fh:
+            fh.write(str(int(pid)))
+    except OSError:
+        pass
+
+
+def _pid_alive(pid):
+    """True only if the process is genuinely still running.
+
+    OpenProcess succeeds on a process that has been terminated but whose
+    object has not been released yet, so opening it is not proof of life. The
+    exit code is: STILL_ACTIVE (259) means it is running, anything else means
+    it has finished.
+    """
+    if not pid or pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            SYNCHRONIZE = 0x00100000
+            STILL_ACTIVE = 259
+            handle = ctypes.windll.kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, False, int(pid)
+            )
+            if not handle:
+                return False
+            try:
+                code = wintypes.DWORD()
+                if not ctypes.windll.kernel32.GetExitCodeProcess(
+                    handle, ctypes.byref(code)
+                ):
+                    return False
+                return code.value == STILL_ACTIVE
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)
+        except Exception:
+            return False
+    try:
+        os.kill(int(pid), 0)
+    except OSError:
+        return False
+    except Exception:
+        return True
+    return True
+
+
+def _terminate_pid(pid):
+    """Terminate a process. True when it is gone afterwards."""
+    if os.name == "nt":
+        try:
+            import ctypes
+            PROCESS_TERMINATE = 0x0001
+            SYNCHRONIZE = 0x00100000
+            handle = ctypes.windll.kernel32.OpenProcess(
+                PROCESS_TERMINATE | SYNCHRONIZE, False, int(pid)
+            )
+            if not handle:
+                return not _pid_alive(pid)
+            try:
+                ctypes.windll.kernel32.TerminateProcess(handle, 1)
+                # Wait for it to actually go, rather than guessing.
+                ctypes.windll.kernel32.WaitForSingleObject(handle, 5000)
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)
+        except Exception:
+            return not _pid_alive(pid)
+    else:
+        try:
+            import signal
+            os.kill(int(pid), signal.SIGTERM)
+        except Exception:
+            return not _pid_alive(pid)
+    for _ in range(30):
+        if not _pid_alive(pid):
+            return True
+        time.sleep(0.1)
+    return not _pid_alive(pid)
+
+
+def _take_over_locked_instance():
+    """Stop an older instance of this tool running from this same folder.
+
+    The lock file lives in this folder, so a PID found in it is by definition
+    an instance of this tool in this folder. That is what lets a second
+    launch take over even when it cannot read the other process's executable
+    path - which is what happens when the two run at different privilege
+    levels or when security software blocks the query.
+
+    Returns True when another instance was found and stopped, False when there
+    was none, and raises RuntimeError when one was found but could not be
+    stopped, because two writers on the same workbooks is worse than one
+    writer refusing to start.
+    """
+    pid = _read_lock_pid()
+    if not pid or pid == os.getpid():
+        return False
+    if not _pid_alive(pid):
+        _instance_guard_log(f"  lock pid={pid} is gone, taking over")
+        return False
+    _instance_guard_log(f"  lock pid={pid} is alive in this folder, stopping it")
+    if _terminate_pid(pid):
+        _instance_guard_log(f"  lock pid={pid} stopped; this launch takes over")
+        return True
+    raise RuntimeError(
+        f"Another copy of {PRODUCT_EXE} (pid {pid}) is still running from "
+        f"this folder and could not be stopped."
+    )
 
 
 def _process_image_path(kernel32, pid):
@@ -2507,27 +3869,45 @@ def _process_image_path(kernel32, pid):
 def kill_previous_instances():
     """Stop an older copy of *this* tool so a double-click takes over cleanly.
 
-    Both products use OptionChain.exe. Identify the product by its package
-    marker or, for legacy installs, by its complete workbook set.
+    The executable is named for the product - us_option_chain.exe - so the
+    process name alone says which tool it is. That removes the need to guess
+    the product from the folder, which is what went wrong when both packages
+    were extracted into the same place.
 
-    Never let this break startup: any failure is logged and ignored.
+    The lock file in this folder is checked first. It proves that a process
+    running from this folder is an instance of this tool, so it can be stopped
+    without having to read its executable path - which is exactly what fails
+    when the two run at different privilege levels or when security software
+    blocks the query.
+
+    Never let the process scan break startup: any failure there is logged and
+    ignored. A duplicate that cannot be stopped is a hard error, because two
+    writers on the same workbooks is worse than one writer refusing to start.
     """
     if platform.system() != "Windows":
         return
+    my_pid = os.getpid()
+    my_dir = os.path.normcase(os.path.abspath(BASE_DIR))
+    _instance_guard_log(
+        f"pid={my_pid} product={PRODUCT_ID} exe={PRODUCT_EXE} dir={my_dir}"
+    )
+
+    # A previous instance of this tool in this folder, stopped without needing
+    # to read its path.
+    try:
+        _take_over_locked_instance()
+    except RuntimeError as e:
+        _instance_guard_log(f"  duplicate could not be stopped: {e}")
+        raise
+    except Exception as e:
+        _instance_guard_log(f"  lock check failed: {type(e).__name__}: {e}")
+
     try:
         import ctypes
         from ctypes import wintypes
 
         kernel32 = ctypes.windll.kernel32
         TH32CS_SNAPPROCESS = 0x2
-        my_pid = os.getpid()
-        my_dir = os.path.normcase(os.path.abspath(BASE_DIR))
-        my_product = identify_product_directory(BASE_DIR)
-        if my_product is None:
-            _instance_guard_log(
-                f"pid={my_pid} dir={my_dir} product unknown; leaving other instances alone"
-            )
-            return
 
         class PROCESSENTRY32(ctypes.Structure):
             _fields_ = [
@@ -2536,7 +3916,7 @@ def kill_previous_instances():
                 ("th32ProcessID", wintypes.DWORD),
                 ("th32DefaultHeapID", ctypes.POINTER(wintypes.ULONG)),
                 ("th32ModuleID", wintypes.DWORD),
-                ("cntThreads", wintypes.DWORD),
+                ("th32Threads", wintypes.DWORD),
                 ("th32ParentProcessID", wintypes.DWORD),
                 ("pcPriClassBase", ctypes.c_long),
                 ("dwFlags", wintypes.DWORD),
@@ -2553,7 +3933,10 @@ def kill_previous_instances():
             matches = []
             if kernel32.Process32First(snap, ctypes.byref(entry)):
                 while True:
-                    if entry.szExeFile.decode(errors="ignore").lower() == "optionchain.exe":
+                    # The executable is named for the product, so the process
+                    # name alone identifies it. The other product's tool has a
+                    # different name and is never a candidate.
+                    if entry.szExeFile.decode(errors="ignore").lower() == PRODUCT_EXE:
                         matches.append(int(entry.th32ProcessID))
                     if not kernel32.Process32Next(snap, ctypes.byref(entry)):
                         break
@@ -2562,33 +3945,34 @@ def kill_previous_instances():
 
         others = [pid for pid in matches if pid != my_pid]
         _instance_guard_log(
-            f"pid={my_pid} product={my_product} dir={my_dir} "
+            f"pid={my_pid} product={PRODUCT_ID} dir={my_dir} "
             f"matched={matches} others={others}"
         )
 
         for pid in others:
             path = _process_image_path(kernel32, pid)
             if not path:
+                # Cannot read the path, so cannot tell which folder it is in.
+                # The lock file already covers the same-folder case, so leave
+                # this one alone rather than killing another product's tool.
                 _instance_guard_log(f"  pid={pid} path unreadable, left alone")
                 continue
             other_dir = os.path.normcase(os.path.dirname(os.path.abspath(path)))
-            other_product = identify_product_directory(other_dir)
-            if other_product != my_product:
+            if not _same_folder(other_dir, my_dir):
                 _instance_guard_log(
-                    f"  pid={pid} product={other_product or 'unknown'} "
-                    f"at {other_dir}, left alone"
+                    f"  pid={pid} at {other_dir}, different folder, left alone"
                 )
                 continue
-            h = kernel32.OpenProcess(0x0001, False, pid)
-            if h:
-                kernel32.TerminateProcess(h, 1)
-                kernel32.CloseHandle(h)
+            if _terminate_pid(pid):
                 _instance_guard_log(
-                    f"  pid={pid} product={other_product} at {other_dir}, "
-                    "stopped; this launch takes over"
+                    f"  pid={pid} at {other_dir}, stopped; this launch takes over"
                 )
     except Exception as e:  # never block startup on this
         _instance_guard_log(f"guard error: {type(e).__name__}: {e}")
+    finally:
+        # Record ourselves as the instance holding this folder, so the next
+        # launch can take over without reading process paths.
+        _write_lock_pid(my_pid)
 
 def recover_calc_mode():
     """Put Excel back on automatic if a previous run died mid-write-window.
@@ -2634,17 +4018,99 @@ def recover_calc_mode():
 
 
 def _emergency_restore():
-    """Last-ditch restore on a clean exit, in case a cycle never finished."""
+    """Put Excel back the way we found it, on a clean exit.
+
+    The calculation mode is held for the whole session, so it has to be
+    released here. Only if this tool set it in the first place - if it was
+    already on manual calculation when we started, that belongs to the
+    customer or to the other OptionChain tool and is left alone.
+    """
     restore = _last_bulk_restore
-    if restore is None:
+    if restore is not None:
+        try:
+            restore()
+        except Exception:
+            pass
+    if not _calc_session.get("owned"):
+        return
+    app = _calc_session.get("app")
+    mode = _calc_session.get("mode")
+    if app is None or not mode:
         return
     try:
-        restore()
+        _ = app.version
+    except Exception:
+        return
+    try:
+        for _attempt in range(3):
+            try:
+                if _set_calc_mode(app, mode):
+                    break
+            except Exception:
+                pass
+            time.sleep(0.5)
+        calc_mode_guard.release(PRODUCT_ID)
     except Exception:
         pass
+    finally:
+        _calc_session["owned"] = False
 
 
 atexit.register(_emergency_restore)
+
+
+def _start_databento():
+    """Resolve the per-PC key and start the live feed.
+
+    The Databento key is mandatory: if it cannot be resolved (env / key file /
+    first-run dialog all empty or cancelled) the app exits with an error box.
+    """
+    global _databento_feed
+    from importlib.util import find_spec
+
+    if find_spec("databento") is None:
+        show_error(
+            "Databento is required but the 'databento' package is not installed.\n\n"
+            "Reinstall the application or contact the owner."
+        )
+        os._exit(1)
+    try:
+        key = databento_feed.ensure_api_key()
+    except Exception as e:
+        feed_log("databento_key_error", error=type(e).__name__, detail=str(e)[:180])
+        try:
+            append_app_exception("resolving Databento API key", e)
+        except OSError:
+            pass
+        show_error(
+            "Could not resolve the Databento API key.\n\n"
+            f"{type(e).__name__}: {e}\n\n"
+            "Contact the owner for a valid key."
+        )
+        os._exit(1)
+    if not key:
+        feed_log("databento_no_key", note="dialog cancelled or blank")
+        show_error(
+            "Databento API key required.\n\n"
+            "Enter the Databento API key to continue.\n"
+            "The key is stored only on this PC, never in the app folder.\n"
+            "App will close."
+        )
+        os._exit(1)
+    _databento_feed = databento_feed.DatabentoFeed(key, event_log=feed_log)
+    feed_log("databento_key_loaded", masked=databento_feed.mask_key(key))
+
+
+def _stop_databento():
+    feed = _databento_feed
+    if feed is not None:
+        try:
+            feed.stop()
+        except Exception:
+            pass
+
+
+atexit.register(_stop_databento)
 
 
 def main():
@@ -2653,9 +4119,38 @@ def main():
     except OSError as e:
         show_error(f"Could not write startup diagnostics:\n{e}")
     try:
+        # Take over from any older instance BEFORE anything that can block.
+        #
+        # The activation dialog and the API-key dialog both block, and the
+        # guard used to run after them. Two launches therefore both sat on a
+        # dialog, neither ever reached the guard, and both went on to write the
+        # same three workbooks. Two writers = two Databento sessions and a
+        # sheet that shows a mix of two snapshots.
+        try:
+            kill_previous_instances()
+        except RuntimeError as e:
+            show_error(
+                f"{e}\n\n"
+                f"Two copies of {PRODUCT_EXE} writing the same workbooks "
+                "will corrupt what you see, so this one will not start.\n\n"
+                "Close the other copy - it is in the taskbar - and run "
+                f"{PRODUCT_EXE} again."
+            )
+            os._exit(1)
+        # One line that says what is running, from where, and whether this
+        # instance owns Excel's calculation mode. The customer never has to
+        # run a diagnostic command to find that out.
+        feed_log(
+            "startup",
+            pid=os.getpid(),
+            product=PRODUCT_ID,
+            exe=PRODUCT_EXE,
+            folder=BASE_DIR,
+            build=_short_build(),
+        )
         if not ensure_license():
             os._exit(1)
-        kill_previous_instances()
+        _start_databento()
         asyncio.run(main_async())
     except KeyboardInterrupt:
         pass

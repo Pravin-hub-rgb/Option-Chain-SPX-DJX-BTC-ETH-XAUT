@@ -1,6 +1,41 @@
 # US Stock Option Chain — Data Source Decision (2026-09-23)
 
-## Primary: BigClawd (free, no key, near real-time)
+_Internal engineering notes - keep out of the client/DELIVERY ZIP._
+
+## Primary: Databento OPRA live (customer-provided key)
+
+- Dataset `OPRA.PILLAR`, live schema `cbbo-1s` (NBBO once per second, OPRA feed).
+- Key is entered once per PC and stored in `%LOCALAPPDATA%\USOptionChain\databento.key`.
+  Development can use `DATABENTO_API_KEY` in the environment or `US Option Chain/.env`.
+- Active expiries are ±100 strikes around spot; other expiries are metadata-only so
+  the standard/weekly expiry ranking still works.
+- Definition/statistics history is used to build the universe and load open interest.
+- Fallback when the feed is not connected: BigClawd, then CBOE delayed.
+
+## Spot (underlying price) is separate from OPRA
+
+OPRA/CBBO carries option quotes only; it does not carry the index level. The spot
+shown in the header is fetched separately on each poll:
+
+1. **Tencent** quote API: `GET https://qt.gtimg.cn/q=usINX` (free, no key, plain
+   text). Mappings: `SPX/SPXW -> usINX`, `XSP -> usINX/10`, `DJX/DJXW -> usDJI/100`,
+   `NDX/NDXP -> usNDX`, `VIX/VIXW -> usVIX`, `RUT/RUTW -> usRUT`.
+2. **Yahoo** chart API if Tencent returns nothing. Index aliases live in
+   `YAHOO_SPOT_CANDIDATES`; stocks use their own ticker.
+3. **Chain payload spot** as the last resort. On CBOE this can be ~15 min delayed;
+   on Databento it reuses the previous spot.
+
+Verified 2026-10-19 during market hours: Tencent returned SPX **7700.42** and DJX
+**519.95** (converted from 52002.41, /100), no API key. Only `usINX`, `usDJI` and
+`usNDX` were confirmed live; the rest fall through to Yahoo/chain spot.
+
+This only positions ATM and the spot header - option bid/ask/OI still come from
+Databento. The free endpoints have no SLA and can rate-limit/change. `STALE` is
+based on when spot was last fetched, not the exchange timestamp; Tencent's
+timestamp is logged but not used to reject after-hours prices. Logs:
+`spot_tencent_ok`, `spot_tencent_miss`, `spot_yahoo_miss`.
+
+## Secondary: BigClawd (free, no key, near real-time)
 
 - Chain: `GET https://bigclawd.com/api/v1/trading/options/chain/{SYMBOL}`
   - Query: `strike_count` (N around ATM, default 50), `expiration` (YYYY-MM-DD, repeatable)
@@ -14,7 +49,7 @@
 ## Fallback: CBOE delayed quotes (~15 min)
 
 - `GET https://cdn.cboe.com/api/global/delayed_quotes/options/{SYMBOL}.json`
-- Full chain + greeks, one request; used only if BigClawd fails (`data_source: auto`).
+- Full chain + greeks, one request; used only after Databento and BigClawd fail (`data_source: auto`).
 - **Index symbols need underscore prefix:** `SPX→_SPX`, `DJX→_DJX`, `NDX→_NDX`, `VIX→_VIX` (bare name → 403).
 - Index payloads are large (`_SPX` ~13MB) — timeout 60s for indices.
 
@@ -44,9 +79,10 @@ Helper in `main.py`: `INDEX_SYMBOLS`, `cboe_symbol()`, `_BIGCLAWD_NO_INDEX` (CBO
 
 ## Config
 
-`config.json` → `"data_source": "auto" | "bigclawd" | "cboe"`
+`config.json` → `"data_source": "auto" | "databento" | "bigclawd" | "cboe"`
 
-`auto` order: BigClawd → CBOE. Sticky per-symbol after first success.
+`auto` order: Databento (when a key is configured) → BigClawd → CBOE.
+Databento is retried on every cycle after a temporary fallback.
 
 ---
 

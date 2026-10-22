@@ -1,0 +1,13 @@
+{
+  "variant": "B",
+  "condition": "off",
+  "sheet": "StratB",
+  "minutes": 2.0,
+  "started": "19:25:58",
+  "gate_clean_slate": false,
+  "clean_slate_detail": {
+    "excel_open": true,
+    "tool_open": false
+  },
+  "ABORTED": "not a clean slate: {'excel_open': True, 'tool_open': False}"
+}

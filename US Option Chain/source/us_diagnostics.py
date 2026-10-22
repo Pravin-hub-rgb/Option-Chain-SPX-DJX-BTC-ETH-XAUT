@@ -276,6 +276,16 @@ def append_performance_summary(lines):
     return _append("performance", lines)
 
 
+def append_runtime_warning(message, detail=""):
+    lines = [
+        f"timestamp={datetime.now().astimezone().isoformat(timespec='seconds')}",
+        f"warning={message}",
+    ]
+    if detail:
+        lines.append(f"detail={detail}")
+    return _append("runtime warning", lines)
+
+
 def append_app_exception(context, exc):
     rendered = traceback.format_exception(type(exc), exc, exc.__traceback__)
     lines = [
