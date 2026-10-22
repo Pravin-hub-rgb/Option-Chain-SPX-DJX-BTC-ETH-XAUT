@@ -167,3 +167,27 @@ _last_unprotected_write = 0.0
 
 _manual_since = 0.0
 MANUAL_WATCHDOG_SECONDS = 4.0
+
+
+def net_note(ok):
+    """Har network round-trip ke baad call karo."""
+    if ok:
+        if _net["fails"] >= NET_FAIL_LIMIT:
+            print("Connection restored", flush=True)
+        _net["fails"] = 0
+        _net["since"] = None
+        return
+    _net["fails"] += 1
+    if _net["fails"] == NET_FAIL_LIMIT:
+        _net["since"] = time.time()
+        print("Connection lost - retrying in background", flush=True)
+
+
+def net_badge():
+    """Header tag text ('' = sab theek, kuch nahi likhna)."""
+    if _net["fails"] < NET_FAIL_LIMIT:
+        return ""
+    secs = int(time.time() - (_net["since"] or time.time()))
+    m, s = divmod(secs, 60)
+    span = f"{m}m {s:02d}s" if m else f"{s}s"
+    return f"OFFLINE {span} - reconnecting..."

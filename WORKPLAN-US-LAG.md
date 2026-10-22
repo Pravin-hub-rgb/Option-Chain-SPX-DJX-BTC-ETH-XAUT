@@ -34,8 +34,8 @@ Baseline numbers (idle machine, this morning): render_cycle avg 191ms / max 311m
 | A1 | Move shared globals into `us_state.py`; import check + 117 tests; commit | DONE (4574b49) |
 | A2 | Extract `us_licensing.py` (~500 LOC key/licence/dialogs); verify; commit | DONE (b8a9072) |
 | A3 | Extract `us_workbook.py` (~220 LOC template/ensure/open); verify; commit | DONE (5b7c651, includes symbol text helpers) |
-| A4 | Extract `us_spot.py` (~500 LOC Yahoo/Tencent/parity/cache); verify; commit | DONE |
-| A5 | Extract `us_chain.py` (~1,100 LOC symbol state, expiry, build, pollers); verify; commit | PENDING |
+| A4 | Extract `us_spot.py` (~500 LOC Yahoo/Tencent/parity/cache); verify; commit | DONE (3b91528) |
+| A5 | Extract `us_chain.py` (~1,100 LOC symbol state, expiry, build, pollers); verify; commit | DONE |
 | A6 | Extract `us_excel.py` (~1,400 LOC all COM writes, bulk mode, render cycle); verify; commit | PENDING |
 | A7 | Extract `us_instance.py` (~270 LOC lock/pid/guard); verify; commit | PENDING |
 | A8 | Slim main.py to ~400 LOC wiring (main_async, exit hooks); full suite; commit | PENDING |

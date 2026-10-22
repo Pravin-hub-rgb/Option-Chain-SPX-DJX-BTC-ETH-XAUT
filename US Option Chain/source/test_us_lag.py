@@ -259,8 +259,8 @@ class PollCadenceTests(unittest.TestCase):
     """The poll loop must not serialise the symbols behind a global gate."""
 
     def setUp(self):
-        import main
-        self.main = main
+        import us_chain
+        self.main = us_chain
 
     def test_source_min_interval_is_small(self):
         self.assertLessEqual(self.main.SOURCE_MIN_INTERVAL, 0.5)
@@ -592,8 +592,8 @@ class ParitySpotTests(unittest.TestCase):
     def test_sanity_limit_rejects_a_wildly_wrong_parity(self):
         """A parity nowhere near the external quote is thrown away."""
         import inspect
-        import main
-        src = inspect.getsource(main.load_symbol)
+        import us_chain
+        src = inspect.getsource(us_chain.load_symbol)
         self.assertIn("spot_parity_rejected", src)
         self.assertIn("PARITY_SANITY_PCT", src)
 
