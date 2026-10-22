@@ -303,7 +303,11 @@ def append_app_exception(context, exc):
 # quietly falls back to CBOE, and the trader spends the session looking at
 # 15-minute-old prices believing they are live. Nothing said so.
 # ---------------------------------------------------------------------------
-FEED_LOG_DIR = os.path.join(os.environ.get("LOCALAPPDATA", "."), "USOptionChain")
+# The log directory honours US_OPTION_CHAIN_LOG_DIR so tests and support
+# runs never write into the real customer logs.
+FEED_LOG_DIR = os.environ.get("US_OPTION_CHAIN_LOG_DIR") or os.path.join(
+    os.environ.get("LOCALAPPDATA", "."), "USOptionChain"
+)
 FEED_LOG_PATH = os.path.join(FEED_LOG_DIR, "feed.log")
 FEED_LOG_MAX_BYTES = 2 * 1024 * 1024
 

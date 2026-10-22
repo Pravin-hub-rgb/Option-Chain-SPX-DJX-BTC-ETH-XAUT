@@ -590,7 +590,11 @@ def _session():
 # Every request and every probe now lands in a size-capped log, and the state
 # is surfaced in the sheet header.
 # ---------------------------------------------------------------------------
-FEED_LOG_DIR = os.path.join(os.environ.get("LOCALAPPDATA", "."), "DeltaOptionChain")
+# The log directory honours DELTA_OPTION_CHAIN_LOG_DIR so tests and support
+# runs never write into the real customer logs.
+FEED_LOG_DIR = os.environ.get("DELTA_OPTION_CHAIN_LOG_DIR") or os.path.join(
+    os.environ.get("LOCALAPPDATA", "."), "DeltaOptionChain"
+)
 FEED_LOG_PATH = os.path.join(FEED_LOG_DIR, "feed.log")
 FEED_LOG_MAX_BYTES = 2 * 1024 * 1024          # rotate at 2 MB; this runs 24/7
 STALE_FLAG_SECONDS = 10.0
