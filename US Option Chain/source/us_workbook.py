@@ -12,10 +12,11 @@ main with a late import to stay import-safe.
 
 import math
 import os
+import threading
 import platform
 import shutil
 
-from us_diagnostics import append_app_exception
+from us_diagnostics import append_app_exception, feed_log
 from us_licensing import show_error
 from us_state import (
     _auto_open_done,
@@ -39,6 +40,17 @@ BLOCK_COLS = [
     {"start": 12, "atm": "L", "call_start": "L", "call_end": "O", "put_start": "Q", "put_end": "T"},
     {"start": 23, "atm": "W", "call_start": "W", "call_end": "Z", "put_start": "AB", "put_end": "AE"},
 ]
+
+# How many expiry blocks a sheet shows. The customer's strategy sheet reads
+# blocks 1+2 only (near and next expiry), so block 3 is retired: the render
+# loop clears it once per session and never touches those columns again,
+# which cuts a third of the per-cycle Excel traffic. The layout constants
+# above keep their third entry so the columns are still here if the customer
+# ever asks for a third expiry back.
+BLOCKS_PER_SHEET = 2
+
+# Per-block expiry input cells, one per SHOWN block (D3 = block 1, O3 = block 2).
+EXPIRY_CELLS = ("D3", "O3", "Z3")[:BLOCKS_PER_SHEET]
 
 
 def clean_symbol(sym):
@@ -150,7 +162,7 @@ def _write_template(ws, role):
     changed = False
     headers = ["Call LTP", "Call Bid", "Call Ask", "Call OI", "Strike",
                "Put OI", "Put Bid", "Put Ask", "Put LTP"]
-    for block in BLOCK_COLS:
+    for block in BLOCK_COLS[:BLOCKS_PER_SHEET]:
         for i, h in enumerate(headers):
             r, c = 4, block["start"] + i
             cell = ws.cell(row=r, column=c)
@@ -166,9 +178,10 @@ def _write_template(ws, role):
             changed = True
     if _safe_set(ws, 2, 2, "± strikes — edit A2"):
         changed = True
-    for col, label in ((1, "Expiry 1"), (3, "(edit D3)"), (12, "Expiry 2"),
-                       (14, "(edit O3)"), (23, "Expiry 3"), (25, "(edit Z3)")):
-        if _safe_set(ws, 3, col, label):
+    for si, block in enumerate(BLOCK_COLS[:BLOCKS_PER_SHEET], 1):
+        if _safe_set(ws, 3, block["start"], f"Expiry {si}"):
+            changed = True
+        if _safe_set(ws, 3, block["start"] + 2, f"(edit {EXPIRY_CELLS[si - 1]})"):
             changed = True
     for row in (2, 3):
         cell = ws.cell(row=row, column=10)
@@ -273,42 +286,184 @@ def ensure_excel_file(role):
     return path
 
 
+def short_path(path):
+    """The Windows 8.3 short name for a path, when there is one.
+
+    Excel's Workbooks.Open stops working somewhere past 128 characters and
+    never returns. A package unzipped under a user's Downloads folder is
+    over that easily, and the symptom is the worst kind: the workbook never
+    opens, the tool says "Excel is not running" while Excel is sitting right
+    there, and the sheet stays empty. That is what "it does not work" looks
+    like on the customer's machine.
+
+    The short name is the same file, so it opens in a fraction of a second.
+    """
+    try:
+        import ctypes
+
+        buffer = ctypes.create_unicode_buffer(1024)
+        if ctypes.windll.kernel32.GetShortPathNameW(path, buffer, 1024):
+            return buffer.value or path
+    except Exception:
+        pass
+    return path
+
+
+AUTO_OPEN_TIMEOUT_SECONDS = 45.0
+
+
 def open_excel_files():
+    """Open the three workbooks in ONE Excel, and get on with the data.
+
+    Two things were wrong with the old way of doing this.
+
+    It went through the Windows shell, which starts a SEPARATE Excel for
+    every workbook it is given. Three workbooks meant three Excel processes,
+    two of them quit, and the one that survived was never registered where
+    the tool can reach it. The tool then said "Excel is not running" while
+    Excel was sitting right there, and wrote nothing.
+
+    And it opened them through that same shell, so a package under a long
+    path never opened at all. Excel's Workbooks.Open gives up somewhere past
+    128 characters and never returns.
+
+    So: one Excel, opened through the API the tool writes with, using the
+    8.3 short name for a long path. Opening Excel can take a while on a
+    cold or busy machine, and the chain does not need Excel to be up first,
+    so the open runs on its own thread and the render loop picks the
+    workbooks up as soon as they are there.
+
+    The open pass is guarded now. Workbooks.Open aimed at an Excel this
+    process does not own - the Delta tool's instance, or one whose
+    controlling process died earlier - can block forever, because a busy
+    Excel answers automation by simply not answering. A dead-quiet daemon
+    thread and a blank sheet was the exact customer symptom, so a watchdog
+    times the pass out, logs it, and retries the missing workbooks in a
+    fresh Excel instance of our own.
+    """
     if platform.system() != "Windows":
         return
-    import xlwings as xw
-    for role in ROLE_ORDER:
-        path = excel_path(role)
+    finished = threading.Event()
+    threading.Thread(target=_open_excel_files, args=(finished, False), daemon=True).start()
+
+    def _watchdog():
+        if finished.wait(AUTO_OPEN_TIMEOUT_SECONDS):
+            return
+        feed_log(
+            "excel_auto_open_timeout",
+            note=(f"chain workbooks still not open after {int(AUTO_OPEN_TIMEOUT_SECONDS)}s; "
+                  "retrying once in a separate Excel instance"),
+        )
+        retry_done = threading.Event()
+        threading.Thread(target=_open_excel_files, args=(retry_done, True), daemon=True).start()
+
+        def _retry_watchdog():
+            if not retry_done.wait(AUTO_OPEN_TIMEOUT_SECONDS):
+                feed_log(
+                    "excel_auto_open_retry_timeout",
+                    note="the retry Excel instance also did not finish; waiting for the customer to open the workbooks",
+                )
+        threading.Thread(target=_retry_watchdog, daemon=True).start()
+
+    threading.Thread(target=_watchdog, daemon=True).start()
+
+
+def _open_excel_files(finished=None, own_instance=False):
+    try:
+        import pythoncom
+
+        pythoncom.CoInitialize()
+    except Exception:
+        pythoncom = None
+    app = None
+    started_excel = False
+    try:
+        import xlwings as xw
+
         try:
-            os.remove(path + ":Zone.Identifier")
-        except OSError:
-            pass
-        # If the workbook is already open in Excel, don't open it again.
-        # Opening a second copy with the same name throws "same name" errors,
-        # and openpyxl cannot load a file Excel has locked anyway.
-        try:
-            import main as _main
-            book = _main.find_open_book(xw, path)
-            if book is not None:
-                # Already open - the customer opened it themselves, so the
-                # tool must never open it again behind their back.
-                _auto_open_done[role] = True
-                continue
+            apps = list(xw.apps)
         except Exception:
-            pass
-        # Workbook not open — ensure the file exists, then open it.
+            apps = []
         try:
-            ensure_excel_file(role)
+            if own_instance:
+                # The first pass may still be wedged inside Workbooks.Open on
+                # some busy or orphaned Excel; the retry always creates a
+                # fresh instance of our own so the books land somewhere we
+                # can definitely reach.
+                started_excel = True
+                app = xw.App(visible=True)
+            else:
+                started_excel = not apps
+                app = apps[0] if apps else xw.App(visible=True)
         except Exception as e:
-            print(f"ensure_excel_file failed ({role}): {e}", flush=True)
-        try:
-            os.startfile(path)
-            # We have now opened it. If the customer closes it later, it stays
-            # closed.
-            _auto_open_done[role] = True
-        except OSError as e:
-            show_error(f"Could not open {ROLE_FILES[role]}:\n{e}")
+            print(f"Could not start Excel: {e}", flush=True)
+            if finished is not None:
+                finished.set()
+            return
+        feed_log("excel_auto_open_started", apps=len(apps), own_instance=own_instance)
+        for role in ROLE_ORDER:
+            path = excel_path(role)
             try:
-                append_app_exception(f"opening {role} workbook", e)
-            except OSError as log_error:
-                print(f"Could not log workbook open failure ({role}): {log_error}", flush=True)
+                ensure_excel_file(role)
+            except Exception as e:
+                print(f"ensure_excel_file failed ({role}): {e}", flush=True)
+            try:
+                # Lazy import: us_excel imports this module, so importing it
+                # at the top would be a circle.
+                from us_excel import find_open_book
+
+                if find_open_book(xw, path) is not None:
+                    # Already open - the customer opened it themselves, so the
+                    # tool must never open it again behind their back.
+                    _auto_open_done[role] = True
+                    feed_log("excel_auto_open_done", role=role, via="already_open")
+                    continue
+            except Exception:
+                pass
+            target = path if len(path) <= 120 else short_path(path)
+            try:
+                app.api.Workbooks.Open(target)
+                _auto_open_done[role] = True
+                feed_log("excel_auto_open_done", role=role, via="api")
+            except Exception as e:
+                print(f"Could not open {ROLE_FILES[role]}: {e}", flush=True)
+                feed_log("excel_auto_open_failed", role=role, error=str(e))
+                show_error(
+                    f"Could not open {ROLE_FILES[role]}:\n\n{e}\n\n"
+                    "If the package was unzipped into a long path, move it "
+                    "to a short one - C:\\OptionChain - and run the tool again."
+                )
+        if finished is not None:
+            finished.set()
+    except Exception as e:
+        print(f"Could not open the workbooks: {type(e).__name__}: {e}", flush=True)
+        if finished is not None:
+            finished.set()
+    finally:
+        if started_excel:
+            _close_empty_book1(app)
+        if pythoncom is not None:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+
+
+def _close_empty_book1(app):
+    """Close the empty Book1 Excel always starts with.
+
+    Only when this process started Excel, and only when the book is empty:
+    a customer who has their own Book1 open with work in it must never have
+    it closed underneath them.
+    """
+    try:
+        for book in list(app.books):
+            if book.name.strip().lower() != "book1":
+                continue
+            try:
+                if book.sheets[0].range("A1").value is None:
+                    book.close()
+            except Exception:
+                continue
+    except Exception:
+        pass

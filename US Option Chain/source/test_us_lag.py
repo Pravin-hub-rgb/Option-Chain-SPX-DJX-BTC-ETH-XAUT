@@ -365,11 +365,21 @@ class TitleBarThrottleTests(unittest.TestCase):
 class PerCycleWriteGatingTests(unittest.TestCase):
     """Nothing may dirty cells on every refresh unless it has to."""
 
-    def test_oi_number_format_is_gated(self):
+    def test_oi_columns_are_never_text_again(self):
+        """OI must stay numeric: the old write path re-armed "@" (text format)
+        on the OI columns whenever a block grew a row, fighting the numeric
+        format force_usd_block_formats applies and putting text into the
+        customer's XLOOKUP formulas. The "@" on the date cells D3/O3/Z3 is a
+        separate, deliberate format (dates are text) and must stay."""
         import inspect
         import us_excel
         src = inspect.getsource(us_excel._write_to_excel)
-        self.assertIn("_oi_fmt_done", src)
+        self.assertNotIn(
+            "sheet.range((5, c0 + off), (4 + n_rows, c0 + off)).api.NumberFormat",
+            src,
+        )
+        self.assertNotIn("_oi_fmt_done", src)
+        self.assertIn("force_usd_block_formats", src)
 
     def test_user_date_format_is_gated(self):
         import inspect
@@ -448,7 +458,7 @@ class AutoOpenLatchTests(unittest.TestCase):
     def test_startup_open_sets_the_latch(self):
         import inspect
         import us_workbook
-        src = inspect.getsource(us_workbook.open_excel_files)
+        src = inspect.getsource(us_workbook._open_excel_files)
         self.assertIn("_auto_open_done[role] = True", src)
 
     def test_only_two_places_launch_excel(self):
@@ -464,11 +474,36 @@ class AutoOpenLatchTests(unittest.TestCase):
             2,
         )
 
-    def test_latch_is_rearmed_only_when_the_file_is_gone(self):
+    def test_latch_rearm_paths_exist(self):
         import inspect
         src = inspect.getsource(self.main._write_to_excel)
+        # The file-gone rearm (template recreated) stays.
         self.assertIn("if not os.path.exists(path):", src)
         self.assertIn("_auto_open_done[role] = False", src)
+        # And there is a time-based rearm, once per role, long after the
+        # first reopen attempt was spent.
+        self.assertIn("us_state._auto_open_rearm_used", src)
+        self.assertIn("_AUTO_OPEN_REARM_SECONDS", src)
+        self.assertIn("excel_auto_open_rearmed", src)
+
+    def test_startup_open_has_watchdog_and_fresh_instance_retry(self):
+        import inspect
+        import us_workbook
+        src = inspect.getsource(us_workbook.open_excel_files)
+        self.assertIn("finished.wait(AUTO_OPEN_TIMEOUT_SECONDS)", src)
+        self.assertIn("excel_auto_open_timeout", src)
+        self.assertIn("args=(retry_done, True)", src)
+        opener = inspect.getsource(us_workbook._open_excel_files)
+        self.assertIn("excel_auto_open_started", opener)
+        self.assertIn("excel_auto_open_failed", opener)
+        self.assertIn("finished.set()", opener)
+
+    def test_exact_book_match_normalizes_short_form_paths(self):
+        import inspect
+        import excel_helpers
+        src = inspect.getsource(excel_helpers.find_book_and_app_in_apps)
+        self.assertIn("long_form(os.path.abspath(filename))", src)
+        self.assertIn("long_form(os.path.abspath(book.fullname))", src)
 
 
 class SheetStructureGuardTests(unittest.TestCase):
@@ -621,7 +656,9 @@ class BlockWriteSafetyTests(unittest.TestCase):
         self.assertNotIn("sheet.range((5, 1), (4 + max_rows, width))", src)
         self.assertNotIn("excel_blocks_batched", src)
         # Each block is written on its own.
-        self.assertIn("for bi, block, chain, n_rows, runs, prev in pending:", src)
+        self.assertIn(
+            "for bi, block, row_block, n_rows, runs, prev in pending:", src
+        )
         self.assertIn("block[\"start\"]", src)
 
     def test_a_failed_block_write_does_not_stop_the_others(self):
@@ -1160,5 +1197,501 @@ class FlapCounterTests(unittest.TestCase):
         self.assertIn("calc_mode_flap_summary", src)
 
 
+
+
+class CalcModeCoexistenceStartupTests(unittest.TestCase):
+    """Startup race: second tool must skip calc switch when sibling holds guard."""
+
+    def test_other_holder_alive_check_in_bulk_mode(self):
+        import inspect
+        import us_excel
+        src = inspect.getsource(us_excel._begin_excel_bulk_mode)
+        self.assertIn("other_holder_alive", src)
+
+    def test_skips_switch_when_sibling_holds_guard(self):
+        from unittest.mock import patch, MagicMock
+        import us_excel
+        import us_state
+        app = MagicMock()
+        app.api.Calculation = -4105  # automatic
+        us_state._calc_session["failed"] = False
+        us_state._app_cache = app
+        with patch.object(us_excel.calc_mode_guard, 'other_holder_alive', return_value=True):
+            with patch.object(us_excel.calc_mode_guard, 'acquire') as mock_acquire:
+                restore = us_excel._begin_excel_bulk_mode(app)
+                self.assertIsNotNone(restore)
+                self.assertFalse(mock_acquire.called,
+                                 'acquire should not be called when sibling holds guard')
+
+
+class ChainExtentStabilityTests(unittest.TestCase):
+    """The customer's strategy formulas carry literal ranges.
+
+    The complaint: their own sheets (VLOOKUP/XLOOKUP against the chain
+    columns) showed values that were wrong and lagging. Root cause one: a
+    chain whose live row count changes with every expiry walks rows out from
+    under those literal ranges, so one leg of the lookup silently becomes the
+    if_not_found default. The write path therefore pads every block to a
+    fixed extent; root cause two (the 0.1s default refresh starving Excel)
+    and root cause three (the OI text-format re-arm fighting the numeric
+    format) are fixed alongside.
+    """
+
+    def test_blocks_write_a_fixed_extent(self):
+        import inspect
+        import us_excel
+        src = inspect.getsource(us_excel._write_to_excel)
+        self.assertIn("ROW_EXTENT_DEFAULT", src)
+        self.assertIn("chain_extent_changed", src)
+        self.assertIn("n_rows = extent", src)
+
+    def test_flush_writes_padded_rows_not_the_dataframe(self):
+        import inspect
+        import us_excel
+        src = inspect.getsource(us_excel._flush_block_writes)
+        # The padded rows are the payload; a raw DataFrame write would push
+        # an unfixed row count at the customer's ranges again.
+        self.assertNotIn("chain.iloc", src)
+        self.assertIn("row_block", src)
+
+    def test_write_path_pads_before_diffing(self):
+        import inspect
+        import us_excel
+        src = inspect.getsource(us_excel._write_to_excel)
+        self.assertIn("pad_block_rows(values, extent)", src)
+        self.assertIn(
+            "pending_writes.append((bi, block, values, n_rows, runs, prev))", src
+        )
+
+    def test_pad_block_rows_pads_with_blank_rows(self):
+        import us_excel
+        self.assertEqual(
+            us_excel.pad_block_rows([[1, 2], [3, 4]], 4),
+            [[1, 2], [3, 4], [None, None], [None, None]],
+        )
+        self.assertEqual(
+            us_excel.pad_block_rows([], 2), [[None] * 9, [None] * 9]
+        )
+        self.assertEqual(us_excel.pad_block_rows([[1, 2]], 1), [[1, 2]])
+
+    def test_deep_clear_sweeps_legacy_junk_once_per_block(self):
+        import inspect
+        import us_excel
+        src = inspect.getsource(us_excel._deep_clear_below_block)
+        self.assertIn("_deep_swept", src)
+        self.assertIn("chain_deep_clear", src)
+
+    def test_extent_is_not_shrunk_after_growing(self):
+        """A stuck-at-max keeps every literal customer range valid forever."""
+        import inspect
+        import us_excel
+        src = inspect.getsource(us_excel._write_to_excel)
+        self.assertIn(
+            "extent = max(us_state.ROW_EXTENT_DEFAULT, seen, len(values))", src
+        )
+        # No branch ever lowers the seen extent: the only write to it comes
+        # from the grow path, which only ever records the max.
+        self.assertNotIn("_row_extent_seen[(role, bi)] = len(values)", src)
+
+
+class RefreshWidenTests(unittest.TestCase):
+    """When Excel still owes a recalc after our window the loop stretches.
+
+    The probe already logs the signal (excel_recalc_second_pass); the widen
+    turns that signal into idle time for the customer's own workbook, and
+    decays back once Excel comes out of every write window clean.
+    """
+
+    def setUp(self):
+        import us_state
+        self._saved = (
+            us_state._refresh_widen,
+            us_state._refresh_widen_hold_until,
+            us_state._calc_state_probe,
+            us_state._app_cache,
+        )
+
+    def tearDown(self):
+        import us_state
+        us_state._refresh_widen = self._saved[0]
+        us_state._refresh_widen_hold_until = self._saved[1]
+        us_state._calc_state_probe = self._saved[2]
+        us_state._app_cache = self._saved[3]
+
+    def test_second_pass_widens_refresh(self):
+        import us_excel
+        import us_state
+
+        class _App:
+            class api:
+                CalculationState = 2
+
+        us_state._refresh_widen = 1.0
+        us_state._calc_state_probe = None
+        us_state._app_cache = _App()
+        us_excel._probe_calc_state_after_restore()
+        self.assertEqual(us_state._refresh_widen, 1.5)
+        self.assertGreater(us_state._refresh_widen_hold_until, 0.0)
+
+    def test_widen_caps_at_four_and_holds_through_the_window(self):
+        import us_excel
+        import us_state
+
+        us_state._refresh_widen = 3.0
+        held_at = time.monotonic() + 10.0
+        us_state._refresh_widen_hold_until = held_at
+        us_excel._note_recalc_second_pass(time.monotonic())
+        # 3.0 * 1.5 = 4.5 caps at WIDEN_MAX.
+        self.assertEqual(us_state._refresh_widen, 4.0)
+        # The hold extends past the previous one, so the display loop cannot
+        # decay the stretch in the middle of the spell.
+        self.assertGreater(us_state._refresh_widen_hold_until, held_at)
+
+    def test_display_loop_uses_and_decays_widen(self):
+        import inspect
+        import us_excel
+        src = inspect.getsource(us_excel.display_loop)
+        self.assertIn("REFRESH * us_state._refresh_widen", src)
+        self.assertIn("refresh_widen_decayed", src)
+        self.assertIn("_refresh_widen_hold_until", src)
+
+
+class ExpiryLayoutTests(unittest.TestCase):
+    """US sheets show two expiry blocks; the third is retired once per session.
+
+    The customer's strategy sheet reads blocks 1+2 only, so block 3 was a
+    third of the per-cycle Excel write/recalc traffic for columns nobody
+    looks at. The blocks retire the delta way: cleared once per session,
+    then left alone until the next session.
+    """
+
+    def test_third_block_wipes_on_connect_not_on_first_write(self):
+        """The sweep must ride the per-cycle connect step, not the first
+        data write - a cold start takes minutes and the customer stares at
+        the old Block 3 the whole time otherwise."""
+        import inspect
+        import us_excel
+        src = inspect.getsource(us_excel._write_to_excel)
+        self.assertIn("_retire_unused_blocks(sheet, role)", src)
+        self.assertLess(
+            src.index("_retire_unused_blocks(sheet, role)"),
+            src.index("if not sheet_structure_ok(sheet, role)"),
+        )
+
+    def test_two_blocks_are_shown(self):
+        import us_workbook
+        self.assertEqual(us_workbook.BLOCKS_PER_SHEET, 2)
+        # Block 3 remains in the layout constants (start col 23) so it can
+        # be switched back on, but no active block starts past it.
+        self.assertEqual(len(us_workbook.BLOCK_COLS), 3)
+        self.assertEqual(
+            tuple(b["start"] for b in us_workbook.BLOCK_COLS[:us_workbook.BLOCKS_PER_SHEET]),
+            (1, 12),
+        )
+
+    def test_expiry_cells_match_blocks(self):
+        import us_workbook
+        self.assertEqual(us_workbook.EXPIRY_CELLS, ("D3", "O3"))
+
+    def test_writer_loops_only_active_blocks(self):
+        import inspect
+        import us_excel
+        src = inspect.getsource(us_excel._write_to_excel)
+        self.assertIn("enumerate(BLOCK_COLS[:BLOCKS_PER_SHEET])", src)
+        self.assertIn("_retire_unused_blocks", src)
+        self.assertIn("EXPIRY_CELLS[bi]", src)
+
+    def test_template_writes_only_two_expiry_labels(self):
+        import inspect
+        import us_workbook
+        src = inspect.getsource(us_workbook._write_template)
+        self.assertNotIn("(edit Z3)", src)
+        self.assertIn("Expiry {si}", src)
+        self.assertIn("f\"Expiry {si}\"", src)
+
+    def test_retire_sweeps_unused_columns_once_per_session(self):
+        import us_excel
+        import us_workbook
+
+        class R:
+            def __init__(self, sheet, ref):
+                self._sheet = sheet
+                self._ref = ref
+            def clear(self):
+                self._sheet.cleared.append(self._ref)
+            def delete(self):
+                pass
+
+        class Sheet:
+            def __init__(self):
+                self.cleared = []
+            def range(self, *args):
+                return R(self, args)
+
+        sheet = Sheet()
+        saved = us_excel._retired_sheets
+        us_excel._retired_sheets = set()
+        try:
+            us_excel._retire_unused_blocks(sheet, "stock")
+            # Once per sheet object: a second call for the same sheet is a no-op.
+            us_excel._retire_unused_blocks(sheet, "stock")
+        finally:
+            us_excel._retired_sheets = saved
+        # Block 3 spans (1,23)..(2000,31) and is swept exactly once.
+        self.assertEqual(sheet.cleared, [((1, 23), (2000, 31))])
+
+
 if __name__ == "__main__":
     unittest.main()
+
+class WatchdogReconnectTests(unittest.TestCase):
+    """ensure_calculation_not_stranded should reconnect when _app_cache is None."""
+
+    def test_reconnect_in_us_watchdog(self):
+        import inspect
+        import us_excel
+        src = inspect.getsource(us_excel.ensure_calculation_not_stranded)
+        self.assertIn('bulk_app', src)
+
+class CalcShutdownSuppressionTests(unittest.TestCase):
+    """Closing the workbook must not put the calc-mode dialog on screen.
+
+    Answering Excel's save prompt refuses every COM call for a few seconds
+    while EXCEL.EXE is still alive, so checking the process cannot see it.
+    The notice is only allowed once a refusal has held for the grace period
+    WITH the chain workbooks still open, and the refusal marks are cleared
+    the moment the chains are gone - which is also when a held manual window
+    is handed back.
+    """
+
+    def setUp(self):
+        import us_state
+
+        self._saved = (
+            us_state._calc_manual_failed,
+            us_state._calc_failed_since,
+            us_state._calc_failed_at,
+            us_state._app_cache,
+            dict(us_state._calc_session),
+        )
+
+    def tearDown(self):
+        import us_state
+
+        (
+            us_state._calc_manual_failed,
+            us_state._calc_failed_since,
+            us_state._calc_failed_at,
+            us_state._app_cache,
+        ) = self._saved[:4]
+        us_state._calc_session.clear()
+        us_state._calc_session.update(self._saved[4])
+
+    def test_no_immediate_dialog_on_a_refused_switch(self):
+        import inspect
+        import us_excel
+
+        src = inspect.getsource(us_excel._begin_excel_bulk_mode)
+        self.assertNotIn("show_error", src)
+
+    def test_the_notice_waits_for_the_grace_period(self):
+        import inspect
+        import us_excel
+
+        src = inspect.getsource(us_excel.render_cycle)
+        self.assertIn("_CALC_NOTICE_GRACE_SECONDS", src)
+        self.assertIn("us_state._calc_failed_since", src)
+
+    def test_marks_are_cleared_when_the_chains_are_gone(self):
+        from unittest.mock import MagicMock
+        import us_state
+        import us_excel
+
+        us_state._calc_manual_failed = True
+        us_state._calc_failed_since = 12345.0
+        book = MagicMock()
+        book.name = "StrategyBook.xlsx"
+        app = MagicMock()
+        app.books = [book]
+        us_state._app_cache = app
+        us_excel._clear_refused_calc_if_chain_gone()
+        self.assertFalse(us_state._calc_manual_failed)
+        self.assertEqual(us_state._calc_failed_since, 0.0)
+
+    def test_marks_survive_while_the_chains_are_open(self):
+        from unittest.mock import MagicMock
+        import us_state
+        import us_excel
+
+        us_state._calc_manual_failed = True
+        us_state._calc_failed_since = 12345.0
+        book = MagicMock()
+        book.name = "spx_option_chain.xlsx"
+        app = MagicMock()
+        app.books = [book]
+        us_state._app_cache = app
+        us_excel._clear_refused_calc_if_chain_gone()
+        self.assertTrue(us_state._calc_manual_failed)
+        self.assertEqual(us_state._calc_failed_since, 12345.0)
+
+    def test_closing_the_chains_releases_a_held_manual_window(self):
+        from unittest.mock import MagicMock, patch
+        import us_state
+        import us_excel
+
+        book = MagicMock()
+        book.name = "Book1.xlsx"
+        app = MagicMock()
+        app.books = [book]
+        us_state._app_cache = app
+        us_state._calc_session.update(
+            {"owned": True, "failed": False, "mode": "automatic", "app": app}
+        )
+        with patch.object(us_excel, "_set_calc_mode") as set_mode:
+            with patch.object(us_excel.calc_mode_guard, "release") as release:
+                result = us_excel._begin_excel_bulk_mode(app)
+        self.assertIsNone(result)
+        self.assertTrue(set_mode.called)
+        self.assertTrue(release.called)
+        self.assertFalse(us_state._calc_session.get("owned"))
+
+    def test_the_chains_open_keeping_the_window(self):
+        from unittest.mock import MagicMock, patch
+        import us_state
+        import us_excel
+
+        book = MagicMock()
+        book.name = "us_stock_option_chain.xlsx"
+        app = MagicMock()
+        app.books = [book]
+        app.api.Calculation = -4105
+        us_state._app_cache = app
+        with patch.object(us_excel.calc_mode_guard, "acquire") as acquire:
+            with patch.object(us_excel.calc_mode_guard, "release") as release:
+                result = us_excel._begin_excel_bulk_mode(app)
+        self.assertIsNotNone(result)
+        self.assertFalse(release.called)
+        self.assertTrue(acquire.called)
+
+
+class ChainSavePromptAnswererTests(unittest.TestCase):
+    """The tool answers Excel's Save / Don't Save prompt over chain books.
+
+    A customer closing the workbook would otherwise leave that prompt in the
+    background: it blocks every COM call until it is answered, which is also
+    how the refused manual-calculation switches start. Nothing unsaved in a
+    chain workbook is worth keeping - every cell is rewritten next cycle -
+    so Don't Save is safe there, and only there.
+    """
+
+    def test_the_answerer_runs_off_the_render_thread(self):
+        import inspect
+        import us_excel
+
+        src = inspect.getsource(us_excel.display_loop)
+        self.assertIn("start_chain_save_prompt_watchdog()", src)
+        starter = inspect.getsource(us_excel.start_chain_save_prompt_watchdog)
+        self.assertIn("_prompt_watchdog_started", starter)
+        self.assertIn('platform.system() != "Windows"', starter)
+        self.assertIn("threading.Thread(", starter)
+        self.assertIn("daemon=True", starter)
+
+    def test_only_chain_windows_are_answered(self):
+        from unittest.mock import patch
+
+        import us_excel
+
+        fake = _FakeUser32("SPX | Option Chain None | LIVE 09:08:13 - Excel")
+        with patch.dict("sys.modules"):  # keep the live import well-behaved
+            with patch("ctypes.windll") as windll:
+                windll.user32 = fake.user32
+                self.assertTrue(
+                    us_excel._prompt_belongs_to_chain(0x1234),
+                    "a prompt over the rendered chain frame must be answered",
+                )
+
+        fake = _FakeUser32("us_stock_option_chain - Excel")
+        with patch("ctypes.windll") as windll:
+            windll.user32 = fake.user32
+            # file captions join words with underscores
+            self.assertTrue(
+                us_excel._prompt_belongs_to_chain(0x1234),
+                "the file-backed caption must be recognised too",
+            )
+
+        fake = _FakeUser32("Research Budget 2026 - Excel")
+        with patch("ctypes.windll") as windll:
+            windll.user32 = fake.user32
+            self.assertFalse(
+                us_excel._prompt_belongs_to_chain(0x1234),
+                "the customer's own workbook keeps its prompt untouched",
+            )
+
+    def test_the_modern_prompt_is_answered_without_fighting_window_shapes(self):
+        import inspect
+        import us_excel
+
+        src = inspect.getsource(us_excel._answer_save_prompt)
+        self.assertIn('FindWindowExW(hwnd, button, "Button", None)', src)
+        self.assertIn("0x00F5", src)
+        self.assertIn("_send_alt_n(hwnd)", src)
+        accel = inspect.getsource(us_excel._send_alt_n)
+        self.assertIn("SetForegroundWindow(hwnd)", accel)
+        self.assertIn("0x12", accel)
+        self.assertIn("0x4E", accel)
+
+    def test_a_stuck_prompt_is_never_hammered_forever(self):
+        import inspect
+        import us_excel
+
+        self.assertEqual(us_excel._SAVE_PROMPT_CLASSES, ("NUIDialog", "#32770"))
+        src = inspect.getsource(us_excel._chain_save_prompt_once)
+        self.assertIn("_SAVE_PROMPT_ATTEMPT_LIMIT", src)
+        self.assertIn("attempts[hwnd] = count + 1", src)
+        self.assertIn("feed_log(", src)
+        looper = inspect.getsource(us_excel._chain_save_prompt_watchdog)
+        self.assertIn("time.sleep(", looper)
+        self.assertIn("except Exception", looper)
+
+    def test_the_question_only_travels_to_chain_owned_dialogs(self):
+        import inspect
+        import us_excel
+
+        self.assertEqual(us_excel._SAVE_PROMPT_ATTEMPT_LIMIT, 8)
+        self.assertGreater(us_excel._SAVE_PROMPT_POLL_SECONDS, 0.0)
+        src = inspect.getsource(us_excel._prompt_belongs_to_chain)
+        self.assertIn("GetAncestor", src)
+        # underscore captions like us_stock_option_chain must match too
+        self.assertIn('.replace("_", " ")', src)
+        self.assertIn('"option chain" in caption', src)
+
+
+class _FakeUser32:
+    """A stand-in for user32 so _prompt_belongs_to_chain can run without a
+    real window hierarchy on the test machine.
+
+    GetAncestor(3) returns the owner handle; GetWindowTextW fills the caller's
+    buffer with the configured caption, matching the real signature closely
+    enough for the one window the function looks at.
+    """
+
+    def __init__(self, caption):
+        import ctypes as _ct
+
+        self.caption = caption
+        self._buf_type = _ct.create_unicode_buffer
+
+        class _U32:
+            GetAncestor = staticmethod(lambda hwnd, flag: 0x4321 if flag == 3 else 0)
+
+            def GetWindowTextW(self, hwnd, buf, size):  # noqa: N802
+                buf.value = caption
+                return len(caption)
+
+            def IsWindow(self, hwnd):
+                return True
+
+            def IsWindowVisible(self, hwnd):
+                return True
+
+        self.user32 = _U32()

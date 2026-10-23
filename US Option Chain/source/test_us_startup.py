@@ -156,9 +156,9 @@ class DatabentoKeyGateTests(unittest.TestCase):
             return key
 
         def validate(key):
-            return (False, "Databento rejected this key.") if key.endswith(
+            return (False, "Databento rejected this key.", True) if key.endswith(
                 "expired"
-            ) else (True, "")
+            ) else (True, "", False)
 
         calls = []
         self.assertEqual("db-new", self._gate(ensure, validate, calls))
@@ -172,7 +172,7 @@ class DatabentoKeyGateTests(unittest.TestCase):
             return "db-expired-from-env"
 
         with self.assertRaises(SystemExit):
-            self._gate(ensure, lambda key: (False, "rejected"), calls)
+            self._gate(ensure, lambda key: (False, "rejected", True), calls)
         self.assertTrue(
             any(("exit", 1) == c for c in calls),
             calls,
@@ -185,7 +185,7 @@ class DatabentoKeyGateTests(unittest.TestCase):
             return None
 
         with self.assertRaises(SystemExit):
-            self._gate(ensure, lambda key: (True, ""), calls)
+            self._gate(ensure, lambda key: (True, "", False), calls)
         self.assertTrue(any(("exit", 1) == c for c in calls))
 
     def test_first_error_message_reaches_the_dialog(self):
@@ -195,9 +195,34 @@ class DatabentoKeyGateTests(unittest.TestCase):
             return "db-k"
 
         with self.assertRaises(SystemExit):
-            self._gate(ensure, lambda key: (False, "Cannot reach Databento."), calls)
+            self._gate(ensure, lambda key: (False, "Databento rejected this key.", True), calls)
         self.assertTrue(
-            any("Cannot reach Databento" in m for m in self._errors(calls))
+            any("Databento rejected" in m for m in self._errors(calls))
+        )
+
+    def test_an_unreachable_databento_keeps_the_key(self):
+        """A key that could not be checked is not a key that was refused.
+
+        The connection dropping used to delete the customer's working key and
+        then demand a new one, so a flaky internet connection cost them a
+        trip to the Databento website.
+        """
+        calls = []
+
+        def ensure():
+            return "db-good"
+
+        with self.assertRaises(SystemExit):
+            self._gate(
+                ensure,
+                lambda key: (False, "Cannot reach Databento (ConnectTimeout).", False),
+                calls,
+            )
+        # The key must NOT have been dropped.
+        self.assertEqual([], [c for c in calls if c == "drop"])
+        self.assertTrue(any(("exit", 1) == c for c in calls), calls)
+        self.assertTrue(
+            any("kept" in m for m in self._errors(calls)), self._errors(calls)
         )
 
 

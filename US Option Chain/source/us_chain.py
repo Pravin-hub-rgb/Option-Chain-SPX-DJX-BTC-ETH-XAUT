@@ -24,14 +24,15 @@ from us_state import (
 from us_diagnostics import append_runtime_warning, build_id, feed_log
 from us_spot import (
     PARITY_SANITY_PCT, PARITY_TOLERANCE_POINTS, PARITY_TOLERANCE_PCT,
+    PARITY_DEADBAND,
     SPOT_POLL_SECONDS, SPOT_STALE_SECONDS, _databento_spot, _parity_log_at,
-    _parity_spot, _parity_spot_cache, _yahoo_spot_fetch, note_spot,
-    refresh_tencent_spot_cache, spot_source_for,
+    _parity_spot, _parity_spot_cache, _spot_divergence, _yahoo_spot_fetch,
+    note_spot, refresh_tencent_spot_cache, spot_source_for,
 )
 from us_time import eastern_now, filter_expiry_dates
 from us_workbook import (
-    base_root, clean_symbol, default_k1, excel_path, is_index_symbol,
-    is_locked_role, normalize_symbol, safe_float,
+    BLOCKS_PER_SHEET, EXPIRY_CELLS, base_root, clean_symbol, default_k1,
+    excel_path, is_index_symbol, is_locked_role, normalize_symbol, safe_float,
 )
 from excel_helpers import prefer_expiry_root
 
@@ -99,27 +100,19 @@ def _note_expiry_roots(sym, rows):
 
 
 def standard_expiries(sym, all_expiries):
-    """Rank expiries: standard contract first, then ones that actually have OI.
+    """Return expiries sorted nearest-first for the default slots.
 
-    An index like DJX lists weekly chains (DJXW only) every few days plus
-    monthly/quarterly DJX. Sorting purely by date makes the default slots show
-    the mini weekly chain, which is what users reported seeing.
+    The expiry blocks sit side by side on the sheet, so they show consecutive
+    expiries: the chain that expires next, then the one after that. That is
+    the ladder a trader actually watches — for an index like SPX the daily
+    and weekly chains are what they are trading, and the far-away monthly
+    expiry is one click away in the dropdown.
 
-    Within the standard group, prefer expiries carrying real open interest:
-    CBOE sometimes lists a standard root for a near expiry but publishes OI=0
-    for every strike, which leaves the default slot full of zeros. Those are
-    still selectable, just not in the first slots. Weekly expiries follow.
+    This used to put the standard (non-weekly) chain first, so the slots
+    showed a monthly expiry, the one after it, and the one after that. The
+    dailies are what the customer asked to see next to each other.
     """
-    base = base_root(sym)
-    roots = expiry_roots.get(base) or {}
-    std = [d for d in all_expiries if base in (roots.get(d) or ())]
-    weekly = [d for d in all_expiries if d not in set(std)]
-
-    def has_oi(exp):
-        return bool(oi_roots.get(base, {}).get(exp))
-
-    std.sort(key=lambda d: (0 if has_oi(d) else 1,))
-    return std + weekly
+    return sorted(all_expiries)
 
 
 # Configured once in main(), after the owner/customer key has been resolved.
@@ -139,8 +132,8 @@ def ensure_sym_state(sym):
     if sym not in live_data:
         live_data[sym] = {}
         spot_cmp[sym] = None
-        active_expiries[sym] = [None, None, None]
-        user_pinned[sym] = [False, False, False]
+        active_expiries[sym] = [None] * BLOCKS_PER_SHEET
+        user_pinned[sym] = [False] * BLOCKS_PER_SHEET
         all_known_expiries[sym] = []
 
 MONTHS = {"JAN": "01", "FEB": "02", "MAR": "03", "APR": "04", "MAY": "05", "JUN": "06",
@@ -162,22 +155,25 @@ def safe_float(val, default=0.0):
 
 
 def fmt_oi(val):
-    # Force USD only â€” strip any â‚¹/INR and coerce to float
-    if isinstance(val, str):
-        s = val.replace("â‚¹", "").replace("Rs", "").replace("INR", "").replace("$", "").replace(",", "").strip()
-        try:
-            val = float(s)
-        except ValueError:
-            return "$0"
+    # Return a NUMBER (float) for Excel, not a formatted string.
+    # Excel number formatting (e.g. '$#,##0') handles display; writing text
+    # like "$1.23K" means XLOOKUP returns text, and text + number = #VALUE!.
+    if val is None:
+        return 0.0
     try:
         val = float(val)
     except (TypeError, ValueError):
-        return "$0"
-    if val >= 1_000_000:
-        return f"${val / 1_000_000:.2f}M"
-    if val >= 1_000:
-        return f"${val / 1_000:.2f}K"
-    return f"${val:.0f}"
+        if isinstance(val, str):
+            s = val.replace("₹", "").replace("Rs", "").replace("INR", "").replace("$", "").replace(",", "").strip()
+            try:
+                val = float(s)
+            except ValueError:
+                return 0.0
+        else:
+            return 0.0
+    if math.isnan(val) or math.isinf(val):
+        return 0.0
+    return float(val)
 
 
 def read_symbol_cell(sheet, role, pre=None):
@@ -296,7 +292,7 @@ def fetch_symbol_payload(sym):
         errors.append(f"databento: {e}")
         feed_log("source_failed", symbol=sym, root=root, source="databento",
                  error=type(e).__name__, detail=str(e)[:180])
-        raise RuntimeError("; ".join(errors) or "no data source")
+        raise RuntimeError("; ".join(errors) or "no data source") from e
     spot_source_name, spot_age = spot_source_for(sym)
     feed_log("source_ok", symbol=sym, root=root, source="databento",
              spot=(result[0] if result else None),
@@ -321,6 +317,9 @@ async def load_symbol(sym):
     if is_index_symbol(sym) and rows:
         parity = _parity_spot(rows, spot)
         if parity and parity > 0:
+            prev = _parity_spot_cache.get(sym)
+            if prev and abs(parity - prev[0]) < PARITY_DEADBAND:
+                parity = prev[0]
             _parity_spot_cache[sym] = (parity, time.monotonic())
             ext_age = spot_source_for(sym)[1]
             external_is_stale = (
@@ -365,14 +364,16 @@ async def load_symbol(sym):
 
     if expiries:
         all_known_expiries[sym] = expiries
-    if active_expiries[sym] == [None, None, None]:
+    if active_expiries[sym] == [None] * BLOCKS_PER_SHEET:
         # Only re-pick when we actually have expiry data. If this fetch came
         # back empty the previously assigned expiries stay in place and the
         # trader keeps seeing the last good chain, flagged stale, instead of
         # watching the block blank itself out.
         dates = available_expiries(all_known_expiries[sym], sym)
         if dates:
-            active_expiries[sym] = (dates[:3] + [None, None, None])[:3]
+            active_expiries[sym] = (
+                dates[:BLOCKS_PER_SHEET] + [None] * BLOCKS_PER_SHEET
+            )[:BLOCKS_PER_SHEET]
         else:
             feed_log("expiry_none_available", symbol=sym,
                      note="no expiry list; keeping previous assignment")
@@ -405,7 +406,7 @@ def available_expiries(all_expiries, sym=None, by_date=False):
     if sym is None:
         return dates
     if by_date:
-        return sorted(dates)
+        return dates
     return standard_expiries(sym, dates)
 
 
@@ -523,6 +524,7 @@ def _refresh_stock_spot(sym):
 
 
 async def expiry_roller():
+    import us_excel as _main
     while True:
         await asyncio.sleep(EXPIRY_REFRESH)
         for sym in active_symbols():
@@ -531,11 +533,15 @@ async def expiry_roller():
                 dates = available_expiries(all_known_expiries[sym], sym)
                 if not dates:
                     continue
-                pinned = [active_expiries[sym][i] for i in range(3) if user_pinned[sym][i]]
-                desired = [d for d in dates if d not in pinned][:3]
+                pinned = [
+                    active_expiries[sym][i]
+                    for i in range(BLOCKS_PER_SHEET)
+                    if user_pinned[sym][i]
+                ]
+                desired = [d for d in dates if d not in pinned][:BLOCKS_PER_SHEET]
                 di = 0
                 changed = []
-                for i in range(3):
+                for i in range(BLOCKS_PER_SHEET):
                     if user_pinned[sym][i]:
                         continue
                     tgt = desired[di] if di < len(desired) else None
@@ -563,7 +569,7 @@ async def expiry_roller():
                                 continue
                             sheet = book.sheets[0]
                             for i, tgt in changed:
-                                cell = sheet.range(["D3", "O3", "Z3"][i])
+                                cell = sheet.range(EXPIRY_CELLS[i])
                                 try:
                                     cell.api.NumberFormat = "@"
                                 except Exception:

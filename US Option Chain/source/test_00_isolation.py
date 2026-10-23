@@ -32,6 +32,14 @@ class IsolationTests(unittest.TestCase):
             us_diagnostics.FEED_LOG_DIR,
         )
 
+    def test_us_app_exception_log_honours_the_override(self):
+        """app.log/startup diag writes used to bypass the override and leak
+        test noise (fake sheet objects) into the customer's real app.log."""
+        import us_diagnostics
+        self.assertEqual(_LOG_ROOT, us_diagnostics._log_directory())
+        us_diagnostics.append_runtime_warning("isolation probe", detail="test")
+        self.assertTrue(os.path.exists(os.path.join(_LOG_ROOT, "startup_diag.log")))
+
 
 if __name__ == "__main__":
     unittest.main()

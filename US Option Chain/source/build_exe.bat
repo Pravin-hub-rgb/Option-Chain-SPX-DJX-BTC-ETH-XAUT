@@ -49,7 +49,38 @@ del /s /q "dist\%PRODUCT_EXE%\*.pxd" >nul 2>&1
 echo Trimmed dev-only payload.
 
 set "PKG=..\client package"
-if not exist "%PKG%" mkdir "%PKG%"
+
+rem BASE_DIR resolves to the client package whenever optionchain.product is
+rem present there, which made the template step below write into the package
+rem and the source-dir label check fail with FileNotFoundError on every build
+rem after the first. Clear the marker so the generation resolves to this
+rem source folder; the marker is stamped into dist below and robocopy restores
+rem it into the package.
+if exist "%PKG%\optionchain.product" del /q "%PKG%\optionchain.product"
+
+rem Excel templates (generated before robocopy so BASE_DIR resolves to source/,
+rem not client package/). also auto-created at runtime, but ship pre-built.
+rem
+rem Delete them first. ensure_excel_file only rewrites the labels it owns, and
+rem it cannot save a file Excel has open, so a template that went bad in a
+rem previous session survived every build and shipped broken. A fresh file
+rem has no such history.
+if exist "spx_option_chain.xlsx" del /q "spx_option_chain.xlsx"
+if exist "djx_option_chain.xlsx" del /q "djx_option_chain.xlsx"
+if exist "us_stock_option_chain.xlsx" del /q "us_stock_option_chain.xlsx"
+if exist "spx_option_chain_new.xlsx" del /q "spx_option_chain_new.xlsx"
+if exist "djx_option_chain_new.xlsx" del /q "djx_option_chain_new.xlsx"
+if exist "us_stock_option_chain_new.xlsx" del /q "us_stock_option_chain_new.xlsx"
+python -c "import us_workbook; us_workbook.ensure_excel_file('spx'); us_workbook.ensure_excel_file('djx'); us_workbook.ensure_excel_file('stock')"
+rem And check what came out. A template with a mangled label in it is worse
+rem than no template at all, because the customer sees it in the header.
+python -c "import openpyxl,sys; want='\u00b1 strikes \u2014 edit A2'; bad=[]; [bad.append(f) for f in ('spx_option_chain.xlsx','djx_option_chain.xlsx','us_stock_option_chain.xlsx') if openpyxl.load_workbook(f).active.cell(row=2,column=2).value != want]; sys.exit('Template labels are wrong: '+','.join(bad)) if bad else None"
+if errorlevel 1 (
+  echo TEMPLATE LABEL CHECK FAILED - not shipping a package with a mangled header
+  exit /b 1
+)
+
+mkdir "%PKG%" >nul 2>&1
 
 > "dist\%PRODUCT_EXE%\optionchain.product" echo us
 
@@ -73,23 +104,29 @@ rem /MIR makes the package an exact mirror, so files removed from the build
 rem (trimmed headers, stale modules) do not linger in the delivered folder.
 rem It must run BEFORE the templates are copied, because /MIR deletes anything
 rem in the target that is not in the source.
-robocopy "dist\%PRODUCT_EXE%" "%PKG%" /MIR /NFL /NDL /NJH /NJS /NP >nul
+rem /R:1 /W:1 keeps a file locked by an open workbook from stalling the build
+rem for minutes on Excel's default 30x30-second retry loop.
+robocopy "dist\%PRODUCT_EXE%" "%PKG%" /MIR /R:1 /W:1 /NFL /NDL /NJH /NJS /NP >nul
 if errorlevel 8 (
   echo COPY ONEDIR PACKAGE FAILED
   exit /b 1
 )
 
-rem Excel templates (also auto-created at runtime, but ship pre-built)
-python -c "import us_workbook; us_workbook.ensure_excel_file('spx'); us_workbook.ensure_excel_file('djx'); us_workbook.ensure_excel_file('stock')"
 if exist "spx_option_chain.xlsx" copy /y "spx_option_chain.xlsx" "%PKG%\" >nul
 if exist "djx_option_chain.xlsx" copy /y "djx_option_chain.xlsx" "%PKG%\" >nul
 if exist "us_stock_option_chain.xlsx" copy /y "us_stock_option_chain.xlsx" "%PKG%\" >nul
 copy /y "config.json" "%PKG%\" >nul
 if exist "HOW-TO-USE.txt" copy /y "HOW-TO-USE.txt" "%PKG%\" >nul
+if exist "CHECK-INSTALL.bat" copy /y "CHECK-INSTALL.bat" "%PKG%\" >nul
 
 rem never ship an activated licence
 if exist "%PKG%\license.json" del /f /q "%PKG%\license.json"
 del /f /q "%PKG%\~$*.xlsx" >nul 2>&1
+
+rem runtime artefacts are not part of the product
+if exist "%PKG%\instance.lock" del /f /q "%PKG%\instance.lock"
+if exist "%PKG%\instance_guard.log" del /f /q "%PKG%\instance_guard.log"
+if exist "%PKG%\doctor-report.txt" del /f /q "%PKG%\doctor-report.txt"
 
 rem The product marker tells the instance guard which product a folder holds.
 rem Without it the guard has to guess from the workbook names, and a customer

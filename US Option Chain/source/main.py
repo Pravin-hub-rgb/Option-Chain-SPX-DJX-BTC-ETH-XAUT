@@ -1,7 +1,8 @@
 """
 US Stock / S&P 500 Option Chain Tool
-Primary: Databento OPRA live when an API key is configured.
-Fallback: BigClawd free brokerage chain then CBOE delayed quotes.
+Databento OPRA live. There is no fallback: if Databento cannot be reached the
+sheets stay empty and the tool says so, rather than quietly showing delayed
+prices as if they were live.
 Three Excel files auto-open (Delta-style):
   spx_option_chain.xlsx       -> locked to SPX (S&P500 index)
   djx_option_chain.xlsx       -> locked to DJX (Dow index)
@@ -12,6 +13,7 @@ Shared cache by symbol; one process drives all books.
 import asyncio
 import atexit
 import os
+import sys
 import time
 
 import databento_feed
@@ -54,8 +56,9 @@ async def main_async():
             errs.append(f"{sym}: {e}")
     if errs and len(errs) >= len(active_symbols()):
         show_error(
-            "Could not reach option data sources (Databento / BigClawd / CBOE).\n\n"
-            "Check internet connection and run again.\n\n"
+            "Could not reach Databento, so no option chains can be loaded.\n\n"
+            "Check the internet connection and that your Databento API key is "
+            "still valid, then run the tool again.\n\n"
             + "\n".join(errs)
         )
         return
@@ -79,7 +82,7 @@ def _ensure_working_databento_key(
     wiped from disk and asked for again; a cancel/blank exits the app.
     """
     ensure = _ensure or databento_feed.ensure_api_key
-    validate = _validate or databento_feed.validate_api_key
+    validate = _validate or databento_feed.check_api_key
     drop = _drop or databento_feed.clear_saved_key
     error = _error or show_error
     exit_ = _exit or os._exit
@@ -112,10 +115,33 @@ def _ensure_working_databento_key(
             )
             exit_(1)
             raise SystemExit(1)
-        ok, detail = validate(key)
+        ok, detail, rejected = validate(key)
         if ok:
             feed_log("databento_key_ok", masked=databento_feed.mask_key(key))
             return key
+        if not rejected:
+            # Databento could not be reached. That is not the key's fault,
+            # and the key is perfectly good.
+            #
+            # The key used to be deleted here, so a customer whose internet
+            # dropped for a moment had their working key thrown away and had
+            # to dig out a new one. Losing a key because the wifi hiccuped is
+            # exactly the kind of thing that makes people say the tool does
+            # not work.
+            feed_log(
+                "databento_unreachable",
+                masked=databento_feed.mask_key(key),
+                detail=detail[:180],
+            )
+            error(
+                "Could not reach Databento, so the key could not be checked.\n\n"
+                f"{detail}\n\n"
+                "Your key has been kept. Check the internet connection and "
+                "run the tool again.\n\n"
+                "App will close."
+            )
+            exit_(1)
+            raise SystemExit(1)
         feed_log(
             "databento_key_rejected",
             masked=databento_feed.mask_key(key),
@@ -178,7 +204,41 @@ def _stop_databento():
 atexit.register(_stop_databento)
 
 
+def _run_doctor():
+    """Check the install and open the report for the customer.
+
+    The executable is built without a console, so the report goes to a file
+    and that file is opened. The customer sees what failed in plain English
+    and support gets one file to read.
+    """
+    from doctor import run_doctor
+
+    report_path = os.path.join(BASE_DIR, "doctor-report.txt")
+    try:
+        report, ok = run_doctor(BASE_DIR, out=report_path)
+    except Exception as e:
+        report = f"the self-test itself failed: {type(e).__name__}: {e}\n"
+        ok = False
+        try:
+            with open(report_path, "w", encoding="utf-8") as handle:
+                handle.write(report)
+        except OSError:
+            pass
+    try:
+        os.startfile(report_path)
+    except OSError:
+        pass
+    # A non-zero exit code lets a script or a test know it failed.
+    sys.exit(0 if ok else 1)
+
+
 def main():
+    # "us_option_chain.exe --doctor" checks the install and writes a report.
+    # It is the first thing to run on a machine where the tool is not
+    # behaving, and it needs no Python on the customer's machine.
+    if any(arg in ("--doctor", "--selftest", "/doctor") for arg in sys.argv[1:]):
+        _run_doctor()
+        return
     try:
         write_startup_diagnostics()
     except OSError as e:

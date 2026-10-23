@@ -153,6 +153,9 @@ SPOT_STALE_SECONDS = float(cfg.get("spot_stale_seconds", 90.0))
 # It only matters for expiries more than a few days out; on a same-day
 # option the discount is zero.
 PARITY_RATE = float(cfg.get("parity_rate", 0.045))
+PARITY_DIVIDEND_Q = float(cfg.get("parity_dividend_q", 0.014))
+PARITY_USE_N_STRIKES = int(cfg.get("parity_use_n_strikes", 5))
+PARITY_DEADBAND = float(cfg.get("parity_deadband", 0.05))
 # How far the parity spot and the external index quote may differ before it
 # is treated as a disagreement worth flagging.
 PARITY_TOLERANCE_POINTS = float(cfg.get("parity_tolerance_points", 3.0))
@@ -357,15 +360,20 @@ def _years_to_expiry(expiry_iso):
 def _parity_spot(rows, spot_hint):
     """Index spot from put-call parity on our own live chain.
 
-    Put-call parity gives  C - P = S - K*e^(-rT),  so
+    Put-call parity gives  C - P = S*exp(-qT) - K*exp(-rT),  so
 
-        S = K*e^(-rT) + (call mid - put mid)
+        F = K + exp(rT) * (C - P)          (forward price)
+        S = F * exp(-(r - q) * T)          (spot, discounted at net repo rate)
 
     The quotes used here are the ones the sheet is already showing, so the
     answer is real time, needs no extra subscription, and can never disagree
     with the chain on screen. It is the fallback and the cross-check for the
     external index quote, which is a free endpoint that can go stale, rate
     limit or simply disappear.
+
+    To reduce noise from a single bad quote, parity is computed for the N
+    strikes nearest the current estimate, and the median is taken. Crossed
+    and wide-spread quotes are rejected.
     """
     if not rows:
         return None
@@ -390,13 +398,10 @@ def _parity_spot(rows, spot_hint):
     common = set(calls) & set(puts)
     if not common:
         return None
-    if spot_hint:
-        strike = min(common, key=lambda s: abs(s - spot_hint))
-    else:
-        strike = max(
-            common,
-            key=lambda s: (calls[s].get("oi") or 0) + (puts[s].get("oi") or 0),
-        )
+
+    T = _years_to_expiry(expiry)
+    forward_discount = math.exp(-(PARITY_RATE - PARITY_DIVIDEND_Q) * T)
+    call_put_adj = math.exp(PARITY_DIVIDEND_Q * T)
 
     def mid(row):
         bid = row.get("bid") or 0.0
@@ -421,16 +426,31 @@ def _parity_spot(rows, spot_hint):
             return False
         return (ask - bid) <= max(PARITY_MAX_SPREAD, mid_price * PARITY_MAX_SPREAD_PCT)
 
-    call_row = calls[strike]
-    put_row = puts[strike]
-    if not spread_ok(call_row) or not spread_ok(put_row):
+    def parity_for_strike(strike):
+        call_row = calls[strike]
+        put_row = puts[strike]
+        if not spread_ok(call_row) or not spread_ok(put_row):
+            return None
+        call_mid = mid(call_row)
+        put_mid = mid(put_row)
+        if call_mid <= 0 or put_mid <= 0:
+            return None
+        return strike * forward_discount + (call_mid - put_mid) * call_put_adj
+
+    # Pick the N strikes nearest the current estimate (or the hint).
+    hint = spot_hint if spot_hint else 0.0
+    ranked = sorted(common, key=lambda s: abs(s - hint))
+    take = ranked[:PARITY_USE_N_STRIKES]
+
+    estimates = [p for s in take if (p := parity_for_strike(s)) is not None]
+    if not estimates:
         return None
-    call_mid = mid(call_row)
-    put_mid = mid(put_row)
-    if call_mid <= 0 or put_mid <= 0:
-        return None
-    discounted = strike * math.exp(-PARITY_RATE * _years_to_expiry(expiry))
-    return discounted + (call_mid - put_mid)
+
+    estimates.sort()
+    n = len(estimates)
+    if n % 2 == 1:
+        return estimates[n // 2]
+    return (estimates[n // 2 - 1] + estimates[n // 2]) / 2.0
 
 
 def _fresher_spot(sym, cboe_or_chain_spot):

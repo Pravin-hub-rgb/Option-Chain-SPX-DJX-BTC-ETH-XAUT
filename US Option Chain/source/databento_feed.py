@@ -163,11 +163,20 @@ def mask_key(key: str | None) -> str:
     return f"{key[:4]}...{key[-4:]}"
 
 
-def validate_api_key(key: str) -> tuple[bool, str]:
-    """Cheap authenticated metadata check. Never logs the key.
+def check_api_key(key: str) -> tuple[bool, str, bool]:
+    """(accepted, detail, rejected)
+
+    rejected is True only when Databento itself said no - HTTP 401 or 403.
+    It is False when Databento could not be reached at all, or answered with
+    something that is not a verdict on the key.
+
+    The distinction matters. A key that was refused is useless and has to be
+    replaced. A key that could not be checked because the connection dropped
+    is perfectly good, and throwing it away means a customer with a flaky
+    internet connection has to dig out a new key for no reason at all.
 
     Uses the raw HTTP endpoint rather than the SDK client so the request has a
-    hard timeout — the SDK's Historical client does not accept one and its
+    hard timeout - the SDK's Historical client does not accept one and its
     default wait is 100s, which would leave the first-run dialog hanging.
 
     The first request to Databento is often slow: cold DNS, the TLS handshake
@@ -178,7 +187,7 @@ def validate_api_key(key: str) -> tuple[bool, str]:
     try:
         import requests
     except ImportError:
-        return False, "requests library is not available."
+        return False, "requests library is not available.", False
     url = "https://hist.databento.com/v0/metadata.get_dataset_condition"
     for attempt in range(2):
         try:
@@ -195,13 +204,19 @@ def validate_api_key(key: str) -> tuple[bool, str]:
             return False, (
                 f"Cannot reach Databento ({type(exc).__name__}). "
                 "Check the internet connection and try again."
-            )
+            ), False
         if resp.status_code == 200:
-            return True, ""
+            return True, "", False
         if resp.status_code in (401, 403):
-            return False, "Databento rejected this key. Paste a valid live key."
-        return False, f"Databento returned HTTP {resp.status_code}. Try again."
-    return False, "Cannot reach Databento. Check the internet connection and try again."
+            return False, "Databento rejected this key. Paste a valid live key.", True
+        return False, f"Databento returned HTTP {resp.status_code}. Try again.", False
+    return False, "Cannot reach Databento. Check the internet connection and try again.", False
+
+
+def validate_api_key(key: str) -> tuple[bool, str]:
+    """Kept for callers that only want the verdict."""
+    accepted, detail, _rejected = check_api_key(key)
+    return accepted, detail
 
 
 def ask_api_key() -> str | None:
@@ -567,6 +582,30 @@ def _expiry_iso(value) -> str | None:
         return None
 
 
+def _is_auth_failure(exc: Exception) -> bool:
+    """True when the failure is the key being rejected, not a transient fault.
+
+    Databento's SDK raises BentoHttpError with the status attached; a raw
+    request raises requests.HTTPError with the response attached. Both carry
+    401 when the key is wrong and 403 when the key is valid but not entitled
+    to the data. Neither gets better by being tried again.
+    """
+    status = getattr(exc, "http_status", None)
+    if isinstance(status, int) and status in (401, 403):
+        return True
+    response = getattr(exc, "response", None)
+    if response is not None:
+        code = getattr(response, "status_code", None)
+        if isinstance(code, int) and code in (401, 403):
+            return True
+    text = str(exc).lower()
+    return (
+        "authentication" in text
+        or "unauthorized" in text
+        or "api key" in text
+    )
+
+
 class DatabentoFeed:
     def __init__(self, key: str, band: int = DEFAULT_BAND, event_log=None):
         self.key = key
@@ -579,6 +618,10 @@ class DatabentoFeed:
         self._quotes: dict[str, dict] = {}
         self._id_map: dict[int, str] = {}
         self._errors: list[str] = []
+        # Set when the key itself was rejected. A rejected key does not fix
+        # itself, so the historical feed is latched off instead of being
+        # retried every few seconds for as long as the app is open.
+        self._auth_error: str | None = None
         self._loading: set[str] = set()
         self._universe_failures: dict[str, int] = {}
         self._universe_retry_at: dict[str, float] = {}
@@ -626,6 +669,36 @@ class DatabentoFeed:
             self._errors.append(self._redact(message)[:300])
             self._errors = self._errors[-5:]
 
+    def auth_error(self) -> str | None:
+        """The reason the key was rejected, or None when it was accepted."""
+        with self._lock:
+            # Read defensively: this is called from the render path, and a
+            # missing attribute must not be able to take the render pass down.
+            return getattr(self, "_auth_error", None)
+
+    def _set_auth_error(self, symbol: str, exc: Exception) -> None:
+        """Latch the feed off: the key was rejected, so stop asking.
+
+        This is written once. The old code treated a 401 like a hiccup and
+        retried it three times per chunk, for every parent, for every symbol,
+        and then started the whole thing again with a five-to-one-hundred-and-
+        twenty-second backoff. Seventeen minutes of the log was nothing but
+        401s, and the customer saw a blank sheet with no explanation.
+        """
+        detail = self._redact(str(exc))[:200]
+        with self._lock:
+            if self._auth_error is not None:
+                return
+            self._auth_error = detail or "the key was rejected"
+        self._log(
+            "databento_auth_failed",
+            symbol=symbol,
+            error=type(exc).__name__,
+            detail=detail,
+            note="the historical feed is now off until the key changes",
+        )
+        self._record_error(f"Databento rejected the key: {detail}")
+
     def errors(self) -> list[str]:
         with self._lock:
             return list(self._errors)
@@ -667,6 +740,14 @@ class DatabentoFeed:
         return self.last_record_age() <= STALE_SECONDS
 
     def status_text(self) -> str:
+        try:
+            rejected = self.auth_error()
+        except Exception:
+            rejected = None
+        if rejected:
+            # The key was rejected. Say so, plainly, instead of leaving the
+            # customer to stare at a sheet that says LOADING forever.
+            return "DATABENTO KEY REJECTED"
         if not self.is_started():
             if self._defs:
                 return "DATABENTO CONNECTING"
@@ -737,6 +818,10 @@ class DatabentoFeed:
         with self._lock:
             if self._defs.get(symbol):
                 return True
+            if self._auth_error:
+                # The key was rejected. Do not ask again: there is nothing to
+                # wait for and nothing to retry.
+                return False
             if self._universe_retry_at.get(symbol, 0.0) > time.monotonic():
                 return False
             if symbol in self._loading:
@@ -821,6 +906,9 @@ class DatabentoFeed:
         try:
             history = db.Historical(self.key)
         except Exception as exc:
+            if _is_auth_failure(exc):
+                self._set_auth_error(symbol, exc)
+                return []
             self._record_error(f"Databento init: {type(exc).__name__}: {exc}")
             return []
 
@@ -865,6 +953,10 @@ class DatabentoFeed:
                         return store.to_df(map_symbols=True)
                     except Exception as exc:
                         last = exc
+                        if _is_auth_failure(exc):
+                            # A rejected key will still be rejected in three
+                            # seconds. Stop the retries here.
+                            raise
                         if attempt < 2:
                             time.sleep(1.5 * (attempt + 1))
                 raise last
@@ -888,6 +980,11 @@ class DatabentoFeed:
                 try:
                     frame = future.result()
                 except Exception as exc:
+                    if _is_auth_failure(exc):
+                        # The key was rejected. Latch the feed off instead of
+                        # logging the same failure once per parent.
+                        self._set_auth_error(symbol, exc)
+                        return []
                     self._log(
                         "databento_definition_failed",
                         symbol=symbol,

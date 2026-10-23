@@ -13,10 +13,14 @@ _MAX_LOG_BYTES = 1024 * 1024
 
 
 def _log_directory():
-    root = os.environ.get("LOCALAPPDATA")
-    if not root:
-        raise OSError("LOCALAPPDATA is not set")
-    directory = os.path.join(root, "USOptionChain")
+    override = os.environ.get("US_OPTION_CHAIN_LOG_DIR")
+    if override:
+        directory = override
+    else:
+        root = os.environ.get("LOCALAPPDATA")
+        if not root:
+            raise OSError("LOCALAPPDATA is not set")
+        directory = os.path.join(root, "USOptionChain")
     os.makedirs(directory, exist_ok=True)
     return directory
 
@@ -299,9 +303,10 @@ def append_app_exception(context, exc):
 # ---------------------------------------------------------------------------
 # Feed observability for the US tool.
 #
-# The failure this exists to prevent: BigClawd 503s on index chains, the tool
-# quietly falls back to CBOE, and the trader spends the session looking at
-# 15-minute-old prices believing they are live. Nothing said so.
+# The failure this exists to prevent: the tool used to fall back to a delayed
+# feed without saying so, and the trader spent the session looking at
+# 15-minute-old prices believing they were live. Nothing said so. The fallback
+# is gone; the rule that came out of it is not.
 # ---------------------------------------------------------------------------
 # The log directory honours US_OPTION_CHAIN_LOG_DIR so tests and support
 # runs never write into the real customer logs.

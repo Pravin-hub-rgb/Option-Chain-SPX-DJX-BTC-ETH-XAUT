@@ -20,7 +20,8 @@ from us_state import (
     MANUAL_WATCHDOG_SECONDS, POLL_GAP, PRODUCT_ID, REFRESH,
     ROLE_FILES, ROLE_ORDER, _CALC_IDS, _FIRST_SIGHT_BOUND,
     _SCREEN_BACKOFF_SECONDS, _SCREEN_FAILURE_LIMIT, _UNPROTECTED_WRITE_INTERVAL,
-    _auto_open_done, _book_sheet_cache, _calc_manual_failed, _calc_session,
+    _auto_open_done, _book_sheet_cache, _calc_failed_at, _calc_manual_failed,
+    _calc_notice_shown, _calc_session,
     _dropdown_sig, _excel_connection_status, _last_excel_exception,
     _last_rows, _net_drawn, _pending_date_loads, _performance_metrics,
     _sheet_altered, _sheet_cache, active_expiries, all_known_expiries,
@@ -34,8 +35,8 @@ from us_chain import (
 )
 from us_spot import source_delay_note, spot_source_for
 from us_workbook import (
-    BLOCK_COLS, default_k1, ensure_excel_file, excel_path, get_column_letter,
-    is_locked_role,
+    BLOCKS_PER_SHEET, BLOCK_COLS, EXPIRY_CELLS, default_k1, ensure_excel_file,
+    excel_path, get_column_letter, is_locked_role,
 )
 from excel_helpers import (
     find_book_and_app_in_apps, find_book_by_name_in_apps, refresh_delay,
@@ -49,7 +50,7 @@ from us_licensing import ensure_license, license_is_valid, show_error
 import asyncio
 import calc_mode_guard
 def net_paint(sheet, role, bi, col_l):
-    """Tag cell (row 1, block ka last column) likho â€” sirf jab badle."""
+    """Tag cell (row 1, block ka last column) likho — sirf jab badle."""
     tag = net_badge()
     prev = _net_drawn.get((role, bi), None)
     if tag == prev:
@@ -149,6 +150,98 @@ def _contiguous_runs(indices):
     if start is not None:
         runs.append((start, prev))
     return runs
+
+
+def pad_block_rows(values, extent):
+    """Pad one block's rows with blank rows up to the fixed extent.
+
+    The customer's strategy formulas carry literal row ranges. A chain that
+    changes its live row count with every expiry would otherwise walk rows out
+    from under those ranges; blank padding keeps the block's occupied range
+    (5 .. 4+extent) constant so the same range always covers the live data.
+    """
+    if extent <= len(values):
+        return values
+    blank = [None] * (len(values[0]) if values else 9)
+    return values + [list(blank) for _ in range(extent - len(values))]
+
+
+# Blocks whose deep-clear check has already run in this session. A workbook
+# written by an older build carries stray chain rows well below the live
+# table (that build wrote as many rows as the feed delivered); the routine
+# first-sight sweep only reaches _FIRST_SIGHT_BOUND rows, so once per block
+# per run we look below the fixed extent and clear to the template depth
+# only when something is actually there.
+_deep_swept = set()
+
+
+# Sheets whose unused expiry blocks were swept in this session. One sheet
+# per workbook per run: anything older than a session ends up cleared again
+# on the next one.
+_retired_sheets = set()
+
+
+def _retire_unused_blocks(sheet, role):
+    """Wipe the expiry blocks a sheet does not show any more.
+
+    The sheet shows BLOCKS_PER_SHEET expiry blocks. Every block beyond them
+    (columns W..AE for a two-block sheet) is swept once per sheet object —
+    labels, headers and any chain data an older build left there — and its
+    expiry dropdown is removed, so the customer cannot pin an expiry into a
+    block that never renders. Re-swept if Excel restarts mid-session with a
+    fresh sheet holding old disk contents. The layout constants stay, so
+    turning a block back on later needs only BLOCKS_PER_SHEET.
+    """
+    if (role, id(sheet)) in _retired_sheets:
+        return
+    _retired_sheets.add((role, id(sheet)))
+    for block in BLOCK_COLS[BLOCKS_PER_SHEET:]:
+        c0 = block["start"]
+        try:
+            sheet.range((1, c0), (2000, c0 + 8)).clear()
+        except Exception as e:
+            log_excel_exception(role, e, "clearing unused expiry block")
+    unused = ("D3", "O3", "Z3")[BLOCKS_PER_SHEET:]
+    for cell in unused:
+        try:
+            sheet.range(cell).api.Validation.Delete()
+        except Exception as e:
+            log_excel_exception(role, e, f"clearing expired input validation {cell}")
+        try:
+            sheet.range(cell).value = None
+        except Exception as e:
+            log_excel_exception(role, e, f"clearing expired input cell {cell}")
+    feed_log("expiry_block_retired", role=role, shown=BLOCKS_PER_SHEET,
+             cleared=[block["start"] for block in BLOCK_COLS[BLOCKS_PER_SHEET:]])
+
+
+def _deep_clear_below_block(sheet, role, bi, c0, n_rows):
+    """Clear junk an older build left below the fixed extent, if any.
+
+    One read decides it; the clear only happens when the region is not
+    already empty, so the normal case costs one cheap COM read per block
+    per run.
+    """
+    if (role, bi) in _deep_swept:
+        return
+    _deep_swept.add((role, bi))
+    deep_start = 5 + n_rows
+    try:
+        deep = sheet.range((deep_start, c0), (2000, c0 + 8)).value
+    except Exception:
+        return
+    if not deep:
+        return
+    rows = deep if isinstance(deep, list) else [[deep]]
+    if not any(any(cell is not None for cell in row) for row in rows):
+        return
+    dcs = get_column_letter(c0)
+    dce = get_column_letter(c0 + 8)
+    try:
+        sheet.range(f"{dcs}{deep_start}:{dce}2000").clear()
+        feed_log("chain_deep_clear", role=role, block=bi + 1, from_row=deep_start)
+    except Exception as e:
+        log_excel_exception(role, e, f"deep clearing stale rows in block {bi + 1}")
 
 
 def show_status(book, role, status, detail=""):
@@ -261,7 +354,7 @@ def find_open_book(xw, fname):
     # (an old install, a copy they made, the source tree). Excel will not open
     # a second workbook with the same name, so opening our own copy fails and
     # leaves the tool unable to write anything. Use the copy that is already
-    # open â€” it is the same product, and it is the one on their screen.
+    # open — it is the same product, and it is the one on their screen.
     book, _app = find_book_by_name_in_apps(
         apps,
         fname,
@@ -321,7 +414,7 @@ def update_expiry_dropdowns(sym, sheet):
         sheet.range((1, helper_col), (helper_end, helper_col)).clear()
     except Exception as e:
         log_excel_exception(sym, e, "clearing expiry dropdown helper column")
-    # xlwings Sheet has no .cell() â€” write helper column as one range
+    # xlwings Sheet has no .cell() — write helper column as one range
     try:
         col_letter = get_column_letter(helper_col)
         sheet.range(f"{col_letter}1:{col_letter}{len(options)}").value = [
@@ -335,7 +428,7 @@ def update_expiry_dropdowns(sym, sheet):
     except Exception as e:
         log_excel_exception(sym, e, "hiding expiry dropdown helper column")
     formula = f"=$AH$1:$AH${len(options)}"
-    for cell in ("D3", "O3", "Z3"):
+    for cell in EXPIRY_CELLS:
         try:
             sheet.range(cell).api.Validation.Delete()
         except Exception as e:
@@ -350,10 +443,10 @@ def update_expiry_dropdowns(sym, sheet):
 
 
 def update_user_dates(sym, sheet, pre=None):
-    for i, cell in enumerate(["D3", "O3", "Z3"]):
+    for i, cell in enumerate(EXPIRY_CELLS):
         rng = sheet.range(cell)
         try:
-            # text â€” stops Excel date conversion / #####
+            # text — stops Excel date conversion / #####
             # Setting the format dirties the cell, so only do it once per
             # sheet instead of on every refresh.
             fmt_key = (id(sheet), cell)
@@ -363,7 +456,7 @@ def update_user_dates(sym, sheet, pre=None):
         except Exception:
             pass
         val = cell_value_from_pre(pre, cell) if pre is not None else rng.value
-        # Excel may have converted text into a datetime â€” force back to DD/MM/YYYY text
+        # Excel may have converted text into a datetime — force back to DD/MM/YYYY text
         if isinstance(val, datetime):
             rng.value = val.strftime("%d/%m/%Y")
             continue
@@ -377,8 +470,28 @@ def update_user_dates(sym, sheet, pre=None):
             rng.value = iso_to_user(active_expiries[sym][i])
             user_pinned[sym][i] = False
             continue
+        # A value the tool itself wrote is not a user edit.
+        #
+        # The workbook keeps whatever expiry was in the cell from the previous
+        # session. When the tool writes a new expiry there and then reads the
+        # cell back, the old value looked like the user had chosen it, and the
+        # slot was pinned to it for good. A pinned slot is never changed, so
+        # the three blocks sat on a monthly expiry and a daily expiry and a
+        # weekly one, and no amount of waiting would move them.
+        written = us_state._tool_written_dates.get((sym, i))
+        if written is not None and user_str == str(written).strip():
+            continue
+        # Only a cell that CHANGED since the tool last looked at it was edited
+        # by somebody. The first look just adopts whatever is there, so a
+        # leftover from the previous session is never mistaken for a choice.
+        seen_key = (sym, i)
+        if seen_key not in us_state._user_dates_seen:
+            us_state._user_dates_seen[seen_key] = user_str
+            continue
+        changed_by_user = us_state._user_dates_seen.get(seen_key) != user_str
+        us_state._user_dates_seen[seen_key] = user_str
         parsed = parse_user_date(user_str)
-        if parsed and parsed != active_expiries[sym][i]:
+        if parsed and parsed != active_expiries[sym][i] and changed_by_user:
             # normalize display to DD/MM/YYYY
             if not re.match(r"^\d{1,2}/\d{1,2}/\d{4}$", user_str):
                 try:
@@ -387,7 +500,7 @@ def update_user_dates(sym, sheet, pre=None):
                     pass
             _pending_date_loads.append((sym, i, parsed))
         elif parsed and re.match(r"^\d{1,2}/\d{1,2}/\d{4}$", user_str) is None:
-            # same expiry but odd format â€” normalize
+            # same expiry but odd format — normalize
             try:
                 rng.value = iso_to_user(parsed)
             except Exception:
@@ -407,7 +520,6 @@ _block_payload = {}
 _block_values = {}
 # Cells whose number format has already been set. Setting a number format
 # dirties the cell, and doing that on every refresh is wasted work.
-_oi_fmt_done = set()
 _user_fmt_done = set()
 # Last applied ITM/ATM colouring per (role, block). Used to skip repainting
 # when the picture has not changed, so a live price tick does not dirty every
@@ -450,17 +562,18 @@ def forget_workbook_formatting(path):
 
 
 # Labels written every run (cheap) so user always sees changeable hints
-# J1 is role-dependent â€” written inside write_hint_labels
+# J1 is role-dependent — written inside write_hint_labels
 HINT_LABELS = (
-    ("B2", "Â± strikes â€” edit A2"),
+    ("B2", "± strikes — edit A2"),
     ("A3", "Expiry 1"),
     ("C3", "(edit D3)"),
     ("L3", "Expiry 2"),
     ("N3", "(edit O3)"),
-    ("W3", "Expiry 3"),
-    ("Y3", "(edit Z3)"),
 )
 
+# Blocks beyond BLOCKS_PER_SHEET are retired: labels, headers and data in
+# their columns are swept once per session (see _retire_unused_blocks), so
+# only Expiry 1/2 hints exist here.
 _HINT_CLEAR = ("J2", "J3")
 
 
@@ -486,7 +599,7 @@ def write_hint_labels(sheet, role="stock"):
             sheet.range(cell).value = None
         except Exception as e:
             log_excel_exception(role, e, f"clearing owned hint cell {cell}")
-    # keep Symbol label from squishing (cheap â€” every run)
+    # keep Symbol label from squishing (cheap — every run)
     try:
         sheet.range("J:J").api.ColumnWidth = 22
     except Exception as e:
@@ -520,12 +633,10 @@ def format_sheet(sheet, role="stock"):
             widths[block["start"] + off] = 11
     widths[3] = 11    # C = (edit D3) hint
     widths[4] = 13    # D = Expiry 1 input DD/MM/YYYY
-    widths[9] = 22    # J Symbol label â€” full text
+    widths[9] = 22    # J Symbol label — full text
     widths[10] = 12   # K symbol value
     widths[14] = 11   # N = (edit O3)
     widths[15] = 13   # O Expiry 2
-    widths[25] = 11   # Y = (edit Z3)
-    widths[26] = 13   # Z Expiry 3
     widths[34] = 10   # AH helper
     try:
         for c, w in widths.items():
@@ -540,11 +651,11 @@ def format_sheet(sheet, role="stock"):
 
     try:
         # Row 1 spot / PCR
-        for block in BLOCK_COLS:
+        for block in BLOCK_COLS[:BLOCKS_PER_SHEET]:
             sheet.range((1, block["start"]), (1, block["start"] + 4)).font.bold = True
             sheet.range((1, block["start"]), (1, block["start"] + 4)).font.size = 12
         # Row 4 headers
-        for block in BLOCK_COLS:
+        for block in BLOCK_COLS[:BLOCKS_PER_SHEET]:
             hdr = sheet.range((4, block["start"]), (4, block["start"] + 8))
             hdr.font.bold = True
             hdr.font.color = (255, 255, 255)
@@ -552,11 +663,11 @@ def format_sheet(sheet, role="stock"):
         # Labels + hints
         for cell, _t in HINT_LABELS:
             sheet.range(cell).font.bold = True
-        for cell in ("B2", "A3", "L3", "W3", "C3", "N3", "Y3", "J1"):
+        for cell in ("B2", "A3", "L3", "C3", "N3", "J1"):
             sheet.range(cell).color = LABEL_FILL
         # Input cells highlighted (do NOT wipe user values)
-        # Locked files (SPX/DJX): K1 gray + forced â€” not an input
-        input_cells = ["A2", "D3", "O3", "Z3"]
+        # Locked files (SPX/DJX): K1 gray + forced — not an input
+        input_cells = ["A2", *EXPIRY_CELLS]
         if role == "stock":
             input_cells.append("K1")
         for cell in input_cells:
@@ -568,9 +679,9 @@ def format_sheet(sheet, role="stock"):
             k1.color = LABEL_FILL
             k1.font.bold = True
             k1.value = default_k1(role)
-        # Stock role: K1 is user-editable â€” never write its value here.
+        # Stock role: K1 is user-editable — never write its value here.
         # The initial value is set by _write_template when the file is created.
-        for cell in ("D3", "O3", "Z3"):
+        for cell in EXPIRY_CELLS:
             try:
                 sheet.range(cell).api.NumberFormat = "@"
             except Exception as e:
@@ -584,17 +695,17 @@ def format_sheet(sheet, role="stock"):
 
 
 def force_usd_block_formats(sheet, block, n_rows):
-    """Prices = 0.00, OI = text with $ only (kills â‚¹ number format).
+    """Prices = 0.00, Strike = 0.0, OI = numeric with $ display.
 
-    The OI columns are already written as "$123" text by build_option_chain, so
-    the only thing needed here is the text number format that stops Excel
-    coercing them back into a number.
+    All columns are written as numbers by build_option_chain (fmt_oi returns
+    float), so every column gets a numeric NumberFormat. OI uses "$#,##0" so it
+    displays as a dollar amount but stays numeric — this lets the customer
+    write XLOOKUP formulas that add OI values without hitting text+number
+    #VALUE! errors.
 
-    The previous version also walked the OI column one cell at a time to
-    convert leftovers. That was 1,206 COM round trips per block â€” about twelve
-    seconds for a 600-row block â€” and it ran again every time the row count
-    changed. It is now one bulk read and one bulk write, once per sheet, and
-    the per-cycle cost is a single range write.
+    The one-off bulk cleanup below fixes up any cells left as numbers or
+    text with ₹ markers by an older build. One read and one write for the
+    whole column, once per sheet.
     """
     if n_rows <= 0:
         return
@@ -614,13 +725,13 @@ def force_usd_block_formats(sheet, block, n_rows):
             sheet.range(f"{strike_col}5:{strike_col}{end}").api.NumberFormat = "0.0#"
             for off in (3, 5):
                 col = get_column_letter(c0 + off)
-                sheet.range(f"{col}5:{col}{end}").api.NumberFormat = "@"
+                sheet.range(f"{col}5:{col}{end}").api.NumberFormat = "$#,##0"
             _usd_fmt_done.add(fmt_key)
         except Exception as e:
             print(f"force_usd formats: {e}", flush=True)
             log_excel_exception("EXCEL", e, "formatting option-chain cells")
             return
-        # One-off bulk cleanup of values left as numbers or â‚¹ by an older
+        # One-off bulk cleanup of values left as numbers or ₹ by an older
         # build. One read and one write for the whole sheet, not per cell.
         for off in (3, 5):
             col = get_column_letter(c0 + off)
@@ -637,9 +748,24 @@ def force_usd_block_formats(sheet, block, n_rows):
                 if isinstance(v, (int, float)):
                     values[i] = fmt_oi(v)
                     changed = True
-                elif isinstance(v, str) and ("â‚¹" in v or "Rs" in v):
-                    values[i] = fmt_oi(v)
-                    changed = True
+                elif isinstance(v, str):
+                    s = v.strip()
+                    if s and (
+                        s.startswith("$")
+                        or "₹" in v
+                        or "Rs" in v
+                        or "INR" in v
+                        or "," in s
+                        or "M" in s
+                        or "K" in s
+                    # Plain numerals in a text cell ("223") are leftovers
+                    # from the old text-format pass - the OI columns hold
+                    # no words, so any string left there can be turned
+                    # into its number.
+                        or s.lstrip("+-").replace(".", "").isdigit()
+                    ):
+                        values[i] = fmt_oi(v)
+                        changed = True
             if changed:
                 try:
                     rng.value = values
@@ -696,7 +822,7 @@ def _write_to_excel(role):
         os._exit(1)
     path = ensure_excel_file(role)
     try:
-        # Cached COM book/sheet objects â€” avoids enumerating all apps + all
+        # Cached COM book/sheet objects — avoids enumerating all apps + all
         # books on every cycle, which dominated the render loop. Dropped on
         # staleness so a closed/renamed workbook recovers.
         book = _book_sheet_cache.get(role)
@@ -761,6 +887,25 @@ def _write_to_excel(role):
                         role,
                         "same_name_open_elsewhere",
                         f"expected_workbook={path}",
+                    )
+                # The one-shot reopen below can still end up nowhere - a
+                # startup Workbooks.Open wedged on a busy Excel, or a
+                # startfile handed to an instance nobody answers. The tool
+                # stays on a blank sheet forever that way. Long after the
+                # first reopen fired, allow exactly one more attempt.
+                if (
+                    _auto_open_done.get(role)
+                    and not same_name_open
+                    and not us_state._auto_open_rearm_used.get(role)
+                    and not any_book_named(xw, path)
+                    and now - _reopen_after[role] > us_state._AUTO_OPEN_REARM_SECONDS
+                ):
+                    us_state._auto_open_rearm_used[role] = True
+                    _auto_open_done[role] = False
+                    feed_log(
+                        "excel_auto_open_rearmed",
+                        role=role,
+                        note="workbook still not open long after the first reopen; retrying once",
                     )
                 if (
                     reopen_due(now, _reopen_after[role])
@@ -850,6 +995,11 @@ def _write_to_excel(role):
         if sheet is None:
             sheet = book.sheets[0]
             _sheet_cache[role] = sheet
+
+        # Retire the third expiry block the moment the sheet is reachable —
+        # not only at the first data write — so the customer never stares at
+        # the previous session's Block 3 through the cold-start window.
+        _retire_unused_blocks(sheet, role)
 
         # The tool writes to fixed columns. If the customer has inserted or
         # deleted a column, those positions no longer line up and the tool
@@ -953,13 +1103,36 @@ def _write_to_excel(role):
         # Blocks of this sheet whose data changed and still has to be written.
         pending_writes = []
 
-        for bi, block in enumerate(BLOCK_COLS):
+        _retire_unused_blocks(sheet, role)
+
+        for bi, block in enumerate(BLOCK_COLS[:BLOCKS_PER_SHEET]):
             expiry = active_expiries[sym][bi]
             col_l = block["start"]
+            # The cell above the block names the expiry that block shows, so
+            # it has to follow the block.
+            #
+            # It used to be written only when the expiry ROLLED, which is
+            # once a minute, and never at all when a slot was first assigned.
+            # So the blocks could show dailies while the cells above them
+            # still said older months - and the customer had no way to tell
+            # which chain they were looking at.
+            if expiry and not user_pinned[sym][bi]:
+                try:
+                    text = iso_to_user(expiry)
+                    if us_state._expiry_cell_written.get((sym, bi)) != text:
+                        cell_ref = EXPIRY_CELLS[bi]
+                        rng = sheet.range(cell_ref)
+                        rng.api.NumberFormat = "@"
+                        rng.value = text
+                        us_state._expiry_cell_written[(sym, bi)] = text
+                        us_state._tool_written_dates[(sym, bi)] = text
+                        us_state._user_dates_seen[(sym, bi)] = text
+                except Exception as e:
+                    log_excel_exception(role, e, "writing expiry date cell")
             if not expiry:
                 # Only rewrite header cells when the text actually changed.
                 # Writing an identical string still dirties the cell and forces
-                # every dependent formula to recalculate â€” that cost is what
+                # every dependent formula to recalculate — that cost is what
                 # makes a strategy workbook feel stuck.
                 head_text = f"{sym} Spot: --"
                 pcr_text = "PCR: --"
@@ -1003,9 +1176,9 @@ def _write_to_excel(role):
                 )
             cnt = len(chain) if chain is not None else 0
             _head = f"{sym} Spot: {sp:.2f} | {cnt} strikes"
-            # Never let a delay go unannounced. A silent drop to the CBOE
-            # fallback means the trader is reading 15-minute-old prices, and
-            # that is exactly what "the data is stale" means to them.
+            # Never let a delay go unannounced. A silent drop to a delayed
+            # feed means the trader is reading old prices, and that is
+            # exactly what "the data is stale" means to them.
             _note = source_delay_note(sym)
             if _note:
                 _head = f"{_head} | {_note}"
@@ -1024,21 +1197,13 @@ def _write_to_excel(role):
             net_paint(sheet, role, bi, col_l)
 
             if chain is not None and not chain.empty:
-                # set OI as text BEFORE write so Excel cannot coerce $223 -> INR number
-                n_rows = len(chain)
+                # OI columns stay numeric: build_option_chain writes floats
+                # and force_usd_block_formats formats them "$#,##0", so the
+                # customer's XLOOKUP arithmetic sees plain numbers. The old
+                # write path re-armed them to text format ("@") whenever the
+                # block grew a row, which fought that numeric format and
+                # nudged text into their formulas - retired for good.
                 c0 = block["start"]
-                # Setting the number format dirties the cells, so do it once
-                # per block rather than on every refresh.
-                fmt_key = (role, bi, n_rows)
-                if fmt_key not in _oi_fmt_done:
-                    for off in (3, 5):
-                        try:
-                            sheet.range((5, c0 + off), (4 + n_rows, c0 + off)).api.NumberFormat = "@"
-                        except Exception as e:
-                            log_excel_exception(
-                                role, e, f"formatting open-interest column {c0 + off}"
-                            )
-                    _oi_fmt_done.add(fmt_key)
 
                 write_started = time.perf_counter()
                 try:
@@ -1046,6 +1211,31 @@ def _write_to_excel(role):
                     # change alters the signature and forces the write, so live
                     # updates still land; unchanged blocks cost nothing.
                     values = chain.values.tolist()
+                    # The block always occupies the same rows. Live strikes
+                    # fill from the top; rows past the live count stay blank,
+                    # so a customer range written for a 37-strike expiry
+                    # (P5:P41) keeps covering the whole chain when the next
+                    # expiry runs to 60 strikes.
+                    # The extent never shrinks: the highest rows this session
+                    # has seen for the block stay the floor, so a shorter
+                    # expiry cannot yank rows out from under the customer's
+                    # offset ranges.
+                    seen = us_state._row_extent_seen.get((role, bi), 0)
+                    extent = max(us_state.ROW_EXTENT_DEFAULT, seen, len(values))
+                    if extent != seen:
+                        if seen:
+                            feed_log(
+                                "chain_extent_changed",
+                                role=role,
+                                block=bi + 1,
+                                from_rows=seen,
+                                to_rows=extent,
+                            )
+                        us_state._row_extent_seen[(role, bi)] = extent
+                    values = pad_block_rows(values, extent)
+                    # Sizes downstream (stale clear, formats, colour paints)
+                    # all key off the extent so the geometry stays constant.
+                    n_rows = extent
                     payload_sig = hash(tuple(map(tuple, values)))
                     if payload_sig != _block_payload.get((role, bi)):
                         prev = _block_values.get((role, bi))
@@ -1060,7 +1250,7 @@ def _write_to_excel(role):
                         us_state._cycle_wrote = True
                         # The Excel write is deferred to the end of the block
                         # loop, so all of this sheet's blocks go out together.
-                        pending_writes.append((bi, block, chain, n_rows, runs, prev))
+                        pending_writes.append((bi, block, values, n_rows, runs, prev))
                     else:
                         _performance_metrics.record(role, "excel_range_skipped", 0.0, rows=n_rows)
                 finally:
@@ -1073,9 +1263,13 @@ def _write_to_excel(role):
 
                 # Clear whatever sits below the live table.
                 #
-                # Only clears rows that can hold leftovers: what this block used
-                # previously, plus on first sighting a generous sweep to catch
-                # anything an earlier run left behind.
+                # Only clears rows that can hold leftovers: what this block
+                # used previously (below the fixed extent that only ever
+                # grows, so only possible on the first cycle this block is
+                # seen), plus on first sighting a generous sweep to catch
+                # anything an earlier run left behind. A live shrink is
+                # handled by the padded payload diff instead: the rows the
+                # block let go of are written back blank as blanks.
                 prev_n = _last_rows.get((role, bi))
                 if prev_n is None or n_rows < prev_n:
                     first_sight = _FIRST_SIGHT_BOUND if prev_n is None else 0
@@ -1089,6 +1283,7 @@ def _write_to_excel(role):
                     except Exception as e:
                         log_excel_exception(role, e, f"clearing stale rows in block {bi + 1}")
                 _last_rows[(role, bi)] = n_rows
+                _deep_clear_below_block(sheet, role, bi, c0, n_rows)
 
                 formatting_started = time.perf_counter()
                 try:
@@ -1180,13 +1375,18 @@ def _flush_block_writes(sheet, role, pending):
 
     Either way each block is written on its own, into its own columns, so a
     block that did not change is never touched.
+
+    Pending entries carry the block's padded rows (values padded with blank
+    rows up to the fixed extent, never the raw DataFrame), so even a
+    whole-block write keeps the geometry the customer's literal ranges rely
+    on.
     """
     if not pending:
         return
     started = time.perf_counter()
     protected = _calc_session.get("owned") and not _calc_session.get("failed")
     try:
-        for bi, block, chain, n_rows, runs, prev in pending:
+        for bi, block, row_block, n_rows, runs, prev in pending:
             try:
                 if protected:
                     if len(runs) == 1:
@@ -1194,14 +1394,14 @@ def _flush_block_writes(sheet, role, pending):
                         sheet.range(
                             (5 + start, block["start"]),
                             (4 + end, block["start"] + 8),
-                        ).value = chain.iloc[start : end + 1].values
+                        ).value = [list(r) for r in row_block[start : end + 1]]
                         _performance_metrics.record(
                             role, "excel_rows_written", 0.0, rows=end - start + 1
                         )
                     else:
                         sheet.range((5, block["start"])).options(
                             index=False, header=False
-                        ).value = chain
+                        ).value = [list(r) for r in row_block]
                 else:
                     # Unprotected window: every cell can trigger a recalc of
                     # the customer's workbook, so the write window is one
@@ -1213,11 +1413,11 @@ def _flush_block_writes(sheet, role, pending):
                         for i in range(lo, hi + 1):
                             in_run = any(start <= i <= end for start, end in runs)
                             if in_run:
-                                merged_rows.append(list(chain.iloc[i].values))
+                                merged_rows.append(list(row_block[i]))
                             elif prev is not None and i < len(prev):
                                 merged_rows.append(list(prev[i]))
                             else:
-                                merged_rows.append(list(chain.iloc[i].values))
+                                merged_rows.append(list(row_block[i]))
                         sheet.range(
                             (5 + lo, block["start"]),
                             (4 + hi, block["start"] + 8),
@@ -1228,7 +1428,7 @@ def _flush_block_writes(sheet, role, pending):
                     else:
                         sheet.range((5, block["start"])).options(
                             index=False, header=False
-                        ).value = chain
+                        ).value = [list(r) for r in row_block]
             except Exception as e:
                 log_excel_exception(role, e, f"writing chain block {bi + 1}")
     finally:
@@ -1257,7 +1457,7 @@ def _time_recalc(wrote):
     workbook takes to recalc when we change a cell it depends on. Plain
     Application.Calculate, not CalculateUntilAsyncQueriesDone (that is for
     asynchronous queries such as Power Query). Only done when we actually
-    wrote something and Excel was on auto/semiauto â€” recalculating for a
+    wrote something and Excel was on auto/semiauto — recalculating for a
     customer who chose manual would undo their choice.
     """
     if not wrote:
@@ -1293,19 +1493,52 @@ def render_cycle():
     started = time.perf_counter()
     us_state._cycle_wrote = False
 
+    # A rejected Databento key cannot fix itself, so no chain can be
+    # downloaded and the sheets will stay empty until the customer puts a
+    # working key in. Say so once, plainly: a blank sheet whose header says
+    # LOADING forever is indistinguishable from a broken app, and the
+    # customer has no way to guess that the key is the problem.
+    feed = us_state._databento_feed
+    if feed is not None and not us_state._databento_auth_notice_shown:
+        try:
+            reason = feed.auth_error()
+        except Exception:
+            reason = None
+        if reason:
+            us_state._databento_auth_notice_shown = True
+            try:
+                show_error(
+                    "Databento rejected your API key, so no option chains can "
+                    "be downloaded and the sheets will stay empty.\n\n"
+                    f"Details: {reason}\n\n"
+                    "Enter a working key when the tool asks for it, then run "
+                    "the tool again."
+                )
+            except Exception:
+                pass
+
     # If Excel would not switch to manual calculation, every cell we write
     # makes it recalculate. Writing anyway at full speed is what made the
     # sheet feel stuck, so slow down to a rate the customer's workbook can
     # absorb, and tell them once what to clear.
-    if _calc_manual_failed:
+    #
+    # A workbook close is the one refusal that must never reach them: closing
+    # briefly puts Excel's save prompt up and every switch fails for those
+    # seconds. The marks are cleared the moment the chains are gone.
+    if us_state._calc_manual_failed:
+        _clear_refused_calc_if_chain_gone()
+    if us_state._calc_manual_failed:
         now = time.monotonic()
-        if now - _last_unprotected_write < _UNPROTECTED_WRITE_INTERVAL:
+        if now - us_state._last_unprotected_write < _UNPROTECTED_WRITE_INTERVAL:
             _performance_metrics.record("ALL", "render_cycle_skipped_busy", 0.0)
             return
-        _last_unprotected_write = now
+        us_state._last_unprotected_write = now
         _performance_metrics.record("ALL", "render_cycle_unprotected", 0.0)
-        if not _calc_manual_notice_shown:
-            _calc_manual_notice_shown = True
+        if (
+            not us_state._calc_manual_notice_shown
+            and now - us_state._calc_failed_since >= _CALC_NOTICE_GRACE_SECONDS
+        ):
+            us_state._calc_manual_notice_shown = True
             try:
                 show_error(
                     "Excel would not switch to manual calculation, so the "
@@ -1362,6 +1595,22 @@ def _probe_calc_state_after_restore():
     hit = 1.0 if state != 0 else 0.0
     us_state._calc_state_probe = (now, hit)
     _performance_metrics.record("ALL", "excel_recalc_second_pass", hit)
+    if hit:
+        _note_recalc_second_pass(now)
+
+
+def _note_recalc_second_pass(now):
+    """Record that Excel still owed a recalc after the write window.
+
+    The customer's own formula workbook is heavier than the configured refresh
+    assumed. Stretch the loop's sleep so Excel gets idle time, and let it decay
+    back once Excel comes out of every write window clean.
+    """
+    widened = min(us_state.WIDEN_MAX, us_state._refresh_widen * us_state.WIDEN_STEP)
+    if widened != us_state._refresh_widen:
+        us_state._refresh_widen = widened
+        feed_log("refresh_widened", widen=round(widened, 2))
+    us_state._refresh_widen_hold_until = now + us_state.WIDEN_DECAY_SECONDS
 
 
 def _log_speed_summary(cycle_ms):
@@ -1482,6 +1731,241 @@ def _observe_raw_calc(raw):
         )
 
 
+def _open_book_names(app):
+    """Lower-case names of the workbooks open in `app`, or None when Excel
+    refuses to enumerate (a modal is up, or the instance is being torn down).
+    """
+    try:
+        return {os.path.basename(book.name).lower() for book in app.books}
+    except Exception:
+        return None
+
+
+def _chain_books_missing(open_names):
+    """True when `open_names` is readable and holds no chain workbook.
+
+    Reads-may-fail is treated the same as "cannot tell": an empty or None
+    enumeration does NOT count as closed, because Excel always keeps at least
+    one workbook open while it is running normally.
+    """
+    if not open_names:
+        return False
+    return not any(name in open_names for name in ROLE_FILES.values())
+
+
+_SAVE_PROMPT_CLASSES = ("NUIDialog", "#32770")
+_SAVE_PROMPT_POLL_SECONDS = 0.25
+_SAVE_PROMPT_ATTEMPT_LIMIT = 8
+
+
+def _prompt_belongs_to_chain(hwnd):
+    """True when the prompt sits over a chain workbook window.
+
+    The chain sheets are rewritten by every cycle, so their unsaved contents
+    are never worth keeping - the tool answers those prompts itself instead
+    of letting them pile up in the background. The customer's other workbooks
+    get no auto-answer: what is unsaved in those is theirs to save or drop,
+    and one wrong click on their side would be data loss. Excel captions live
+    on the main window the prompt is owned by, so climb to the owner and
+    recognise the chain wording there.
+    """
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    owner = user32.GetAncestor(hwnd, 3)  # GA_ROOTOWNER
+    if not owner:
+        return False
+    buf = ctypes.create_unicode_buffer(512)
+    user32.GetWindowTextW(owner, buf, 512)
+    # File-backed captions join words with an underscore
+    # ("us_stock_option_chain - Excel") while the tool's rendered frames
+    # space them ("SPX | Option Chain ..."); normalise so one phrase covers
+    # both shapes.
+    caption = buf.value.replace("_", " ").replace("-", " ").lower()
+    return "option chain" in caption or "options chain" in caption
+
+
+def _send_alt_n(hwnd):
+    """Press the Don't Save accelerator (Alt+N) on a prompt window."""
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    user32.SetForegroundWindow(hwnd)
+    time.sleep(0.08)
+    vk_menu, vk_n = 0x12, 0x4E  # VK_MENU, VK_N
+    user32.keybd_event(vk_menu, 0, 0, 0)
+    time.sleep(0.04)
+    user32.keybd_event(vk_n, 0, 0, 0)
+    time.sleep(0.04)
+    user32.keybd_event(vk_n, 0, 2, 0)
+    time.sleep(0.04)
+    user32.keybd_event(vk_menu, 0, 2, 0)
+    time.sleep(0.10)
+
+
+def _answer_save_prompt(hwnd):
+    """Press the prompt's Don't Save button; True when a click was sent.
+
+    Classic prompts are plain dialogs owning standard Button children, so a
+    BM_CLICK on the Don't Save button answers them directly. The modern
+    NetUI prompt has no button windows at all - captions empty, everything
+    inside one NetUIHWND - so for those the Alt+N accelerator is pressed
+    once the dialog is foreground, which Excel maps to Don't Save.
+    """
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    button = 0
+    while True:
+        button = user32.FindWindowExW(hwnd, button, "Button", None)
+        if not button:
+            break
+        text = ctypes.create_unicode_buffer(128)
+        user32.GetWindowTextW(button, text, 128)
+        label = text.value.replace("&", "").lower()
+        if "don" in label and "save" in label:
+            user32.SendMessageW(button, 0x00F5, 0, 0)  # BM_CLICK
+            return True
+    _send_alt_n(hwnd)
+    return False
+
+
+def _chain_save_prompt_once(attempts):
+    """One scan: find Excel save prompts over chain windows and answer them.
+
+    `attempts` remembers how many times each prompt has been poked so a
+    stuck dialog is never hammered forever; the limit just keeps a broken
+    dialog from cycling clicks until the workbook is closed one way or the
+    other.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    callback = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+    cls = ctypes.create_unicode_buffer(64)
+    hits = []
+
+    def _scan(hwnd, _lparam):
+        user32.GetClassNameW(hwnd, cls, 64)
+        if cls.value in _SAVE_PROMPT_CLASSES and user32.IsWindowVisible(hwnd):
+            hits.append(hwnd)
+        return True
+
+    proc = callback(_scan)
+    user32.EnumWindows(proc, 0)
+    for hwnd in hits:
+        if not user32.IsWindow(hwnd):
+            attempts.pop(hwnd, None)
+            continue
+        if not _prompt_belongs_to_chain(hwnd):
+            continue
+        count = attempts.get(hwnd, 0)
+        if count >= _SAVE_PROMPT_ATTEMPT_LIMIT:
+            continue
+        attempts[hwnd] = count + 1
+        clicked = _answer_save_prompt(hwnd)
+        feed_log(
+            "chain_save_prompt_answered",
+            attempt=count + 1,
+            way="button" if clicked else "alt_n",
+        )
+
+
+def _chain_save_prompt_watchdog():
+    attempts = {}
+    while True:
+        try:
+            _chain_save_prompt_once(attempts)
+        except Exception:
+            pass
+        time.sleep(_SAVE_PROMPT_POLL_SECONDS)
+
+
+_prompt_watchdog_started = False
+
+
+def start_chain_save_prompt_watchdog():
+    """Start the save-prompt answerer, once per process.
+
+    It runs on its own thread on purpose: the prompt freezes every COM call
+    on the main thread, so a poll from inside display_loop would sit blocked
+    on exactly the dialog it is trying to answer. Win32-only work (window
+    enumeration and keystrokes) needs no COM and stays safe off-thread.
+    """
+    global _prompt_watchdog_started
+    if _prompt_watchdog_started or platform.system() != "Windows":
+        return
+    _prompt_watchdog_started = True
+    threading.Thread(
+        target=_chain_save_prompt_watchdog,
+        name="chain-save-prompt-answerer",
+        daemon=True,
+    ).start()
+
+
+def _release_session_manual(app):
+    """Hand the manual window back when the customer closed the chains.
+
+    While we own manual calculation, their own workbook only recalculates
+    when we ask it to. Once no chain workbook is left, nothing of ours is
+    being written and hanging on to it would silently freeze their formulas
+    - so release it, in both Excel and the crash record.
+    """
+    mode = _calc_session.get("mode")
+    try:
+        if mode:
+            _set_calc_mode(app, mode)
+    except Exception as e:
+        log_excel_exception("ALL", e, "releasing session manual calculation")
+    try:
+        calc_mode_guard.release(PRODUCT_ID)
+    except Exception as e:
+        log_excel_exception("ALL", e, "releasing calculation guard on close")
+    _calc_session["owned"] = False
+    _calc_session["failed"] = False
+    _calc_session["mode"] = None
+    _calc_session["app"] = None
+    us_state._manual_since = 0.0
+
+
+def _clear_refused_calc_marks():
+    """Drop the refused-manual marks the moment the chains are gone.
+
+    The save prompt Excel shows while the workbook closes refuses COM calls
+    for a few seconds, and the refusal marks left behind would fire the
+    slow-down notice long after the close had finished. Cheap when calm: no
+    state, no COM.
+    """
+    us_state._calc_manual_failed = False
+    us_state._calc_failed_since = 0.0
+    us_state._calc_failed_at = 0.0
+    _calc_session["failed"] = False
+    us_state._bulk_will_recalc = False
+
+
+def _clear_refused_calc_if_chain_gone():
+    """Mark-clearing before the render slow path.
+
+    Runs only while a refusal is still latched, so a calm cycle costs nothing.
+    Reads the books of the cached Excel instance; when no chain workbook is
+    left the close has finished and the marks must not survive it.
+    """
+    if not us_state._calc_manual_failed:
+        return
+    app = us_state._app_cache
+    if app is None:
+        return
+    open_names = _open_book_names(app)
+    if not _chain_books_missing(open_names):
+        return
+    _clear_refused_calc_marks()
+
+
+_CALC_NOTICE_GRACE_SECONDS = 60.0
+_NO_BOOK_SKIP_LOG_SECONDS = 60.0
+
+
 def ensure_calculation_not_stranded(app=None):
     """Safety net: never leave the trader in manual calculation.
 
@@ -1491,6 +1975,8 @@ def ensure_calculation_not_stranded(app=None):
     """
     if app is None:
         app = us_state._app_cache
+    if app is None:
+        app = bulk_app()
     if app is None:
         return
     if _calc_session.get("owned") and not _calc_session.get("failed"):
@@ -1552,6 +2038,24 @@ def _begin_excel_bulk_mode(app=None):
             us_state._app_cache = None
             return None
         state["app"] = app
+        # Closed-workbook gate. When the customer is closing the chains, Excel
+        # is either gone or busy answering its save prompt, and both states
+        # refuse COM calls. There is nothing of ours to write, so the honest
+        # response is to skip the write window - which also hands manual
+        # calculation back the moment the chains are no longer open, instead
+        # of holding it over whatever workbook the customer has left.
+        open_names = _open_book_names(app)
+        if _chain_books_missing(open_names):
+            _release_session_manual(app)
+            _clear_refused_calc_marks()
+            now = time.monotonic()
+            if now - us_state._no_book_skip_logged_at > _NO_BOOK_SKIP_LOG_SECONDS:
+                us_state._no_book_skip_logged_at = now
+                feed_log(
+                    "bulk_mode_skipped_no_chain_workbook",
+                    note="no chain workbook is open; skipping the write window",
+                )
+            return None
         try:
             if _screen_pause_active():
                 # Setting it keeps failing and Excel is busy. Stop trying for a
@@ -1596,67 +2100,75 @@ def _begin_excel_bulk_mode(app=None):
                 if not _calc_session.get("owned"):
                     _calc_session["owned"] = False
             else:
-                state["calc"] = current or "automatic"
-                # Written BEFORE Excel is changed. If this process dies inside
-                # the window, the next launch finds the record and puts Excel
-                # back, instead of leaving their formulas silently dead.
-                calc_mode_guard.acquire(state["calc"], PRODUCT_ID)
-                state["calc_guarded"] = True
-                # If the workbook was already on automatic, Excel will
-                # recalculate by itself once we restore. Semiautomatic does
-                # the same for ordinary formulas.
-                us_state._bulk_will_recalc = state["calc"] in ("automatic", "semiautomatic")
-                if _calc_session["failed"]:
-                    # We already know Excel will not let us change the mode.
-                    # Stop asking: every failed attempt costs a COM call and
-                    # makes Excel busier, which is the loop that made the
-                    # customer's workbook crawl.
+                # Coexistence guard: if the sibling Option Chain tool already
+                # acquired manual calculation, do not try to take it too:
+                # calc_mode_guard.acquire() is a file append, not a lock, so
+                # both tools can pass it at once and then fight over the
+                # actual Excel switch -- the first error dialog the customer
+                # sees on joint startup. Skip the switch entirely and let the
+                # sibling own it for this cycle.
+                if calc_mode_guard.other_holder_alive(PRODUCT_ID):
                     state["calc"] = None
-                    state["calc_guarded"] = False
                 else:
-                    # Take the calculation mode once, for the whole session.
-                    #
-                    # It used to be set at the start of every cycle and restored
-                    # at the end of every cycle. On the customer's machine
-                    # that switch failed almost every time, so the write window
-                    # was never protected and every cell we touched triggered a
-                    # full recalculation of their own workbook. Leaving Excel
-                    # in manual for the session and recalculating it ourselves
-                    # once per cycle is both cheaper and far less likely to
-                    # collide with the other OptionChain tool.
-                    try:
-                        app.calculation = "manual"
-                        _calc_session["owned"] = True
-                        _calc_session["mode"] = state["calc"]
-                        _calc_session["failed"] = False
-                        _calc_session["app"] = app
-                    except Exception as exc:
-                        _calc_session["failed"] = True
-                        _calc_session["owned"] = False
-                        feed_log(
-                            "calc_manual_unavailable",
-                            error=type(exc).__name__,
-                            detail=str(exc)[:120],
-                        )
-                        if not _calc_notice_shown:
-                            _calc_notice_shown = True
-                            try:
-                                show_error(
-                                    "Excel will not switch to manual calculation, "
-                                    "so the workbook recalculates on every "
-                                    "update and can feel slow.\n\n"
-                                    "This is usually one of three things:\n"
-                                    "  - a cell is in edit mode - press Escape\n"
-                                    "  - an Excel dialog is open - close it\n"
-                                    "  - an Excel add-in is busy - turn it off\n\n"
-                                    "The tool carries on and recovers on its own, "
-                                    "but Excel will be working harder than it "
-                                    "needs to until that is cleared."
-                                )
-                            except Exception:
-                                pass
-                        state["calc"] = None
-                        state["calc_guarded"] = False
+                    state["calc"] = current or "automatic"
+                    # Written BEFORE Excel is changed. If this process dies inside
+                    # the window, the next launch finds the record and puts Excel
+                    # back, instead of leaving their formulas silently dead.
+                    calc_mode_guard.acquire(state["calc"], PRODUCT_ID)
+                    state["calc_guarded"] = True
+                if state["calc"]:
+                    # If the workbook was already on automatic, Excel will
+                    # recalculate by itself once we restore. Semiautomatic does
+                    # the same for ordinary formulas.
+                    us_state._bulk_will_recalc = state["calc"] in ("automatic", "semiautomatic")
+                    if _calc_session["failed"]:
+                        # We already know Excel will not let us change the mode.
+                        # Stop asking: every failed attempt costs a COM call and
+                        # makes Excel busier, which is the loop that made the
+                        # customer's workbook crawl. But after a cooldown, the user
+                        # may have cleared the cause (pressing Escape, closing a
+                        # dialog), so we retry once to recover the manual window.
+                        now = time.monotonic()
+                        if now - us_state._calc_failed_at < us_state.CALC_RETRY_COOLDOWN_SECONDS:
+                            state["calc"] = None
+                            state["calc_guarded"] = False
+                    else:
+                        # Take the calculation mode once, for the whole session.
+                        #
+                        # It used to be set at the start of every cycle and restored
+                        # at the end of every cycle. On the customer's machine
+                        # that switch failed almost every time, so the write window
+                        # was never protected and every cell we touched triggered a
+                        # full recalculation of their own workbook. Leaving Excel
+                        # in manual for the session and recalculating it ourselves
+                        # once per cycle is both cheaper and far less likely to
+                        # collide with the other OptionChain tool.
+                        try:
+                            was_failed = us_state._calc_manual_failed
+                            app.calculation = "manual"
+                            _calc_session["owned"] = True
+                            _calc_session["mode"] = state["calc"]
+                            _calc_session["failed"] = False
+                            _calc_session["app"] = app
+                            us_state._calc_manual_failed = False
+                            us_state._calc_failed_since = 0.0
+                            if was_failed:
+                                feed_log("calc_manual_restored",
+                                         detail="recovered manual calculation after retry")
+                        except Exception as exc:
+                            _calc_session["failed"] = True
+                            _calc_session["owned"] = False
+                            if not us_state._calc_failed_since:
+                                us_state._calc_failed_since = time.monotonic()
+                            us_state._calc_failed_at = time.monotonic()
+                            feed_log(
+                                "calc_manual_unavailable",
+                                error=type(exc).__name__,
+                                detail=str(exc)[:120],
+                            )
+                            us_state._calc_manual_failed = True
+                            state["calc"] = None
+                            state["calc_guarded"] = False
         except Exception as e:
             log_excel_exception("ALL", e, "switching to manual calculation")
             state["calc"] = None
@@ -1717,6 +2229,10 @@ async def display_loop():
     is_windows = platform.system() == "Windows"
     license_tick = 0
     us_state._excel_gone_logged = False
+    if is_windows:
+        # The chain save prompt would otherwise sit unanswered in the
+        # background blocking COM until the customer notices it.
+        start_chain_save_prompt_watchdog()
     while True:
         render_started = time.perf_counter()
         # re-check license roughly every ~60s while running
@@ -1756,8 +2272,31 @@ async def display_loop():
 
             elif not us_state._excel_gone_logged:
                 us_state._excel_gone_logged = True
-                print("Excel is not running - pausing writes until it is reopened.", flush=True)
+                print(
+                    "Excel is not running - pausing writes until it is "
+                    "reopened. Open spx_option_chain, djx_option_chain and "
+                    "us_stock_option_chain in Excel and the chain will "
+                    "start on its own.",
+                    flush=True,
+                )
                 _last_excel_exception.clear()
+                # Excel's address space is gone, so any manual window we held
+                # is gone with it. Drop the session and the claim so the next
+                # cycle starts clean instead of talking to a dead app, and the
+                # crash record cannot outlive the instance it belonged to.
+                _calc_session["owned"] = False
+                _calc_session["failed"] = False
+                _calc_session["mode"] = None
+                _calc_session["app"] = None
+                us_state._calc_manual_failed = False
+                us_state._calc_failed_since = 0.0
+                us_state._calc_failed_at = 0.0
+                us_state._bulk_will_recalc = False
+                us_state._app_cache = None
+                try:
+                    calc_mode_guard.release(PRODUCT_ID)
+                except Exception:
+                    pass
             render_seconds = time.perf_counter() - render_started
             _performance_metrics.record("ALL", "render_cycle", render_seconds)
             if render_seconds > REFRESH:
@@ -1774,19 +2313,36 @@ async def display_loop():
         # Sleep AFTER the work, for at least as long as the work took.
         #
         # The customer builds their strategy in the same Excel instance, so if
-        # writing the chains leaves no idle gap, Excel is busy whenever they try
-        # to click a cell and the workbook feels stuck. Measured with a heavy
-        # 800-row formula workbook open, one pass took ~880ms; against a 1.0s
-        # refresh that is ~88% duty cycle. Backing off to an equal amount of
-        # idle time keeps the workbook usable and lets the refresh stretch
+        # writing the chains leaves no idle gap, Excel is busy whenever they
+        # try to click a cell and the workbook feels stuck. Measured with a
+        # heavy 800-row formula workbook open, one pass took ~880ms; against a
+        # 1.0s refresh that is ~88% duty cycle. Backing off to an equal amount
+        # of idle time keeps the workbook usable and lets the refresh stretch
         # automatically when their workbook is heavy, while a light workbook
         # still updates at the configured interval.
+        #
+        # The stretch is adaptive: a CalculationState probe that still shows
+        # work owed after the write window (see _note_recalc_second_pass)
+        # multiplies the configured interval, and the stretch decays back to
+        # 1.0 after a quiet spell so a fast workbook is never left crawling.
+        now_mono = time.monotonic()
+        if (
+            now_mono > us_state._refresh_widen_hold_until
+            and us_state._refresh_widen > 1.0
+        ):
+            us_state._refresh_widen = max(1.0, us_state._refresh_widen / 2.0)
+            us_state._refresh_widen_hold_until = now_mono + us_state.WIDEN_DECAY_SECONDS
+            if us_state._refresh_widen > 1.0:
+                feed_log("refresh_widen_decayed", widen=round(us_state._refresh_widen, 2))
         await asyncio.sleep(
             refresh_delay(
-                REFRESH,
+                REFRESH * us_state._refresh_widen,
                 REFRESH,
                 time.perf_counter() - render_started,
             )
         )
+
+
+
 
 

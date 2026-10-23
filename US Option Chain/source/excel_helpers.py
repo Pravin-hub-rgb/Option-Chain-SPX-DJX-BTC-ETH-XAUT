@@ -1,8 +1,27 @@
 import os
 
 
+def long_form(path):
+    """The Windows long form of a path, or the path itself.
+
+    Mirror of the Delta tool's fix: Workbooks.Open may have been handed the
+    8.3 short name, and Excel then reports THAT form as the book's fullname.
+    Comparing short-vs-long never matches, so the tool would sit unable to
+    write even though the workbook is wide open.
+    """
+    try:
+        import ctypes
+
+        buffer = ctypes.create_unicode_buffer(1024)
+        if ctypes.windll.kernel32.GetLongPathNameW(path, buffer, 1024):
+            return buffer.value or path
+    except Exception:
+        pass
+    return path
+
+
 def find_book_and_app_in_apps(apps, filename, on_error=None):
-    target = os.path.normcase(os.path.abspath(filename))
+    target = os.path.normcase(long_form(os.path.abspath(filename)))
     for app in apps:
         try:
             books = list(app.books)
@@ -12,7 +31,7 @@ def find_book_and_app_in_apps(apps, filename, on_error=None):
             continue
         for book in books:
             try:
-                if os.path.normcase(os.path.abspath(book.fullname)) == target:
+                if os.path.normcase(long_form(os.path.abspath(book.fullname))) == target:
                     return book, app
             except Exception as exc:
                 if on_error is not None:

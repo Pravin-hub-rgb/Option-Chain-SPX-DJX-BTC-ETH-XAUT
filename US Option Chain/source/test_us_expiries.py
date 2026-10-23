@@ -69,8 +69,10 @@ class DropdownOrderTests(unittest.TestCase):
         self.assertEqual(ordered, sorted(self.dates))
         self.assertEqual(ordered[0], "2026-10-22")
 
-    def test_default_order_still_prefers_the_standard_root(self):
-        """The default slots keep the liquid chain, not the mini weekly."""
+    def test_default_order_is_nearest_first_too(self):
+        """The three slots sit side by side, so they show three consecutive
+        expiries: the dailies and weeklies next to each other, the way a
+        trader watches them."""
         main.expiry_roots["SPX"] = {
             "2026-11-20": {"SPX"},
             "2026-12-18": {"SPX"},
@@ -78,7 +80,10 @@ class DropdownOrderTests(unittest.TestCase):
         }
         try:
             ordered = main.available_expiries(self.dates, "SPX")
-            self.assertEqual(ordered[0], "2026-11-20")
+            self.assertEqual(ordered, sorted(self.dates))
+            self.assertEqual(ordered[0], "2026-10-22")
+            self.assertEqual(ordered[1], "2026-10-23")
+            self.assertEqual(ordered[2], "2026-10-27")
         finally:
             main.expiry_roots.pop("SPX", None)
 

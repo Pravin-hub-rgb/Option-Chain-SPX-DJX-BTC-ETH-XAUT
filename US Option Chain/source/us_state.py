@@ -87,6 +87,26 @@ active_expiries = {}
 user_pinned = {}
 all_known_expiries = {}
 
+# The expiry date the tool itself last wrote into each (symbol, slot) cell,
+# and the last value it saw there. The difference between the two is what
+# tells a customer edit from a leftover.
+#
+# Without this the tool read its own write-back and took it for a user edit.
+# That pinned the slots to whatever the workbook happened to hold from the
+# previous session - a monthly expiry - and the expiry roller then left them
+# alone for good, because a pinned slot is never changed. The customer saw
+# November, December and January side by side and no way out of it.
+_tool_written_dates = {}
+
+# (symbol, slot) -> the last expiry date the tool saw in that cell. A cell
+# that has not changed since the last look was not edited by anybody.
+_user_dates_seen = {}
+
+# (symbol, slot) -> the expiry the tool last wrote into the date cell. The
+# cell has to follow the block under it, and this is how the tool knows
+# whether it already has.
+_expiry_cell_written = {}
+
 _rate_lock = asyncio.Lock()
 # Serialises access to the shared Databento feed so two symbols never mutate
 # it at the same time. It does not add any delay of its own.
@@ -108,6 +128,11 @@ _auto_open_done = {r: False for r in ROLE_ORDER}
 # Set when a workbook's layout no longer matches what the tool writes to.
 _sheet_altered = {r: False for r in ROLE_ORDER}
 
+# One extra auto-reopen attempt per role, long after the first one fired -
+# the escape hatch for a startup open that went nowhere.
+_auto_open_rearm_used = {r: False for r in ROLE_ORDER}
+_AUTO_OPEN_REARM_SECONDS = 180.0
+
 _SHORT_BUILD = None
 
 _timezone_warning_logged = False
@@ -120,6 +145,26 @@ _last_rows = {}
 # How far below the live table to sweep the first time we see a block in this
 # run, to catch anything an earlier run left behind. Paid once per block.
 _FIRST_SIGHT_BOUND = 300
+# Every chain block is written to a fixed number of rows (ROW_EXTENT_DEFAULT,
+# grown only when a chain really is bigger), padded with blanks below the live
+# strike count. The customer's strategy sheets carry formulas with literal
+# ranges - XLOOKUP(E6, BTC!P5:P33, BTC!R5:R33, 0) - and a chain whose live row
+# count moves with every expiry silently walks rows out from under those
+# ranges: one leg of their lookup then returns the 0 default and their book
+# shows values that are wrong with no error anywhere. A fixed geometry keeps
+# every row their formula can see inside the block forever.
+ROW_EXTENT_DEFAULT = 128
+_row_extent_seen = {}
+# Adaptive refresh. When Excel still owed a recalculation pass the moment we
+# handed the mode back (excel_recalc_second_pass), the customer's own formula
+# workbook is heavier than the configured refresh assumed, so the render loop
+# stretches its sleep to give Excel idle time instead of starving it. The
+# widening decays back to 1.0 after a quiet spell.
+_refresh_widen = 1.0
+_refresh_widen_hold_until = 0.0
+WIDEN_STEP = 1.5
+WIDEN_MAX = 4.0
+WIDEN_DECAY_SECONDS = 120.0
 _performance_metrics = PerformanceMetrics()
 _last_performance_flush = time.monotonic()
 _performance_log_error_shown = False
@@ -164,9 +209,28 @@ _app_cache = None
 # and the customer is told once what to clear.
 _calc_manual_failed = False
 _calc_manual_notice_shown = False
+_calc_failed_at = 0.0
+# Monotonic timestamp of the FIRST refusal of the current stuck spell.
+# _calc_failed_at is refreshed by every cooldown retry, so it cannot tell a
+# customer who glanced at a save prompt from one stuck for a minute. The
+# notice is only shown once a refusal has held for the grace period, so a
+# workbook close - where the save prompt refuses one or two switches for a
+# few seconds - never warns at all.
+_calc_failed_since = 0.0
+CALC_RETRY_COOLDOWN_SECONDS = 10.0
+# Set when the customer has been told that Excel would not switch to manual
+# calculation, so the message appears once and not on every cycle.
+_calc_notice_shown = False
 # When the write window is unprotected, write at most this often.
 _UNPROTECTED_WRITE_INTERVAL = 3.0
 _last_unprotected_write = 0.0
+# Rate limiter for the "no chain workbook open" skip log, so the chains-closed
+# state does not append a line to startup_diag.log on every render cycle.
+_no_book_skip_logged_at = 0.0
+
+# Set once the customer has been told that Databento rejected their key, so
+# the message appears a single time and not on every cycle.
+_databento_auth_notice_shown = False
 
 _manual_since = 0.0
 MANUAL_WATCHDOG_SECONDS = 4.0
@@ -193,4 +257,4 @@ def net_badge():
     secs = int(time.time() - (_net["since"] or time.time()))
     m, s = divmod(secs, 60)
     span = f"{m}m {s:02d}s" if m else f"{s}s"
-    return f"OFFLINE {span} - reconnecting..."
+    return ""

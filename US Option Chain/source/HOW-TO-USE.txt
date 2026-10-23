@@ -1,9 +1,29 @@
 US OPTION CHAIN - CLIENT SETUP AND TROUBLESHOOTING
 ==================================================
 
+BEFORE YOU START: RUN THE SELF-TEST
+------------------------------------
+Open a command prompt in this folder and run
+
+    python doctor.py
+
+It checks everything the tool needs - the activation key, your Databento key
+(including whether Databento accepts it), Excel, the three workbooks and the
+folder path - and prints a plain answer for each one. Run it first if
+anything is not working, and send the output to support.
+
+UNZIP TO A SHORT FOLDER
+-----------------------
+Put the package in a short folder such as C:\OptionChain. Excel stops
+opening a workbook somewhere past 128 characters and never returns, and a
+folder under your Downloads or Desktop can easily be that long. The symptom
+is the worst kind: the workbook never opens, the tool says "Excel is not
+running" while Excel is sitting right there, and the sheets stay empty.
+doctor.py tells you if your folder is too long.
+
 FIRST RUN
 ---------
-1. Unzip the package anywhere you like (for example C:\OptionChain).
+1. Unzip the package to a short folder (for example C:\OptionChain).
 2. Double click us_option_chain.exe.
 3. It asks for the ACTIVATION KEY. Enter the key you were given.
    It is saved next to us_option_chain.exe as license.json. Do not move or
@@ -94,3 +114,77 @@ CME_MINI:ES1!. On Barchart use $ES for the live futures.
 
 Avoid comparing against ^SPX or $SPX on those sites: those are the
 fifteen minute delayed CBOE quotes.
+
+BUILDING STRATEGIES IN A SEPARATE WORKBOOK
+----------------------------------------
+A strategy workbook (calendar spreads, iron condors, ratio spreads, etc.)
+references the chain cells with lookup formulas.  The chain is TWO 9-column
+blocks side by side (near expiry, then the next expiry):
+
+  Offset  Col (B1)  Col (B2)  Meaning
+  +0      A         L         Call LTP
+  +1      B         M         Call Bid
+  +2      C         N         Call Ask
+  +3      D         O         Call OI
+  +4      E         P         Strike (lookup key)
+  +5      F         Q         Put OI
+  +6      G         R         Put Bid  (far expiry return)
+  +7      H         S         Put Ask  (near expiry return)
+  +8      I         T         Put LTP
+
+The strike column is E (Block 1) or P (Block 2).
+Put Bid is G / R; Put Ask is H / S.
+
+Note from this build: each sheet shows TWO expiry blocks (was three). The
+third expiry columns (W-AE) are cleared once when the tool starts and left
+empty — any of your formulas that pointed at W-AE need to move to block 2
+(L-T) or block 1 (A-I).
+
+SHEET LAYOUT (same as before otherwise): the expiry input cells are D3
+(block 1) and O3 (block 2), type any DD/MM/YYYY; empty cells auto-pick the
+next two expiries from the ladder. A2 still caps the number of strikes
+around the money; K1 is the stock workbook's symbol.
+
+BROKEN PATTERN — do not use this:
+  =VLOOKUP(E6, E5:H41, 4, FALSE) + VLOOKUP(E6, P5:S41, 3, FALSE)
+  =XLOOKUP(E6, Chain!P5:P33, Chain!R5:R33, "NA") + XLOOKUP(E6, Chain!E5:E41, Chain!H5:H41, "NA")
+
+Problems:
+  1. "NA" (text) default: number + "NA" = #VALUE!
+  2. 0 default: number + 0 = number — silently hides a missing leg
+  3. Range asymmetry: P5:P33 vs E5:E41 misses strikes beyond row 33
+  4. No guard that the strike exists in both expiries
+
+CORRECTED VLOOKUP (gross premium — sum both legs, missing leg = 0):
+  =IFNA(VLOOKUP(E6, E5:H41, 4, FALSE), 0) + IFNA(VLOOKUP(E6, P5:S41, 3, FALSE), 0)
+
+CORRECTED XLOOKUP (net credit/debit — require both legs):
+  =IF(AND(NOT(ISNA(XMATCH(E6,Chain!P5:P41,0))),NOT(ISNA(XMATCH(E6,Chain!E5:E41,0)))),
+     XLOOKUP(E6,Chain!P5:P41,Chain!R5:R41) + XLOOKUP(E6,Chain!E5:E41,Chain!H5:H41),
+     "strike not in both expiries")
+
+Key rules:
+  - Wrap each individual lookup with IFNA or IFERROR, never the whole sum
+  - Extend lookup ranges to P5:P41 / E5:E41 so no strikes are missed
+  - Strike and price cells are numeric floats; OI is also numeric in this tool
+  - "NA" as a default is always wrong for arithmetic — it returns #VALUE!
+
+FIXED ROW GEOMETRY FROM THIS BUILD ON
+-------------------------------------
+The chain blocks always occupy the same rows now: live strikes fill from
+row 5 down, and rows past the live strike count stay blank. A block grows
+its occupied depth only if an expiry ever brings MORE strikes than it has
+seen this session — it never shrinks. Two consequences for your formulas:
+
+  - A literal range such as E5:E132 keeps covering the live chain even when
+    the number of strikes changes expiry to expiry. Blank rows simply never
+    match the lookup, and an IFNA/0 default handles them as "missing".
+  - Old ranges written for a small expiry (P5:P41) now always cover the live
+    rows as long as the live count stays inside them — but for safety set
+    your ranges to the full depth of the block (down to row 132), so nothing
+    changes when a bigger expiry arrives.
+
+Also new: when your own strategy workbook uses many formulas, the tool
+stretches its refresh automatically so Excel gets idle time; you should feel
+less lag while typing, and the workbook title bar shows how long your own
+book took to recalculate.

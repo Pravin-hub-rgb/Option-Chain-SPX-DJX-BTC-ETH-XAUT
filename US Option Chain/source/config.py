@@ -6,13 +6,17 @@ import sys
 def base_dir():
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
+    d = os.path.dirname(os.path.abspath(__file__))
+    pkg = os.path.normpath(os.path.join(d, "..", "client package"))
+    if os.path.isfile(os.path.join(pkg, "optionchain.product")):
+        return pkg
+    return d
 
 
 def load_config():
     path = os.path.join(base_dir(), "config.json")
     defaults = {
-        "refresh_interval_seconds": 0.1,
+        "refresh_interval_seconds": 0.5,
         "poll_gap_seconds": 2,
         "round_pause_seconds": 2,
         "expiry_refresh_seconds": 60,
