@@ -1658,6 +1658,53 @@ def _raw_calc_mode(app):
     return int(app.api.Calculation)
 
 
+_DEAD_COM_CODES = {
+    0x800A01A8,  # OLE error 0x800A01A8 - the app object is gone
+    0x800706BA,  # RPC_S_SERVER_UNAVAILABLE - the Excel process is gone
+    0x800706B5,  # RPC_S_CALL_FAILED
+    0x80010108,  # RPC_E_DISCONNECTED
+}
+
+
+def _com_dead(exc):
+    """True when the failure says the Excel instance itself is gone.
+
+    A switch refused while a modal is up is a recoverable refusal and keeps
+    the usual handling. When Excel has closed, recording a refusal only
+    nuclear-armes the slow-down notice a minute later.
+    """
+    codes = []
+    hr = getattr(exc, "hresult", None)
+    if hr is not None:
+        codes.append(hr)
+    args = getattr(exc, "args", ()) or ()
+    for item in args:
+        if isinstance(item, int):
+            codes.append(item)
+        winerr = getattr(item, "winerror", None)
+        if winerr is not None:
+            codes.append(winerr)
+        scode = getattr(item, "scode", None)
+        if scode is not None:
+            codes.append(scode)
+    seen = [c & 0xFFFFFFFF for c in codes if isinstance(c, int)]
+    return any(code in _DEAD_COM_CODES for code in seen)
+
+
+def _release_dead_excel_state():
+    """After Excel is gone: drop the calc session, marks and stale handles."""
+    _calc_session["owned"] = False
+    _calc_session["failed"] = False
+    _calc_session["mode"] = None
+    _calc_session["app"] = None
+    try:
+        calc_mode_guard.release(PRODUCT_ID)
+    except Exception:
+        pass
+    us_state._app_cache = None
+    _clear_refused_calc_marks()
+
+
 def _set_calc_mode(app, name):
     app.api.Calculation = _CALC_IDS[name]
     return _raw_calc_mode(app) == _CALC_IDS[name]
@@ -1955,8 +2002,23 @@ def _clear_refused_calc_if_chain_gone():
         return
     app = us_state._app_cache
     if app is None:
+        # No cached Excel at all: the instance is gone, and the chains cannot
+        # be open. A dead-handle refusal must not survive the close.
+        _clear_refused_calc_marks()
         return
     open_names = _open_book_names(app)
+    if open_names is None:
+        # The instance refuses to enumerate (teardown or a modal). With a live
+        # Excel that is "cannot tell", so only treat it as closed when there
+        # is genuinely nothing running: a taskbar Close-all leaves neither
+        # process nor cache, and the marks still have to go.
+        try:
+            gone = not excel_process_running()
+        except Exception:
+            gone = False
+        if gone:
+            _clear_refused_calc_marks()
+        return
     if not _chain_books_missing(open_names):
         return
     _clear_refused_calc_marks()
@@ -2035,7 +2097,10 @@ def _begin_excel_bulk_mode(app=None):
             _ = app.version
         except Exception as e:
             log_excel_exception("ALL", e, "cached Excel app went stale")
-            us_state._app_cache = None
+            # A dead instance ends the session as well: marks, guard record and
+            # the stale handle all go together, or the refusal latch would
+            # survive the close and pop its notice a minute later.
+            _release_dead_excel_state()
             return None
         state["app"] = app
         # Closed-workbook gate. When the customer is closing the chains, Excel
@@ -2156,19 +2221,31 @@ def _begin_excel_bulk_mode(app=None):
                                 feed_log("calc_manual_restored",
                                          detail="recovered manual calculation after retry")
                         except Exception as exc:
-                            _calc_session["failed"] = True
-                            _calc_session["owned"] = False
-                            if not us_state._calc_failed_since:
-                                us_state._calc_failed_since = time.monotonic()
-                            us_state._calc_failed_at = time.monotonic()
-                            feed_log(
-                                "calc_manual_unavailable",
-                                error=type(exc).__name__,
-                                detail=str(exc)[:120],
-                            )
-                            us_state._calc_manual_failed = True
                             state["calc"] = None
                             state["calc_guarded"] = False
+                            if _com_dead(exc):
+                                # Excel died mid-window (the customer closed
+                                # it). A dead handle is not a refusal: latching
+                                # one would pop the slow-down notice about a
+                                # minute later. Drop the state and let the
+                                # reopen path bring Excel back.
+                                _release_dead_excel_state()
+                                feed_log(
+                                    "calc_switch_excel_gone",
+                                    detail=type(exc).__name__,
+                                )
+                            else:
+                                _calc_session["failed"] = True
+                                _calc_session["owned"] = False
+                                if not us_state._calc_failed_since:
+                                    us_state._calc_failed_since = time.monotonic()
+                                us_state._calc_failed_at = time.monotonic()
+                                feed_log(
+                                    "calc_manual_unavailable",
+                                    error=type(exc).__name__,
+                                    detail=str(exc)[:120],
+                                )
+                                us_state._calc_manual_failed = True
         except Exception as e:
             log_excel_exception("ALL", e, "switching to manual calculation")
             state["calc"] = None

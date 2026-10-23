@@ -3,6 +3,8 @@ import math
 import os
 import time
 import unittest
+import pywintypes
+from unittest.mock import patch
 
 import main as delta_main
 import delta_state
@@ -139,6 +141,57 @@ class _FakeSheet:
     def only_write(self):
         assert len(self.writes) == 1, "expected one COM call, got %d" % len(self.writes)
         return self.writes[0]
+
+
+class DeadExcelRefusalTests(unittest.TestCase):
+    """Excel closing under us must not arm the manual-switch notice.
+
+    A taskbar Close-all leaves every handle dead; the next manual switch used
+    to latch a refusal and pop the slow-down dialog a minute later. Dead COM
+    means Excel is gone - drop the session and never show that dialog.
+    """
+
+    DEAD = pywintypes.com_error(-2146827864, "OLE error 0x800a01a8", None, None)
+
+    def setUp(self):
+        delta_main.delta_state._calc_manual_failed = True
+        delta_main.delta_state._calc_failed_since = 0.0
+        self._release_probe = patch.object(
+            delta_main.calc_mode_guard, "release"
+        )
+        self._release_probe.start()
+
+    def tearDown(self):
+        self._release_probe.stop()
+        delta_main.delta_state._calc_manual_failed = False
+        delta_main.delta_state._calc_failed_since = 0.0
+        delta_main.delta_state._app_cache = None
+        delta_main.delta_state._bulk_owning_manual = False
+
+    def test_com_dead_classifier_separates_dead_from_busy(self):
+        self.assertTrue(delta_main._com_dead(self.DEAD))
+        self.assertFalse(
+            delta_main._com_dead(
+                pywintypes.com_error(-2147352567, "modal up", None, None)
+            )
+        )
+        self.assertFalse(delta_main._com_dead(RuntimeError("dialog is up")))
+
+    def test_dead_version_probe_drops_marks_and_cache(self):
+        dead_err = self.DEAD
+
+        class DeadApp:
+            @property
+            def version(self):
+                raise dead_err
+
+        ds = delta_main.delta_state
+        ds._app_cache = DeadApp()
+        result = delta_main._begin_excel_bulk_mode()
+        self.assertIsNone(result)
+        self.assertIsNone(ds._app_cache)
+        self.assertFalse(ds._calc_manual_failed)
+        self.assertFalse(ds._bulk_owning_manual)
 
 
 class DeltaMergedBlockWriteTests(unittest.TestCase):

@@ -25,6 +25,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import excel_helpers
 import us_performance
+import pywintypes
+from unittest.mock import MagicMock, patch
 
 
 class FakeBook:
@@ -1596,6 +1598,153 @@ class CalcShutdownSuppressionTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertFalse(release.called)
         self.assertTrue(acquire.called)
+
+
+class DeadExcelRefusalTests(unittest.TestCase):
+    """Excel closing while we own the manual window is not a refusal.
+
+    A taskbar "Close all windows" leaves every handle dead: the next bending
+    of the manual switch used to latch a refusal and pop the slow-down notice
+    a minute later. Dead COM means Excel is gone - drop the session and the
+    marks, and never show that notice about it.
+    """
+
+    DEAD = pywintypes.com_error(-2146827864, "OLE error 0x800a01a8", None, None)
+
+    def setUp(self):
+        import us_excel
+        import us_state
+
+        self.us_excel = us_excel
+        self.us_state = us_state
+        self._guard_probe = patch.object(
+            us_excel.calc_mode_guard, "other_holder_alive", return_value=False
+        )
+        self._guard_probe.start()
+        self._release_probe = patch.object(us_excel.calc_mode_guard, "release")
+        self._release_probe.start()
+        self._saved = (
+            us_state._calc_manual_failed,
+            us_state._calc_failed_since,
+            us_state._calc_failed_at,
+            us_state._app_cache,
+            dict(us_excel._calc_session),
+        )
+        us_state._calc_manual_failed = False
+        us_state._calc_failed_since = 0.0
+        us_state._calc_failed_at = 0.0
+
+    def tearDown(self):
+        us_excel = self.us_excel
+        us_state = self.us_state
+        self._guard_probe.stop()
+        self._release_probe.stop()
+        (
+            us_state._calc_manual_failed,
+            us_state._calc_failed_since,
+            us_state._calc_failed_at,
+            us_state._app_cache,
+        ) = self._saved[:4]
+        us_excel._calc_session.clear()
+        us_excel._calc_session.update(self._saved[4])
+
+    def _dead_app(self):
+        dead_err = self.DEAD
+
+        class DeadApp:
+            @property
+            def version(self):
+                raise dead_err
+
+        return DeadApp()
+
+    def test_app_cache_none_clears_refusal_marks(self):
+        us_excel = self.us_excel
+        us_state = self.us_state
+
+        us_state._calc_manual_failed = True
+        us_state._app_cache = None
+        us_excel._clear_refused_calc_if_chain_gone()
+        self.assertFalse(us_state._calc_manual_failed)
+
+    def test_dead_enumeration_with_no_process_clears_marks(self):
+        us_excel = self.us_excel
+        us_state = self.us_state
+
+        dead_err = self.DEAD
+
+        class LockedApp:
+            @property
+            def books(self):
+                raise dead_err
+
+        with patch.object(us_excel, "excel_process_running", lambda: False):
+            us_state._calc_manual_failed = True
+            us_state._app_cache = LockedApp()
+            us_excel._clear_refused_calc_if_chain_gone()
+            self.assertFalse(us_state._calc_manual_failed)
+
+        with patch.object(us_excel, "excel_process_running", lambda: True):
+            us_state._calc_manual_failed = True
+            us_state._app_cache = LockedApp()
+            us_excel._clear_refused_calc_if_chain_gone()
+            # A live Excel with an unreadable book list might still open the
+            # chains - that stays "cannot tell".
+            self.assertTrue(us_state._calc_manual_failed)
+
+    def test_dead_version_probe_ends_the_session(self):
+        us_excel = self.us_excel
+        us_state = self.us_state
+
+        us_state._calc_manual_failed = True
+        us_state._app_cache = self._dead_app()
+        result = us_excel._begin_excel_bulk_mode(us_state._app_cache)
+        self.assertIsNone(result)
+        self.assertIsNone(us_state._app_cache)
+        self.assertFalse(us_state._calc_manual_failed)
+
+    def test_dead_switch_is_not_latched_but_living_refusal_is(self):
+        us_excel = self.us_excel
+        us_state = self.us_state
+
+        class ChainApp:
+            def __init__(self, err):
+                self.err = err
+
+            @property
+            def version(self):
+                return "16.0"
+
+            @property
+            def books(self):
+                return [type("B", (), {"name": "us_stock_option_chain.xlsx"})()]
+
+            @property
+            def screen_updating(self):
+                return False
+
+            @property
+            def api(self):
+                return type("Api", (), {"Calculation": 2})()
+
+            calculation = property(
+                lambda self: "manual",
+                lambda self, v: self._raise(),
+            )
+
+            def _raise(self):
+                raise self.err
+
+        dead = ChainApp(self.DEAD)
+        us_state._app_cache = dead
+        us_excel._begin_excel_bulk_mode(dead)
+        self.assertFalse(us_state._calc_manual_failed)
+        self.assertIsNone(us_state._app_cache)
+
+        alive_refusal = ChainApp(RuntimeError("nope, dialog is up"))
+        us_state._app_cache = alive_refusal
+        us_excel._begin_excel_bulk_mode(alive_refusal)
+        self.assertTrue(us_state._calc_manual_failed)
 
 
 class ChainSavePromptAnswererTests(unittest.TestCase):

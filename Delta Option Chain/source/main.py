@@ -3012,6 +3012,51 @@ def start_chain_save_prompt_watchdog():
     ).start()
 
 
+_DEAD_COM_CODES = {
+    0x800A01A8,  # OLE error 0x800A01A8 - the app object is gone
+    0x800706BA,  # RPC_S_SERVER_UNAVAILABLE - the Excel process is gone
+    0x800706B5,  # RPC_S_CALL_FAILED
+    0x80010108,  # RPC_E_DISCONNECTED
+}
+
+
+def _com_dead(exc):
+    """True when the failure says the Excel instance itself is gone.
+
+    A switch refused while a modal is up stays a recoverable refusal. Excel
+    having closed records nothing: the marks would otherwise arm the
+    slow-down notice a minute after the customer closed the workbook.
+    """
+    codes = []
+    hr = getattr(exc, "hresult", None)
+    if hr is not None:
+        codes.append(hr)
+    args = getattr(exc, "args", ()) or ()
+    for item in args:
+        if isinstance(item, int):
+            codes.append(item)
+        winerr = getattr(item, "winerror", None)
+        if winerr is not None:
+            codes.append(winerr)
+        scode = getattr(item, "scode", None)
+        if scode is not None:
+            codes.append(scode)
+    seen = [c & 0xFFFFFFFF for c in codes if isinstance(c, int)]
+    return any(code in _DEAD_COM_CODES for code in seen)
+
+
+def _release_dead_excel_state():
+    """After Excel is gone: drop the session, marks and the stale handle."""
+    delta_state._bulk_owning_manual = False
+    delta_state._calc_manual_failed = False
+    delta_state._calc_failed_since = 0.0
+    try:
+        calc_mode_guard.release(PRODUCT_ID)
+    except Exception:
+        pass
+    delta_state._app_cache = None
+
+
 def _begin_excel_bulk_mode():
     """Suspend repaint + recalculation for the duration of one render cycle.
 
@@ -3039,7 +3084,10 @@ def _begin_excel_bulk_mode():
             _ = app.version
         except Exception as e:
             log_excel_exception("ALL", e, "cached Excel app went stale")
-            delta_state._app_cache = None
+            # A dead instance ends the whole session: marks and the stale
+            # handle go together, or the refused-manual latch would survive
+            # the close and pop its notice a minute later.
+            _release_dead_excel_state()
             return None
         state["app"] = app
         # Closed-workbook gate. When the customer is closing the chains, Excel
@@ -3139,22 +3187,33 @@ def _begin_excel_bulk_mode():
                         delta_state._calc_failed_since = 0.0
                     except Exception as exc:
                         was_guarded = state.get("calc_guarded", False)
-                        if not delta_state._calc_failed_since:
-                            delta_state._calc_failed_since = time.monotonic()
-                        delta_state._calc_failed_at = time.monotonic()
-                        delta_state._calc_manual_failed = True
-                        feed_log(
-                            "calc_manual_unavailable",
-                            error=type(exc).__name__,
-                            detail=str(exc)[:120],
-                        )
                         state["calc"] = None
                         state["calc_guarded"] = False
-                        if was_guarded:
-                            try:
-                                calc_mode_guard.release(PRODUCT_ID)
-                            except Exception:
-                                pass
+                        if _com_dead(exc):
+                            # Excel died mid-window (the customer closed it).
+                            # Not a refusal: drop the session so the reopen
+                            # path can bring Excel back without the notice.
+                            _release_dead_excel_state()
+                            feed_log(
+                                "calc_switch_excel_gone",
+                                detail=type(exc).__name__,
+                            )
+                        else:
+                            was_guarded = state.get("calc_guarded", False)
+                            if not delta_state._calc_failed_since:
+                                delta_state._calc_failed_since = time.monotonic()
+                            delta_state._calc_failed_at = time.monotonic()
+                            delta_state._calc_manual_failed = True
+                            feed_log(
+                                "calc_manual_unavailable",
+                                error=type(exc).__name__,
+                                detail=str(exc)[:120],
+                            )
+                            if was_guarded:
+                                try:
+                                    calc_mode_guard.release(PRODUCT_ID)
+                                except Exception:
+                                    pass
                         # A workbook close refuses the switch for as long as
                         # its save prompt is up, and that is not a fault a
                         # customer needs explained to their face. Only a
