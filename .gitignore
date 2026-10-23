@@ -17,8 +17,12 @@ OWNER-ONLY/
 # logs and local runtime state
 *.log
 instance_guard.log
+instance.lock
 startup_diag.log
 feed.log
+
+# editor state
+.kilo/
 
 # build artifacts — regenerate from source
 build/
