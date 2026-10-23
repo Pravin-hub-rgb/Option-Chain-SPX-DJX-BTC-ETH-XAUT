@@ -19,7 +19,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['matplotlib', 'scipy', 'PyQt5', 'PIL'],
+    excludes=['matplotlib', 'scipy', 'PyQt5', 'PIL', 'pyarrow', 'pyarrow.lib'],
     noarchive=False,
     optimize=0,
 )

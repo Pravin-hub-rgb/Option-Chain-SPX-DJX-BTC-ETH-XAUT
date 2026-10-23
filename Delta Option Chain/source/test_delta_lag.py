@@ -1,7 +1,11 @@
 import inspect
+import math
+import os
+import time
 import unittest
 
 import main as delta_main
+import delta_state
 
 
 class DeltaComTaxTests(unittest.TestCase):
@@ -70,20 +74,1051 @@ class DeltaSpanWriteTests(unittest.TestCase):
         self.assertEqual(delta_main._contiguous_runs([]), [])
 
     def test_scattered_changes_write_one_merged_span(self):
-        src = inspect.getsource(delta_main._write_to_excel)
+        src = inspect.getsource(delta_main._flush_block_writes)
         self.assertIn("merged_rows", src)
         self.assertNotIn("for start, end in runs:", src)
 
     def test_unchanged_rows_carry_previous_values(self):
-        src = inspect.getsource(delta_main._write_to_excel)
+        src = inspect.getsource(delta_main._flush_block_writes)
         self.assertIn("merged_rows.append(list(prev[i]))", src)
 
     def test_ownership_flag_gates_row_granularity(self):
         src = inspect.getsource(delta_main._begin_excel_bulk_mode)
-        self.assertIn("_bulk_owning_manual = True", src)
-        self.assertIn("_bulk_owning_manual = False", src)
-        self.assertIn("protected = _bulk_owning_manual",
-                      inspect.getsource(delta_main._write_to_excel))
+        self.assertIn("delta_state._bulk_owning_manual = True", src)
+        self.assertIn("delta_state._bulk_owning_manual = False", src)
+        self.assertIn("protected = delta_state._bulk_owning_manual",
+                      inspect.getsource(delta_main._flush_block_writes))
+
+
+class DeltaFormattingTests(unittest.TestCase):
+    """A1: the OI formatting cost was 340-712 ms of per-cell COM walking."""
+
+    def test_no_per_cell_walk_left_in_formats(self):
+        src = inspect.getsource(delta_main.force_usd_block_formats)
+        self.assertNotIn("for r in range(", src)
+        self.assertNotIn("cell.value", src)
+        self.assertIn("values = rng.value", src)
+        self.assertIn("rng.value = values", src)
+
+    def test_format_gate_ignores_row_count(self):
+        src = inspect.getsource(delta_main.force_usd_block_formats)
+        self.assertIn('(sheet_key, c0, "numfmt")', src)
+        self.assertNotIn("(asset, bi, n_rows)", src)
+
+
+class _FakeRange:
+    def __init__(self, recorder, top, left, bottom, right):
+        self._recorder = recorder
+        self.top = top
+        self.left = left
+        self.bottom = bottom
+        self.right = right
+
+    @property
+    def value(self):
+        return None
+
+    @value.setter
+    def value(self, data):
+        self._recorder.append((self.top, self.left, self.bottom, self.right, data))
+
+
+class _FakeSheet:
+    """Records every range write so a test can inspect the exact grid."""
+
+    def __init__(self):
+        self.writes = []
+
+    def range(self, spec, other=None):
+        if other is None:
+            row, col = spec
+            return _FakeRange(self.writes, row, col, row, col)
+        return _FakeRange(self.writes, spec[0], spec[1], other[0], other[1])
+
+    @property
+    def only_write(self):
+        assert len(self.writes) == 1, "expected one COM call, got %d" % len(self.writes)
+        return self.writes[0]
+
+
+class DeltaMergedBlockWriteTests(unittest.TestCase):
+    """The combined block write, checked on the grid it actually produces.
+
+    The US tool tried writing all three blocks as one wide range and reverted
+    it: the combined grid carried blanks for the blocks that had not changed,
+    so an unchanged block came back empty and the sheet looked like it was
+    blanking out and then filling in again. These tests pin the two rules that
+    make the combined write safe.
+    """
+
+    def setUp(self):
+        import delta_state
+        import pandas as pd
+        import main as delta_main
+        from unittest.mock import patch
+
+        self.delta_main = delta_main
+        self.delta_state = delta_state
+        self.pd = pd
+        self.patch = patch
+
+    def _pending(self, block_index, values, prev, runs):
+        """Build one queued block the way _write_to_excel queues it.
+
+        The pending tuple carries the padded rows (here the test data stands
+        in for them) - no DataFrame - just like the writer now queues.
+        """
+        block = self.delta_main.BLOCK_COLS[block_index]
+        return (block_index, block, values, len(values), runs, prev)
+
+    def _flush(self, sheet, pending):
+        with self.patch.object(self.delta_state, "_bulk_owning_manual", True):
+            self.delta_main._flush_block_writes(sheet, "BTC", pending)
+
+    def test_consecutive_blocks_go_out_as_one_call(self):
+        values = [[1, 2, 3, 4, 5, 6, 7, 8, 9] for _ in range(4)]
+        prev = [list(row) for row in values]
+        pending = [
+            self._pending(0, values, prev, [(0, 0)]),
+            self._pending(1, values, prev, [(0, 0)]),
+        ]
+        sheet = _FakeSheet()
+        self._flush(sheet, pending)
+        top, left, bottom, right, grid = sheet.only_write
+        self.assertEqual((left, right), (1, 20))
+        self.assertEqual(len(grid), 1)
+        # Both blocks carry their current row, and the spacer columns between
+        # them are blank rather than an old value.
+        self.assertEqual(grid[0][0:9], values[0])
+        # Blocks sit in columns 1-9 and 12-20, so columns 10 and 11 are the
+        # spacer and must be blank rather than an old value.
+        self.assertEqual(grid[0][9:11], [None, None])
+        self.assertEqual(grid[0][11:20], values[0])
+
+    def test_an_unchanged_block_is_never_written(self):
+        values = [[1, 2, 3, 4, 5, 6, 7, 8, 9] for _ in range(4)]
+        prev = [list(row) for row in values]
+        # Block 2 did not change, so it is never queued and its columns must
+        # not appear in the write at all.
+        pending = [
+            self._pending(0, values, prev, [(0, 0)]),
+            self._pending(1, values, prev, [(0, 0)]),
+        ]
+        sheet = _FakeSheet()
+        self._flush(sheet, pending)
+        top, left, bottom, right, grid = sheet.only_write
+        self.assertLessEqual(right, 20)
+        self.assertEqual(right, self.delta_main.BLOCK_COLS[1]["start"] + 8)
+
+    def test_a_block_that_shrank_does_not_get_its_old_tail_back(self):
+        # Block 0 went from five rows to two. Its previous rows 1..4 were
+        # cleared a moment ago and must not be written back.
+        stale = [["stale"] * 9 for _ in range(5)]
+        fresh = [[0, 1, 2, 3, 4, 5, 6, 7, 8], [9, 9, 9, 9, 9, 9, 9, 9, 9]]
+        other = [[1, 2, 3, 4, 5, 6, 7, 8, 9] for _ in range(6)]
+        pending = [
+            self._pending(0, fresh, stale, [(0, 0)]),
+            self._pending(1, other, [list(r) for r in other], [(1, 2)]),
+        ]
+        sheet = _FakeSheet()
+        self._flush(sheet, pending)
+        top, left, bottom, right, grid = sheet.only_write
+        flat = [cell for row in grid for cell in row]
+        self.assertNotIn("stale", flat)
+        # Row index 2 of block 0 is past its current row count, so it is blank
+        # even though the block used to have data there.
+        self.assertEqual(grid[2][0:9], [None] * 9)
+        self.assertEqual(grid[1][0:9], fresh[1])
+
+    def test_rows_inside_the_grid_carry_current_content(self):
+        values = [[r] * 9 for r in range(10)]
+        prev = [["old"] * 9 for _ in range(10)]
+        other = [[r] * 9 for r in range(8)]
+        pending = [
+            self._pending(0, values, prev, [(0, 1)]),
+            self._pending(1, other, [list(r) for r in other], [(5, 6)]),
+        ]
+        sheet = _FakeSheet()
+        self._flush(sheet, pending)
+        top, left, bottom, right, grid = sheet.only_write
+        # Block 0 row 2 was not part of the changed run, so it carries the
+        # block's current value, not the previous one.
+        self.assertEqual(grid[2][0], 2)
+        self.assertNotIn("old", [cell for row in grid for cell in row])
+
+    def test_blocks_that_are_not_consecutive_are_written_separately(self):
+        values = [[1, 2, 3, 4, 5, 6, 7, 8, 9] for _ in range(4)]
+        prev = [list(row) for row in values]
+        pending = [
+            self._pending(0, values, prev, [(0, 0)]),
+            self._pending(2, values, prev, [(0, 0)]),
+        ]
+        sheet = _FakeSheet()
+        self._flush(sheet, pending)
+        self.assertEqual(len(sheet.writes), 2)
+        lefts = sorted(w[1] for w in sheet.writes)
+        self.assertEqual(lefts, [1, 23])
+
+    def test_a_huge_rectangle_is_not_used(self):
+        values = [[1, 2, 3, 4, 5, 6, 7, 8, 9] for _ in range(60)]
+        prev = [list(row) for row in values]
+        # The two changed runs sit far apart, so one rectangle would dirty
+        # hundreds of cells the customer never asked us to touch.
+        pending = [
+            self._pending(0, values, prev, [(0, 1)]),
+            self._pending(1, values, prev, [(50, 51)]),
+        ]
+        sheet = _FakeSheet()
+        self._flush(sheet, pending)
+        self.assertEqual(len(sheet.writes), 2)
+
+
+class DeltaExpiryRollerTests(unittest.TestCase):
+    """A failed probe must not shift the slots.
+
+    The slots are filled from the list of expiries that have data, so one
+    missing expiry slides every slot along. The ladder then swaps to a
+    different expiry - and swaps back on the next pass, when the probe
+    works. The trader watches the chain change for no reason.
+    """
+
+    def setUp(self):
+        import main as delta_main
+        self.delta_main = delta_main
+
+    def test_a_failed_probe_keeps_the_current_assignment(self):
+        import inspect
+
+        src = inspect.getsource(self.delta_main.expiry_roller)
+        self.assertIn('if "ERROR" in states:', src)
+        self.assertIn("roller_probe_incomplete", src)
+        # The skip must come before the slots are reassigned.
+        self.assertLess(
+            src.index('if "ERROR" in states:'),
+            src.index("changed_slots = []"),
+        )
+
+    def test_the_retry_recomputes_the_states(self):
+        import inspect
+
+        src = inspect.getsource(self.delta_main.expiry_roller)
+        # After the retry the states have to be read again, or a probe that
+        # failed the first time still looks failed after it succeeded.
+        self.assertIn('states = [st for _, st in counts]', src)
+
+
+class DeltaDelayNoteTests(unittest.TestCase):
+    """What the header says when the data is not fresh.
+
+    A trader looking at a frozen spot has no way of telling a quiet market
+    from a broken feed. The note has to say so - and it has to be empty in
+    the normal case, so the header text does not change and the cell is not
+    rewritten on every cycle.
+    """
+
+    def setUp(self):
+        import time
+
+        import main as delta_main
+        self.delta_main = delta_main
+        self.time = time
+
+    def test_a_healthy_feed_says_nothing(self):
+        self.delta_main.feed_state["BTC"] = {
+            "state": "OK",
+            "detail": "",
+            "retry_in": 0.0,
+            "last_good_ts": time.time(),
+        }
+        self.delta_main.last_ws_recv["BTC"] = time.time()
+        self.delta_main.last_spot_change["BTC"] = time.time()
+        self.assertEqual(self.delta_main.source_delay_note("BTC"), "")
+
+    def test_a_degraded_feed_is_announced(self):
+        self.delta_main.feed_state["BTC"] = {
+            "state": "ERROR",
+            "detail": "http 503",
+            "retry_in": 5.0,
+            "last_good_ts": time.time() - 60,
+        }
+        note = self.delta_main.source_delay_note("BTC")
+        self.assertIn("ERROR", note)
+
+    def test_a_quiet_spot_is_announced(self):
+        self.delta_main.feed_state["BTC"] = {
+            "state": "OK",
+            "detail": "",
+            "retry_in": 0.0,
+            "last_good_ts": time.time(),
+        }
+        self.delta_main.last_ws_recv["BTC"] = time.time() - 30
+        self.delta_main.last_spot_change["BTC"] = time.time() - 30
+        note = self.delta_main.source_delay_note("BTC")
+        self.assertIn("SPOT STALE", note)
+
+    def test_a_never_seen_feed_does_not_crash(self):
+        self.delta_main.feed_state.pop("BTC", None)
+        self.delta_main.last_ws_recv["BTC"] = 0.0
+        self.delta_main.last_spot_change["BTC"] = 0.0
+        self.assertIsInstance(self.delta_main.source_delay_note("BTC"), str)
+
+
+class DeltaSheetStructureGuardTests(unittest.TestCase):
+    """A restructured sheet must stop the tool, not be written over.
+
+    The tool writes to fixed columns. If the customer inserts a column, those
+    positions no longer line up and the tool would write over their own data.
+    """
+
+    class FakeSheet:
+        def __init__(self, a4):
+            self._a4 = a4
+
+        def range(self, *args):
+            class R:
+                def __init__(self, v):
+                    self.value = v
+
+            return R(self._a4)
+
+    def setUp(self):
+        import main as delta_main
+        self.delta_main = delta_main
+
+    def test_intact_sheet_is_ok(self):
+        sheet = self.FakeSheet("Call LTP")
+        self.assertTrue(self.delta_main.sheet_structure_ok(sheet))
+
+    def test_blank_sheet_is_ok(self):
+        sheet = self.FakeSheet(None)
+        self.assertTrue(self.delta_main.sheet_structure_ok(sheet))
+
+    def test_inserted_column_is_detected(self):
+        sheet = self.FakeSheet("My Notes")
+        self.assertFalse(self.delta_main.sheet_structure_ok(sheet))
+
+    def test_unreadable_sheet_is_allowed(self):
+        class Broken:
+            def range(self, *args):
+                raise RuntimeError("RPC server is unavailable")
+
+        self.assertTrue(self.delta_main.sheet_structure_ok(Broken()))
+
+
+class DeltaExpirySettlementTests(unittest.TestCase):
+    """Today's expiry must stay in the list until it has really expired.
+
+    Delta settles BTC and ETH options at 12:00 UTC and XAUT at 16:00 UTC. The
+    old code dropped today's expiry at 08:00 UTC for BTC and ETH, so for four
+    hours of every trading day the contract that was about to expire was
+    missing from the sheet.
+    """
+
+    def setUp(self):
+        import main as delta_main
+        self.delta_main = delta_main
+
+    def _products(self, settlements):
+        return [{"settlement_time": s} for s in settlements]
+
+    def _at(self, hour, minute=0):
+        from datetime import datetime, timezone
+        return datetime(2026, 10, 22, hour, minute, tzinfo=timezone.utc)
+
+    def test_todays_expiry_survives_until_it_settles(self):
+        products = self._products([
+            "2026-10-22T12:00:00Z",
+            "2026-10-23T12:00:00Z",
+        ])
+        dates = self.delta_main.available_expiry_dates(
+            "BTC", products, now=self._at(8, 30)
+        )
+        self.assertEqual(dates, ["2026-10-22", "2026-10-23"])
+
+    def test_todays_expiry_is_dropped_once_it_has_settled(self):
+        products = self._products([
+            "2026-10-22T12:00:00Z",
+            "2026-10-23T12:00:00Z",
+        ])
+        dates = self.delta_main.available_expiry_dates(
+            "BTC", products, now=self._at(12, 1)
+        )
+        self.assertEqual(dates, ["2026-10-23"])
+
+    def test_xaut_settles_later_than_btc(self):
+        products = self._products([
+            "2026-10-22T16:00:00Z",
+            "2026-10-23T16:00:00Z",
+        ])
+        dates = self.delta_main.available_expiry_dates(
+            "XAUT", products, now=self._at(13, 0)
+        )
+        self.assertEqual(dates, ["2026-10-22", "2026-10-23"])
+
+    def test_an_expired_expiry_is_never_offered(self):
+        products = self._products([
+            "2026-10-21T12:00:00Z",
+            "2026-10-22T12:00:00Z",
+        ])
+        dates = self.delta_main.available_expiry_dates(
+            "BTC", products, now=self._at(8, 30)
+        )
+        self.assertEqual(dates, ["2026-10-22"])
+
+    def test_the_settlement_hour_comes_from_the_products(self):
+        # A product that settles at a different hour must be honoured, not
+        # overridden by a hard-coded number.
+        products = self._products([
+            "2026-10-22T09:45:00Z",
+            "2026-10-23T09:45:00Z",
+        ])
+        self.assertEqual(
+            self.delta_main.available_expiry_dates(
+                "BTC", products, now=self._at(9, 50)
+            ),
+            ["2026-10-23"],
+        )
+
+
+class DeltaOiNumericsTests(unittest.TestCase):
+    """OI columns must be numeric so client VLOOKUP/XLOOKUP formulas work."""
+
+    def test_fmt_oi_returns_float_not_string(self):
+        self.assertIsInstance(delta_main.fmt_oi(1500000), float)
+        self.assertEqual(delta_main.fmt_oi(1500000), 1500000.0)
+
+    def test_fmt_oi_handles_legacy_money_strings(self):
+        # Old builds wrote "$1.50M", "$2.00K", "$100", "Rs 500"
+        self.assertEqual(delta_main.fmt_oi("$1.50M"), 1500000.0)
+        self.assertEqual(delta_main.fmt_oi("$2.00K"), 2000.0)
+        self.assertEqual(delta_main.fmt_oi("$100"), 100.0)
+        self.assertEqual(delta_main.fmt_oi("Rs 500"), 500.0)
+        self.assertEqual(delta_main.fmt_oi("1,234"), 1234.0)
+
+    def test_fmt_oi_handles_none_and_nan(self):
+        self.assertEqual(delta_main.fmt_oi(None), 0.0)
+        self.assertEqual(delta_main.fmt_oi(float("nan")), 0.0)
+
+    def test_oI_columns_use_numeric_format_not_text(self):
+        src = inspect.getsource(delta_main.force_usd_block_formats)
+        # OI columns (offsets 3, 5) must use numeric format, not "@"
+        self.assertIn('NumberFormat = "#,##0"', src)
+        self.assertNotIn('NumberFormat = "@"',
+                         src.split('for off in (3, 5)')[1].split('_usd_fmt_done')[0])
+
+
+class DeltaParitySpotTests(unittest.TestCase):
+    """Parity spot fills the gap when the external spot feed goes stale."""
+
+    def test_parity_spot_returns_correct_value(self):
+        """S = K*exp(-(r-q)T) + (C-P)*exp(qT).  With q=0: S = K*exp(-rT) + (C-P)."""
+        expiry_iso = "2027-12-31"
+        T = delta_main._years_to_expiry(expiry_iso)
+        self.assertIsNotNone(T)
+        self.assertGreater(T, 0)
+
+        # Set up a call/put pair at strike 50000
+        delta_state.live_data["BTC"].clear()
+        delta_state.live_data["BTC"]["C-BTC-50000"] = {
+            "strike": 50000, "type": "call", "bid": 1000, "ask": 1010, "ltp": 1005
+        }
+        delta_state.live_data["BTC"]["P-BTC-50000"] = {
+            "strike": 50000, "type": "put", "bid": 800, "ask": 810, "ltp": 805
+        }
+        delta_state.symbol_expiry["BTC"] = {"C-BTC-50000": expiry_iso, "P-BTC-50000": expiry_iso}
+        delta_state.active_expiries["BTC"] = [expiry_iso]
+
+        r = delta_state.PARITY_RATE
+        expected = 50000 * math.exp(-r * T) + 200.0
+
+        result = delta_main.parity_spot_or_none("BTC")
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result, expected, places=0)
+
+    def test_parity_spot_uses_median_of_n_strikes(self):
+        """Multiple strikes: median, not mean."""
+        expiry_iso = "2027-12-31"
+        delta_state.live_data["ETH"].clear()
+        delta_state.live_data["ETH"].update({
+            f"C-ETH-{s}": {"strike": s, "type": "call", "bid": 100, "ask": 102, "ltp": 101}
+            for s in [10000, 11000, 12000, 13000, 14000]
+        })
+        delta_state.live_data["ETH"].update({
+            f"P-ETH-{s}": {"strike": s, "type": "put", "bid": 50, "ask": 52, "ltp": 51}
+            for s in [10000, 11000, 12000, 13000, 14000]
+        })
+        for s in [10000, 11000, 12000, 13000, 14000]:
+            delta_state.symbol_expiry["ETH"][f"C-ETH-{s}"] = expiry_iso
+            delta_state.symbol_expiry["ETH"][f"P-ETH-{s}"] = expiry_iso
+        delta_state.active_expiries["ETH"] = [expiry_iso]
+
+        result = delta_main.parity_spot_or_none("ETH")
+        self.assertIsNotNone(result)
+        # With symmetric spreads, all parity estimates are similar
+        self.assertGreater(result, 0)
+
+    def test_parity_deadband_smooths_cache(self):
+        """Changes smaller than deadband return the cached value."""
+        expiry_iso = "2027-12-31"
+        delta_state.live_data["BTC"].clear()
+        # Two strikes, both at parity
+        for s in [50000, 51000]:
+            delta_state.live_data["BTC"][f"C-BTC-{s}"] = {
+                "strike": s, "type": "call", "bid": 1000, "ask": 1002, "ltp": 1001
+            }
+            delta_state.live_data["BTC"][f"P-BTC-{s}"] = {
+                "strike": s, "type": "put", "bid": 800, "ask": 802, "ltp": 801
+            }
+            delta_state.symbol_expiry["BTC"][f"C-BTC-{s}"] = expiry_iso
+            delta_state.symbol_expiry["BTC"][f"P-BTC-{s}"] = expiry_iso
+        delta_state.active_expiries["BTC"] = [expiry_iso]
+
+        first = delta_main.parity_spot_or_none("BTC")
+        self.assertIsNotNone(first)
+        # Now change one quote slightly — the new parity will differ from
+        # cached, but if within deadband the cache wins.
+        delta_state.live_data["BTC"]["C-BTC-50000"]["bid"] = 1000.01  # tiny bump
+        second = delta_main.parity_spot_or_none("BTC")
+        self.assertEqual(second, first, "Deadband should suppress small changes")
+
+    def test_parity_returns_none_without_contracts(self):
+        delta_state.live_data["XAUT"].clear()
+        self.assertIsNone(delta_main.parity_spot_or_none("XAUT"))
+
+
+class DeltaCalcRetryCooldownTests(unittest.TestCase):
+    """Session-level cooldown prevents COM hammering when Excel won't switch modes."""
+
+    def test_cooldown_constants_exist(self):
+        self.assertTrue(hasattr(delta_state, "CALC_RETRY_COOLDOWN_SECONDS"))
+        self.assertTrue(hasattr(delta_state, "_calc_failed_at"))
+        self.assertTrue(hasattr(delta_state, "_calc_manual_failed"))
+
+    def test_cooldown_logic_in_bulk_mode(self):
+        src = inspect.getsource(delta_main._begin_excel_bulk_mode)
+        self.assertIn("CALC_RETRY_COOLDOWN_SECONDS", src)
+        self.assertIn("_calc_manual_failed", src)
+        self.assertIn("calc_manual_unavailable", src)
+
+
+
+
+class DeltaCalcModeCoexistenceTests(unittest.TestCase):
+    """When both tools start simultaneously, the second to acquire the guard
+    must skip the Excel mode switch entirely instead of failing and showing
+    an error dialog."""
+
+
+    def test_other_holder_alive_check_is_in_bulk_mode(self):
+        src = inspect.getsource(delta_main._begin_excel_bulk_mode)
+        self.assertIn("other_holder_alive", src)
+
+    def test_other_holder_alive_guards_before_acquire(self):
+        """When other_holder_alive returns True, state[calc] is None
+        and calc_mode_guard.acquire must not be called."""
+        from unittest.mock import patch, MagicMock
+        app = MagicMock()
+        app.api.Calculation = -4105  # automatic
+        app.screen_updating = True
+        delta_state._app_cache = app
+        delta_state._calc_manual_failed = False
+        with patch.object(delta_main.calc_mode_guard, 'other_holder_alive', return_value=True):
+            with patch.object(delta_main.calc_mode_guard, 'acquire') as mock_acquire:
+                restore = delta_main._begin_excel_bulk_mode()
+                self.assertIsNotNone(restore)
+                self.assertFalse(mock_acquire.called,
+                                 'acquire should not be called when another tool holds the guard')
+
+    def test_no_other_holder_proceeds_normally(self):
+        """When no other holder is alive, the guard is acquired normally."""
+        from unittest.mock import patch, MagicMock
+        app = MagicMock()
+        app.api.Calculation = -4105  # automatic
+        app.screen_updating = True
+        delta_state._app_cache = app
+        delta_state._calc_manual_failed = False
+        with patch.object(delta_main.calc_mode_guard, 'other_holder_alive', return_value=False):
+            with patch.object(delta_main.calc_mode_guard, 'acquire') as mock_acquire:
+                restore = delta_main._begin_excel_bulk_mode()
+                self.assertIsNotNone(restore)
+                self.assertTrue(mock_acquire.called,
+                                'acquire should be called when no other tool holds the guard')
+
+
+class ChainsCloseSuppressionTests(unittest.TestCase):
+    """Closing the chain workbooks must never put the calc dialog on screen.
+
+    Excel's save prompt refuses every COM call for a few seconds while
+    EXCEL.EXE is still alive, and that refusal used to fire the dialog on
+    the first cycle. The write window is now skipped once the chains are
+    gone, and the dialog only fires after a refusal has held for the grace
+    period while a chain workbook is still open.
+    """
+
+    def setUp(self):
+        self._saved = (
+            delta_state._calc_manual_failed,
+            delta_state._calc_failed_since,
+            delta_state._calc_notice_shown,
+            delta_state._calc_failed_at,
+            delta_state._app_cache,
+            delta_state._bulk_owning_manual,
+        )
+
+    def tearDown(self):
+        restore = self._saved
+        (
+            delta_state._calc_manual_failed,
+            delta_state._calc_failed_since,
+            delta_state._calc_notice_shown,
+            delta_state._calc_failed_at,
+            delta_state._app_cache,
+            delta_state._bulk_owning_manual,
+        ) = restore
+
+    def _app_with_books(self, names, refusing=True):
+        from unittest.mock import MagicMock
+
+        books = []
+        for name in names:
+            book = MagicMock()
+            book.name = name
+            books.append(book)
+
+        class _Api:
+            Calculation = -4105
+
+        class App:
+            version = "16.0"
+
+            def __init__(inner):
+                inner.api = _Api()
+                inner._screen = True
+                inner.books = books
+
+            @property
+            def screen_updating(inner):
+                return inner._screen
+
+            @screen_updating.setter
+            def screen_updating(inner, value):
+                inner._screen = value
+
+            @property
+            def calculation(inner):
+                return "automatic"
+
+            @calculation.setter
+            def calculation(inner, value):
+                if value == "manual" and refusing:
+                    raise RuntimeError(
+                        "Unable to set the Calculation property of the Application class"
+                    )
+
+        return App()
+
+    def _run_cycle(self, app, failed_for=None):
+        import time
+        import unittest.mock as mock
+
+        delta_state._app_cache = app
+        delta_state._calc_failed_at = time.monotonic() - 60.0
+        delta_state._bulk_owning_manual = False
+        if failed_for is None:
+            delta_state._calc_manual_failed = False
+            delta_state._calc_failed_since = 0.0
+        else:
+            delta_state._calc_manual_failed = True
+            delta_state._calc_failed_since = time.monotonic() - failed_for
+        with mock.patch.object(
+            delta_main.calc_mode_guard, "other_holder_alive", return_value=False
+        ), mock.patch.object(
+            delta_main.calc_mode_guard, "acquire"
+        ), mock.patch.object(
+            delta_main.calc_mode_guard, "release"
+        ), mock.patch.object(
+            delta_main, "show_error"
+        ) as show_error:
+            restore = delta_main._begin_excel_bulk_mode()
+        return restore, show_error
+
+    def test_closing_the_chains_clears_the_refusal_without_dialog(self):
+        app = self._app_with_books(["StrategyBook.xlsx"])
+        restore, show_error = self._run_cycle(app, failed_for=600.0)
+        self.assertIsNone(restore)
+        show_error.assert_not_called()
+        self.assertFalse(delta_state._calc_manual_failed)
+        self.assertEqual(delta_state._calc_failed_since, 0.0)
+
+    def test_a_short_blip_runs_silent(self):
+        app = self._app_with_books(["btc_chain.xlsx"])
+        restore, show_error = self._run_cycle(app, failed_for=30.0)
+        self.assertIsNotNone(restore)
+        show_error.assert_not_called()
+        self.assertFalse(delta_state._calc_notice_shown)
+        self.assertTrue(delta_state._calc_manual_failed)
+
+    def test_a_stuck_refusal_earns_the_dialog_first_try(self):
+        app = self._app_with_books(["btc_chain.xlsx", "eth_chain.xlsx"])
+        restore, show_error = self._run_cycle(app, failed_for=90.0)
+        self.assertIsNotNone(restore)
+        self.assertEqual(show_error.call_count, 1)
+        self.assertTrue(delta_state._calc_notice_shown)
+
+    def test_an_open_chain_keeps_the_window_quiet(self):
+        app = self._app_with_books(["eth_chain.xlsx"], refusing=False)
+        restore, show_error = self._run_cycle(app)
+        self.assertIsNotNone(restore)
+        show_error.assert_not_called()
+
+    def test_close_skips_the_guard_entirely(self):
+        from unittest.mock import patch
+
+        app = self._app_with_books(["StrategyBook.xlsx"])
+        with patch.object(delta_main.calc_mode_guard, "acquire") as acquire:
+            delta_state._app_cache = app
+            result = delta_main._begin_excel_bulk_mode()
+        self.assertIsNone(result)
+        self.assertFalse(acquire.called)
+
+
+class ChainSavePromptAnswererTests(unittest.TestCase):
+    """The tool answers Excel's Save / Don't Save prompt over chain books.
+
+    A customer closing btc/eth/xaut_chain would otherwise leave that prompt
+    sitting in the background: it blocks every COM call until it is answered,
+    which is also how the refused manual-calculation switches start. Nothing
+    unsaved in a chain workbook is worth keeping - every cell is rewritten
+    next cycle - so Don't Save is safe there, and only there.
+    """
+
+    def test_the_answerer_runs_off_the_render_thread(self):
+        import inspect
+        import main as delta_main
+
+        src = inspect.getsource(delta_main.display_loop)
+        self.assertIn("start_chain_save_prompt_watchdog()", src)
+        starter = inspect.getsource(delta_main.start_chain_save_prompt_watchdog)
+        self.assertIn("_prompt_watchdog_started", starter)
+        self.assertIn('platform.system() != "Windows"', starter)
+        self.assertIn("threading.Thread(", starter)
+        self.assertIn("daemon=True", starter)
+
+    def test_only_chain_windows_are_answered(self):
+        import unittest.mock as mock
+
+        import main as delta_main
+
+        fake = _FakeUser32("BTC | Options Chain | LIVE - Excel")
+        with mock.patch("ctypes.windll") as windll:
+            windll.user32 = fake.user32
+            self.assertTrue(
+                delta_main._prompt_belongs_to_chain(0x1234),
+                "a prompt over the rendered chain frame must be answered",
+            )
+
+        fake = _FakeUser32("btc_chain - Excel")
+        with mock.patch("ctypes.windll") as windll:
+            windll.user32 = fake.user32
+            # file captions join words with underscores
+            self.assertTrue(
+                delta_main._prompt_belongs_to_chain(0x1234),
+                "the file-backed caption must be recognised too",
+            )
+
+        fake = _FakeUser32("Research Budget 2026 - Excel")
+        with mock.patch("ctypes.windll") as windll:
+            windll.user32 = fake.user32
+            self.assertFalse(
+                delta_main._prompt_belongs_to_chain(0x1234),
+                "the customer's own workbook keeps its prompt untouched",
+            )
+
+    def test_the_modern_prompt_is_answered_without_fighting_window_shapes(self):
+        import inspect
+        import main as delta_main
+
+        src = inspect.getsource(delta_main._answer_save_prompt)
+        self.assertIn('FindWindowExW(hwnd, button, "Button", None)', src)
+        self.assertIn("0x00F5", src)
+        self.assertIn("_send_alt_n(hwnd)", src)
+        accel = inspect.getsource(delta_main._send_alt_n)
+        self.assertIn("SetForegroundWindow(hwnd)", accel)
+        self.assertIn("0x12", accel)
+        self.assertIn("0x4E", accel)
+
+    def test_a_stuck_prompt_is_never_hammered_forever(self):
+        import inspect
+        import main as delta_main
+
+        self.assertEqual(delta_main._SAVE_PROMPT_CLASSES, ("NUIDialog", "#32770"))
+        src = inspect.getsource(delta_main._chain_save_prompt_once)
+        self.assertIn("_SAVE_PROMPT_ATTEMPT_LIMIT", src)
+        self.assertIn("attempts[hwnd] = count + 1", src)
+        self.assertIn("feed_log(", src)
+        looper = inspect.getsource(delta_main._chain_save_prompt_watchdog)
+        self.assertIn("time.sleep(", looper)
+        self.assertIn("except Exception", looper)
+
+    def test_the_question_only_travels_to_chain_owned_dialogs(self):
+        import inspect
+        import main as delta_main
+
+        self.assertEqual(delta_main._SAVE_PROMPT_ATTEMPT_LIMIT, 8)
+        self.assertGreater(delta_main._SAVE_PROMPT_POLL_SECONDS, 0.0)
+        src = inspect.getsource(delta_main._prompt_belongs_to_chain)
+        self.assertIn("GetAncestor", src)
+        # underscore captions like btc_chain must match too
+        self.assertIn('.replace("_", " ")', src)
+        self.assertIn("for token in _DELTA_CHAIN_CAPTION_TOKENS", src)
+
+
+class _FakeUser32:
+    """A stand-in for user32 so _prompt_belongs_to_chain can run without a
+    real window hierarchy on the test machine.
+
+    GetAncestor(3) returns the owner handle; GetWindowTextW fills the caller's
+    buffer with the configured caption, matching the real signature closely
+    enough for the one window the function looks at.
+    """
+
+    def __init__(self, caption):
+        import ctypes as _ct
+
+        self.caption = caption
+
+        class _U32:
+            GetAncestor = staticmethod(lambda hwnd, flag: 0x4321 if flag == 3 else 0)
+
+            def GetWindowTextW(self, hwnd, buf, size):  # noqa: N802
+                buf.value = caption
+                return len(caption)
+
+            def IsWindow(self, hwnd):
+                return True
+
+            def IsWindowVisible(self, hwnd):
+                return True
+
+        self.user32 = _U32()
+
+
+class ChainExtentStabilityTests(unittest.TestCase):
+    """The customer's strategy formulas carry literal row ranges.
+
+    The complaint: their own sheets (VLOOKUP/XLOOKUP against the chain
+    columns) showed values that were wrong and lagging. Root cause one: a
+    chain whose live row count changes with every expiry walks rows out from
+    under those literal ranges, so one leg of the lookup silently becomes the
+    if_not_found default. The write path therefore pads every block to a
+    fixed extent, and the refresh widens adaptively when the customer's own
+    workbook is heavy.
+    """
+
+    def test_blocks_write_a_fixed_extent(self):
+        import inspect
+        src = inspect.getsource(delta_main._write_to_excel)
+        self.assertIn("ROW_EXTENT_DEFAULT", src)
+        self.assertIn("chain_extent_changed", src)
+        self.assertIn("n_rows = extent", src)
+
+    def test_flush_writes_padded_rows_not_the_dataframe(self):
+        import inspect
+        src = inspect.getsource(delta_main._flush_block_writes)
+        self.assertNotIn("chain.iloc", src)
+        self.assertIn("rows_block", src)
+
+    def test_write_path_pads_before_diffing(self):
+        import inspect
+        src = inspect.getsource(delta_main._write_to_excel)
+        self.assertIn("pad_block_rows(values, extent)", src)
+        self.assertIn("pending_writes.append(", src)
+
+    def test_pad_block_rows_pads_with_blank_rows(self):
+        self.assertEqual(
+            delta_main.pad_block_rows([[1, 2], [3, 4]], 4),
+            [[1, 2], [3, 4], [None, None], [None, None]],
+        )
+        self.assertEqual(
+            delta_main.pad_block_rows([], 2), [[None] * 9, [None] * 9]
+        )
+        self.assertEqual(delta_main.pad_block_rows([[1, 2]], 1), [[1, 2]])
+
+    def test_extent_is_not_shrunk_after_growing(self):
+        """A stuck-at-max keeps every literal customer range valid forever."""
+        import inspect
+        src = inspect.getsource(delta_main._write_to_excel)
+        self.assertIn(
+            "extent = max(delta_state.ROW_EXTENT_DEFAULT, seen, len(values))", src
+        )
+        self.assertNotIn("_row_extent_seen[(asset, bi)] = len(values)", src)
+
+    def test_deep_clear_sweeps_legacy_junk_once_per_block(self):
+        import inspect
+        src = inspect.getsource(delta_main._deep_clear_below_block)
+        self.assertIn("_deep_swept", src)
+        self.assertIn("chain_deep_clear", src)
+
+    def test_every_asset_shows_two_blocks(self):
+        """BTC and ETH join XAUT on two expiry blocks per sheet.
+
+        The customer asked for two expiries per sheet everywhere (their
+        strategy books read blocks 1+2 only); the third expiry columns get
+        cleared and hidden by the existing bi >= nb machinery.
+        """
+        for asset in ("BTC", "ETH", "XAUT"):
+            self.assertEqual(delta_main.n_blocks(asset), 2)
+        self.assertEqual(delta_main.BLOCK_COLS[2]["start"], 23)
+
+    def test_third_block_wipes_on_connect_not_on_first_write(self):
+        """The sweep must ride the per-cycle connect step, not the first
+        data write - a cold start takes minutes and the customer stares at
+        the old Block 3 the whole time otherwise."""
+        import inspect
+        src = inspect.getsource(delta_main._retire_unused_blocks)
+        self.assertIn("expiry_block_retired", src)
+        self.assertIn("_block_hidden[(asset, bi)] = True", src)
+        self.assertLess(
+            src.index("get_column_letter(block[\"start\"])"),
+            src.index("api.EntireColumn.Hidden"),
+        )
+        writer = inspect.getsource(delta_main._write_to_excel)
+        self.assertIn("_retire_unused_blocks(sheet, asset)", writer)
+        self.assertLess(
+            writer.index("_retire_unused_blocks(sheet, asset)"),
+            writer.index("if not sheet_structure_ok(sheet)"),
+        )
+
+
+class DeltaRefreshWidenTests(unittest.TestCase):
+    """When Excel still owes a recalc after our window the loop stretches."""
+
+    def setUp(self):
+        self._saved = (
+            delta_state._refresh_widen,
+            delta_state._refresh_widen_hold_until,
+            delta_state._calc_state_probe,
+            delta_state._app_cache,
+        )
+
+    def tearDown(self):
+        delta_state._refresh_widen = self._saved[0]
+        delta_state._refresh_widen_hold_until = self._saved[1]
+        delta_state._calc_state_probe = self._saved[2]
+        delta_state._app_cache = self._saved[3]
+
+    def test_second_pass_widens_refresh(self):
+        class _App:
+            class api:
+                CalculationState = 2
+
+        delta_state._refresh_widen = 1.0
+        delta_state._calc_state_probe = None
+        delta_state._app_cache = _App()
+        delta_main._probe_calc_state_after_restore()
+        self.assertEqual(delta_state._refresh_widen, 1.5)
+        self.assertGreater(delta_state._refresh_widen_hold_until, 0.0)
+
+    def test_widen_caps_at_four_and_holds_through_the_window(self):
+        delta_state._refresh_widen = 3.0
+        held_at = time.monotonic() + 10.0
+        delta_state._refresh_widen_hold_until = held_at
+        delta_main._note_recalc_second_pass(time.monotonic())
+        # 3.0 * 1.5 = 4.5 caps at WIDEN_MAX.
+        self.assertEqual(delta_state._refresh_widen, 4.0)
+        self.assertGreater(delta_state._refresh_widen_hold_until, held_at)
+
+    def test_display_loop_uses_and_decays_widen(self):
+        import inspect
+        src = inspect.getsource(delta_main.display_loop)
+        self.assertIn("float(refresh) * delta_state._refresh_widen", src)
+        self.assertIn("refresh_widen_decayed", src)
+        self.assertIn("_refresh_widen_hold_until", src)
+
+
+class AutoOpenRecoveryTests(unittest.TestCase):
+    """A wedged Workbooks.Open must time out, log, and retry in a fresh Excel.
+
+    The startup open pass used to be one silent daemon thread: Workbooks.Open
+    aimed at an Excel another tool owned (or whose controller died earlier)
+    can block forever, the pass never reported anything, and the writer sat
+    on "excel_running_workbook_not_found" for the whole session - the
+    customer sees a blank sheet that never fills.
+    """
+
+    def test_open_pass_is_watchdog_gated(self):
+        src = inspect.getsource(delta_main.open_excel_files)
+        self.assertIn("threading.Event()", src)
+        self.assertIn("finished.wait(AUTO_OPEN_TIMEOUT_SECONDS)", src)
+        self.assertIn("excel_auto_open_timeout", src)
+        self.assertIn("args=(retry_done, True)", src)
+
+    def test_open_pass_reports_each_book(self):
+        opener = inspect.getsource(delta_main._open_excel_files)
+        self.assertIn("excel_auto_open_started", opener)
+        self.assertIn('excel_auto_open_done", asset=asset', opener)
+        self.assertIn("excel_auto_open_failed", opener)
+        self.assertIn("finished.set()", opener)
+        self.assertIn("own_instance", opener)
+
+    def test_writer_rearms_open_once_when_excel_alive_no_book(self):
+        writer = inspect.getsource(delta_main._write_to_excel)
+        self.assertIn("excel_auto_open_rearmed", writer)
+        self.assertIn("delta_state._auto_open_rearm_started", writer)
+        self.assertIn("open_excel_files()", writer)
+        # The rearm rides the Excel-alive-but-book-missing path, after the
+        # had-it-once notice branch.
+        self.assertLess(
+            writer.index("notice_workbook_missing(fname)"),
+            writer.index("excel_auto_open_rearmed"),
+        )
+
+    def test_loop_thread_initializes_com_apartment(self):
+        src = inspect.getsource(delta_main.main_async)
+        self.assertIn("pythoncom.CoInitialize()", src)
+        self.assertLess(
+            src.index("pythoncom.CoInitialize()"),
+            src.index("open_excel_files()"),
+        )
+
+    def test_default_expiries_are_two_wide(self):
+        src = inspect.getsource(delta_main.get_default_expiries)
+        self.assertIn("n_blocks(asset)", src)
+        self.assertIn("dates.append(None)", src)
+
+    def test_roller_pads_slot_lists_before_writes(self):
+        src = inspect.getsource(delta_main.expiry_roller)
+        self.assertIn("while len(active_expiries[asset]) <= i:", src)
+        self.assertLess(
+            src.index("while len(active_expiries[asset]) <= i:"),
+            src.index("active_expiries[asset][i] = tgt"),
+        )
+
+    def test_find_open_book_matches_short_form_fullnames(self):
+        src = inspect.getsource(delta_main.find_open_book)
+        self.assertIn("_long_form", src)
+        self.assertIn("GetLongPathNameW", inspect.getsource(delta_main._long_form))
+        # Path match first, then the same-name fallback (Excel cannot hold
+        # two workbooks with the same name, so the open copy is the one to
+        # use - same policy as the US tool).
+        self.assertLess(
+            src.index("long_form == target_long"),
+            src.index("same_name = same_name or book"),
+        )
+
+    def test_long_form_round_trips_short_paths(self):
+        import ctypes
+
+        path = os.path.abspath(__file__)
+        buffer = ctypes.create_unicode_buffer(1024)
+        short = path
+        if ctypes.windll.kernel32.GetShortPathNameW(path, buffer, 1024):
+            short = buffer.value or path
+        self.assertTrue(short and short.upper() != path.upper())
+        self.assertEqual(
+            os.path.abspath(delta_main._long_form(short)).lower(),
+            path.lower(),
+        )
 
 
 if __name__ == "__main__":

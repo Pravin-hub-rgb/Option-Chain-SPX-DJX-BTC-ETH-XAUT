@@ -3,8 +3,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from performance_metrics import PerformanceMetrics
-from startup_diagnostics import (
+from delta_performance import PerformanceMetrics
+from delta_diagnostics import (
     append_app_exception,
     append_connection_event,
     append_performance_summary,
@@ -58,7 +58,7 @@ class PerformanceMetricsTests(unittest.TestCase):
             with open(path, "w", encoding="utf-8") as log_file:
                 log_file.write("old log\n" + ("x" * (1024 * 1024)))
 
-            with patch.dict(os.environ, {"LOCALAPPDATA": temp}):
+            with patch.dict(os.environ, {"DELTA_OPTION_CHAIN_LOG_DIR": log_dir}):
                 append_performance_summary(["performance.interval_seconds=30.0"])
 
             with open(path + ".1", encoding="utf-8") as rotated:
@@ -68,7 +68,10 @@ class PerformanceMetricsTests(unittest.TestCase):
 
     def test_connection_transitions_are_recorded_without_workbook_values(self):
         with tempfile.TemporaryDirectory() as temp:
-            with patch.dict(os.environ, {"LOCALAPPDATA": temp}):
+            with patch.dict(
+                os.environ,
+                {"DELTA_OPTION_CHAIN_LOG_DIR": os.path.join(temp, "DeltaOptionChain")},
+            ):
                 append_connection_event("BTC", "connected", "workbook=C:\\Delta\\btc_chain.xlsx")
                 path = os.path.join(
                     temp, "DeltaOptionChain", "startup_diag.log"

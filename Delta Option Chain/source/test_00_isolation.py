@@ -22,15 +22,28 @@ import unittest
 
 class IsolationTests(unittest.TestCase):
     def test_delta_log_dir_override_is_honoured(self):
-        import main
-        self.assertEqual(_LOG_ROOT, main.FEED_LOG_DIR)
+        import delta_diagnostics
+        self.assertEqual(_LOG_ROOT, delta_diagnostics.FEED_LOG_DIR)
 
     def test_delta_log_dir_is_not_the_customer_directory(self):
-        import main
+        import delta_diagnostics
         self.assertNotEqual(
             os.path.join(os.environ.get("LOCALAPPDATA", "."), "DeltaOptionChain"),
-            main.FEED_LOG_DIR,
+            delta_diagnostics.FEED_LOG_DIR,
         )
+
+    def test_delta_app_exception_log_honours_the_override(self):
+        """app.log/startup diag writes used to bypass the override and leak
+        test noise into the customer's real app.log."""
+        import delta_diagnostics
+        self.assertEqual(
+            _LOG_ROOT,
+            delta_diagnostics._log_directory(),
+        )
+        exc = RuntimeError("isolation probe")
+        exc.__traceback__ = None
+        delta_diagnostics.append_app_exception("isolation probe", exc)
+        self.assertTrue(os.path.exists(os.path.join(_LOG_ROOT, "app.log")))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,163 @@
+DELTA OPTION CHAIN - CLIENT SETUP AND TROUBLESHOOTING
+====================================================
+
+BEFORE YOU START: RUN THE SELF-TEST
+------------------------------------
+Open a command prompt in this folder and run
+
+    python doctor.py
+
+It checks everything the tool needs - the activation key, the Delta
+Exchange connection, Excel, the three workbooks and the folder path - and
+prints a plain answer for each one. Run it first if anything is not working,
+and send the output to support.
+
+UNZIP TO A SHORT FOLDER
+-----------------------
+Put the package in a short folder such as C:\OptionChain. Excel stops
+opening a workbook somewhere past 128 characters and never returns, and a
+folder under your Downloads or Desktop can easily be that long. The symptom
+is the worst kind: the workbook never opens, the tool says "Excel is not
+running" while Excel is sitting right there, and the sheets stay empty.
+doctor.py tells you if your folder is too long.
+
+FIRST RUN
+---------
+1. Unzip the package to a short folder (for example C:\OptionChain).
+2. Double click delta_option_chain.exe.
+3. It asks for the ACTIVATION KEY. Enter the key you were given.
+   It is saved next to delta_option_chain.exe as license.json. Do not move
+   or delete that file, or you will be asked for the key again.
+4. Excel opens with three workbooks: btc_chain, eth_chain and xaut_chain.
+   Leave them open.
+
+WHAT EACH WORKBOOK DOES
+-----------------------
+One workbook per underlying: BTC, ETH and XAUT. Each one shows that
+underlying's option chain.
+
+Row 1 carries the index price and the put/call ratio. Row 3 carries the
+expiry for that block - edit the cell next to "Expiry 1" to pick a different
+expiry and press Enter. The cell colours show which strikes are in the
+money: green calls below the index, red puts above it, and the yellow row
+is the at-the-money strike.
+
+Open interest is official end-of-day OI, so it does not change during the
+session. Live bid, ask and last price do.
+
+IF THE SHEETS LOOK FROZEN OR SCROLLING STUTTERS
+------------------------------------------------
+1. Do not leave a cell in edit mode. If you have clicked into a cell and it
+   is in edit mode (the cursor is in the cell and the formula bar is
+   active), Excel will not let any other program write to it. Press Escape
+   or click a different cell.
+2. Close any Excel dialog that is open, including the "Data Connections"
+   or "Security Warning" prompts.
+3. Close third party Excel add-ins while you are trading with this tool.
+   A busy add-in stops Excel from accepting a calculation-mode change, and
+   every refresh then makes Excel recalculate your whole workbook.
+4. Close any other file that is called btc_chain.xlsx, eth_chain.xlsx or
+   xaut_chain.xlsx. Excel will not open two workbooks with the same name, so
+   the tool will use the copy you already have open - but it is cleaner to
+   have only one.
+
+HOW TO TELL IF IT IS WORKING
+----------------------------
+The workbook title bar shows:
+
+    BTC  |  Option Chain <build>  |  LIVE  19:42:03
+
+LIVE means data is arriving. If it says NO LIVE QUOTES the exchange is not
+sending quotes for that contract; the sheet still shows the ladder and the
+open interest.
+
+If it shows a recalc time, for example "recalc 340ms", that is how long
+YOUR OWN workbook took to recalculate after the tool updated the chain. If
+that number is large, your workbook is the slow part, not this tool.
+
+ONLY ONE COPY AT A TIME
+-----------------------
+Run one copy. If you start it again, the new one takes over from the old
+one by itself, so a second window never writes to the same sheets.
+
+If a second copy is already running and cannot be stopped, the new one says
+so and closes rather than both writing to the same workbooks.
+
+If Option Chain and the Delta Option Chain are both open in the same Excel,
+that is fine - each keeps its own workbooks. But only the one whose workbook
+is in front will appear to update while you are scrolling it.
+
+THE LOG FILE
+------------
+Everything the tool does is recorded in
+
+    %LOCALAPPDATA%\DeltaOptionChain\feed.log
+
+That is the file to send to support. It is a plain text file, one line per
+event, and it never contains your activation key.
+
+BUILDING STRATEGIES IN A SEPARATE WORKBOOK
+----------------------------------------
+A strategy workbook (calendar spreads, iron condors, ratio spreads, etc.)
+references the chain cells with lookup formulas.  Each Delta workbook shows one
+underlying (BTC, ETH, XAUT) in a single 9-column block:
+
+  Offset  Col  Meaning
+  +0      A    Call LTP
+  +1      B    Call Bid
+  +2      C    Call Ask
+  +3      D    Call OI
+  +4      E    Strike (lookup key)
+  +5      F    Put OI
+  +6      G    Put Bid
+  +7      H    Put Ask
+  +8      I    Put LTP
+
+When comparing two expiries side by side (e.g. near vs. far), Block 1 occupies
+columns A-I and Block 2 occupies columns L-T (spacer columns J-K hold the symbol
+input).  The strike column is E (Block 1) or P (Block 2).  Put Bid is G / R;
+Put Ask is H / S.
+
+BROKEN PATTERN — do not use this:
+  =VLOOKUP(E6, E5:H41, 4, FALSE) + VLOOKUP(E6, P5:S41, 3, FALSE)
+  =XLOOKUP(E6, Chain!P5:P33, Chain!R5:R33, "NA") + XLOOKUP(E6, Chain!E5:E41, Chain!H5:H41, "NA")
+
+Problems:
+  1. "NA" (text) default: number + "NA" = #VALUE!
+  2. 0 default: number + 0 = number — silently hides a missing leg
+  3. Range asymmetry: P5:P33 vs E5:E41 misses strikes beyond row 33
+  4. No guard that the strike exists in both expiries
+
+CORRECTED VLOOKUP (gross premium — sum both legs, missing leg = 0):
+  =IFNA(VLOOKUP(E6, E5:H41, 4, FALSE), 0) + IFNA(VLOOKUP(E6, P5:S41, 3, FALSE), 0)
+
+CORRECTED XLOOKUP (net credit/debit — require both legs):
+  =IF(AND(NOT(ISNA(XMATCH(E6,Chain!P5:P41,0))),NOT(ISNA(XMATCH(E6,Chain!E5:E41,0)))),
+     XLOOKUP(E6,Chain!P5:P41,Chain!R5:R41) + XLOOKUP(E6,Chain!E5:E41,Chain!H5:H41),
+     "strike not in both expiries")
+
+Key rules:
+  - Wrap each individual lookup with IFNA or IFERROR, never the whole sum
+  - Extend lookup ranges to P5:P41 / E5:E41 so no strikes are missed
+  - Strike and price cells are numeric floats; OI is also numeric in this tool
+  - "NA" as a default is always wrong for arithmetic — it returns #VALUE!
+
+FIXED ROW GEOMETRY FROM THIS BUILD ON
+-------------------------------------
+The chain block always occupies the same rows now: live strikes fill from
+row 5 down, and rows past the live strike count stay blank. The block grows
+its occupied depth only if an expiry ever brings MORE strikes than it has
+seen this session — it never shrinks. Two consequences for your formulas:
+
+  - A literal range such as E5:E260 keeps covering the live chain even when
+    the number of strikes changes expiry to expiry. Blank rows simply never
+    match the lookup, and an IFNA/0 default handles them as "missing".
+  - Old ranges written for a small expiry (P5:P41) keep covering the live
+    rows as long as the live count stays inside them — but for safety set
+    your ranges to the full depth of the block (down to row 260), so nothing
+    changes when a bigger expiry arrives.
+
+Also new: when your own strategy workbook uses many formulas, the tool
+stretches its refresh automatically so Excel gets idle time; you should feel
+less lag while typing, and the workbook title bar shows how long your own
+book took to recalculate.

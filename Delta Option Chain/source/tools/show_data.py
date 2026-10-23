@@ -1,5 +1,7 @@
-import asyncio, sys
-sys.path.insert(0, '.')
+import asyncio, os, sys
+
+# This tool lives in source/tools, so the product source is one level up.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import main as M
 
 async def run():
