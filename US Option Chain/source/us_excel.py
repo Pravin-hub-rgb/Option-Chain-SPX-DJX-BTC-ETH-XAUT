@@ -1274,14 +1274,18 @@ def _write_to_excel(role):
                 if prev_n is None or n_rows < prev_n:
                     first_sight = _FIRST_SIGHT_BOUND if prev_n is None else 0
                     last_row = max(n_rows, prev_n or 0, first_sight)
-                    stale_a = (
-                        f"{get_column_letter(c0)}{5 + n_rows}"
-                        f":{get_column_letter(c0 + 8)}{4 + last_row}"
-                    )
-                    try:
-                        sheet.range(stale_a).clear()
-                    except Exception as e:
-                        log_excel_exception(role, e, f"clearing stale rows in block {bi + 1}")
+                    if last_row > n_rows:
+                        # A reversed range (rows n..n-1) resolves to its
+                        # top-left and clips the wrong row, so only clear
+                        # when there is something below the live rows.
+                        stale_a = (
+                            f"{get_column_letter(c0)}{5 + n_rows}"
+                            f":{get_column_letter(c0 + 8)}{4 + last_row}"
+                        )
+                        try:
+                            sheet.range(stale_a).clear()
+                        except Exception as e:
+                            log_excel_exception(role, e, f"clearing stale rows in block {bi + 1}")
                 _last_rows[(role, bi)] = n_rows
                 _deep_clear_below_block(sheet, role, bi, c0, n_rows)
 
@@ -1391,10 +1395,9 @@ def _flush_block_writes(sheet, role, pending):
                 if protected:
                     if len(runs) == 1:
                         start, end = runs[0]
-                        sheet.range(
-                            (5 + start, block["start"]),
-                            (4 + end, block["start"] + 8),
-                        ).value = [list(r) for r in row_block[start : end + 1]]
+                        sheet.range((5 + start, block["start"])).value = [
+                            list(r) for r in row_block[start : end + 1]
+                        ]
                         _performance_metrics.record(
                             role, "excel_rows_written", 0.0, rows=end - start + 1
                         )
@@ -1418,10 +1421,7 @@ def _flush_block_writes(sheet, role, pending):
                                 merged_rows.append(list(prev[i]))
                             else:
                                 merged_rows.append(list(row_block[i]))
-                        sheet.range(
-                            (5 + lo, block["start"]),
-                            (4 + hi, block["start"] + 8),
-                        ).value = merged_rows
+                        sheet.range((5 + lo, block["start"])).value = merged_rows
                         _performance_metrics.record(
                             role, "excel_rows_written", 0.0, rows=hi - lo + 1
                         )

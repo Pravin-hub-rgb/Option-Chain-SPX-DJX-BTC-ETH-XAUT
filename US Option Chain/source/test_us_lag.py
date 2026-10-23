@@ -474,6 +474,21 @@ class AutoOpenLatchTests(unittest.TestCase):
             2,
         )
 
+    def test_chain_value_writes_anchor_at_row_five(self):
+        import inspect
+        import us_excel
+        src = inspect.getsource(us_excel._flush_block_writes)
+        self.assertIn("sheet.range((5 + start, block[\"start\"])).value = [", src)
+        self.assertIn("sheet.range((5 + lo, block[\"start\"])).value = merged_rows", src)
+        self.assertNotIn("(4 + end, block[\"start\"] + 8)", src)
+        self.assertNotIn("(4 + hi, block[\"start\"] + 8)", src)
+
+    def test_stale_clear_only_when_below_live_rows(self):
+        import inspect
+        import us_excel
+        src = inspect.getsource(us_excel._write_to_excel)
+        self.assertIn("if last_row > n_rows:", src)
+
     def test_latch_rearm_paths_exist(self):
         import inspect
         src = inspect.getsource(self.main._write_to_excel)
@@ -809,6 +824,7 @@ class CalcFlapGuardTests(unittest.TestCase):
         import us_state
         import us_excel
         import time
+        from unittest.mock import patch
 
         class FlippableApp:
             def __init__(self):
@@ -842,7 +858,12 @@ class CalcFlapGuardTests(unittest.TestCase):
         app = FlippableApp()
         us_state._calc_session.pop("owned", None)
         us_state._manual_since = time.time() - (us_state.MANUAL_WATCHDOG_SECONDS + 5)
-        us_excel.ensure_calculation_not_stranded(app)
+        # The sibling delta tool may genuinely be running on this machine while
+        # the tests run - the watchdog must stay environment-independent here.
+        with patch.object(
+            us_excel.calc_mode_guard, "other_holder_alive", return_value=False
+        ):
+            us_excel.ensure_calculation_not_stranded(app)
         self.assertEqual(app.mode, -4105)
         self.assertEqual(us_state._manual_since, 0.0)
 
@@ -1566,9 +1587,12 @@ class CalcShutdownSuppressionTests(unittest.TestCase):
         app.books = [book]
         app.api.Calculation = -4105
         us_state._app_cache = app
-        with patch.object(us_excel.calc_mode_guard, "acquire") as acquire:
-            with patch.object(us_excel.calc_mode_guard, "release") as release:
-                result = us_excel._begin_excel_bulk_mode(app)
+        with patch.object(
+            us_excel.calc_mode_guard, "other_holder_alive", return_value=False
+        ):
+            with patch.object(us_excel.calc_mode_guard, "acquire") as acquire:
+                with patch.object(us_excel.calc_mode_guard, "release") as release:
+                    result = us_excel._begin_excel_bulk_mode(app)
         self.assertIsNotNone(result)
         self.assertFalse(release.called)
         self.assertTrue(acquire.called)

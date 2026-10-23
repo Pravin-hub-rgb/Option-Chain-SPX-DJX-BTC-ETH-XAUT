@@ -185,7 +185,11 @@ class DeltaMergedBlockWriteTests(unittest.TestCase):
         sheet = _FakeSheet()
         self._flush(sheet, pending)
         top, left, bottom, right, grid = sheet.only_write
-        self.assertEqual((left, right), (1, 20))
+        # Top-left anchor: the payload carries the full merge width (the two
+        # corner form was removed because a degenerate run turned 5..4 into a
+        # row-4 stomp).
+        self.assertEqual((top, left), (5, 1))
+        self.assertEqual(len(grid[0]), self.delta_main.BLOCK_COLS[1]["start"] + 8)
         self.assertEqual(len(grid), 1)
         # Both blocks carry their current row, and the spacer columns between
         # them are blank rather than an old value.
@@ -198,17 +202,14 @@ class DeltaMergedBlockWriteTests(unittest.TestCase):
     def test_an_unchanged_block_is_never_written(self):
         values = [[1, 2, 3, 4, 5, 6, 7, 8, 9] for _ in range(4)]
         prev = [list(row) for row in values]
-        # Block 2 did not change, so it is never queued and its columns must
-        # not appear in the write at all.
-        pending = [
-            self._pending(0, values, prev, [(0, 0)]),
-            self._pending(1, values, prev, [(0, 0)]),
-        ]
+        # The writer only queues blocks that changed; the flush must then keep
+        # block 2's columns out of the write entirely.
+        pending = [self._pending(0, values, prev, [(0, 0)])]
         sheet = _FakeSheet()
         self._flush(sheet, pending)
         top, left, bottom, right, grid = sheet.only_write
-        self.assertLessEqual(right, 20)
-        self.assertEqual(right, self.delta_main.BLOCK_COLS[1]["start"] + 8)
+        self.assertEqual((top, left), (5, 1))
+        self.assertEqual(len(grid[0]), 9)
 
     def test_a_block_that_shrank_does_not_get_its_old_tail_back(self):
         # Block 0 went from five rows to two. Its previous rows 1..4 were
@@ -1093,6 +1094,21 @@ class AutoOpenRecoveryTests(unittest.TestCase):
             src.index("while len(active_expiries[asset]) <= i:"),
             src.index("active_expiries[asset][i] = tgt"),
         )
+
+    def test_chain_value_writes_anchor_at_row_five(self):
+        src = inspect.getsource(delta_main._flush_block_writes)
+        self.assertIn("sheet.range((5 + min_row, first_c)).value = grid", src)
+        self.assertIn("sheet.range((5 + start, block[\"start\"])).value = [", src)
+        self.assertIn("sheet.range((5 + lo, block[\"start\"])).value = merged_rows", src)
+        # Reversed two-corner ranges (row 5..4) resolve to their top-left
+        # and stomp the header row - they must not come back.
+        self.assertNotIn("(4 + max_row, last_c)", src)
+        self.assertNotIn("(4 + end, block[\"start\"] + 8)", src)
+        self.assertNotIn("(4 + hi, block[\"start\"] + 8)", src)
+
+    def test_stale_clear_only_when_below_live_rows(self):
+        src = inspect.getsource(delta_main._write_to_excel)
+        self.assertIn("if last_row > n_rows:", src)
 
     def test_find_open_book_matches_short_form_fullnames(self):
         src = inspect.getsource(delta_main.find_open_book)

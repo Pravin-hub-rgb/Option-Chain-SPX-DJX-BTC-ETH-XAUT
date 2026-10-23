@@ -12,7 +12,7 @@ one calendar day per request keeps every request under the gateway's limit.
 import unittest
 import os
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -59,31 +59,38 @@ class DropdownOrderTests(unittest.TestCase):
 
     def setUp(self):
         # Today is filtered out by the expiry rules, so use later dates.
+        # Relative to date.today() so the suite never ages out of green.
+        today = date.today()
         self.dates = [
-            "2026-11-20", "2026-10-23", "2026-12-18", "2026-10-27",
-            "2026-11-06", "2026-10-22",
+            (today + timedelta(days=29)).isoformat(),
+            (today + timedelta(days=1)).isoformat(),
+            (today + timedelta(days=49)).isoformat(),
+            (today + timedelta(days=5)).isoformat(),
+            (today + timedelta(days=17)).isoformat(),
+            (today + timedelta(days=3)).isoformat(),
         ]
 
     def test_by_date_is_nearest_first(self):
         ordered = main.available_expiries(self.dates, None, by_date=True)
         self.assertEqual(ordered, sorted(self.dates))
-        self.assertEqual(ordered[0], "2026-10-22")
+        self.assertEqual(ordered[0], (date.today() + timedelta(days=1)).isoformat())
 
     def test_default_order_is_nearest_first_too(self):
         """The three slots sit side by side, so they show three consecutive
         expiries: the dailies and weeklies next to each other, the way a
         trader watches them."""
+        nearest = self.dates[1]
         main.expiry_roots["SPX"] = {
-            "2026-11-20": {"SPX"},
-            "2026-12-18": {"SPX"},
-            "2026-10-23": {"SPXW"},
+            self.dates[0]: {"SPX"},
+            self.dates[2]: {"SPX"},
+            nearest: {"SPXW"},
         }
         try:
             ordered = main.available_expiries(self.dates, "SPX")
             self.assertEqual(ordered, sorted(self.dates))
-            self.assertEqual(ordered[0], "2026-10-22")
-            self.assertEqual(ordered[1], "2026-10-23")
-            self.assertEqual(ordered[2], "2026-10-27")
+            self.assertEqual(ordered[0], nearest)
+            self.assertEqual(ordered[1], self.dates[5])
+            self.assertEqual(ordered[2], self.dates[3])
         finally:
             main.expiry_roots.pop("SPX", None)
 

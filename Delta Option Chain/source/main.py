@@ -2024,10 +2024,7 @@ def _flush_block_writes(sheet, asset, pending):
                         # shrank must not have its old tail written back.
                         row[c_off : c_off + 9] = list(p["values"][r])
                 grid.append(row)
-            sheet.range(
-                (5 + min_row, first_c),
-                (4 + max_row, last_c),
-            ).value = grid
+            sheet.range((5 + min_row, first_c)).value = grid
             delta_state._cycle_wrote = True
         else:
             for bi, block, rows_block, n_rows, runs, prev in pending:
@@ -2035,10 +2032,9 @@ def _flush_block_writes(sheet, asset, pending):
                     if protected:
                         if len(runs) == 1:
                             start, end = runs[0]
-                            sheet.range(
-                                (5 + start, block["start"]),
-                                (4 + end, block["start"] + 8),
-                            ).value = [list(r) for r in rows_block[start : end + 1]]
+                            sheet.range((5 + start, block["start"])).value = [
+                                list(r) for r in rows_block[start : end + 1]
+                            ]
                         else:
                             sheet.range((5, block["start"])).options(
                                 index=False, header=False
@@ -2055,10 +2051,7 @@ def _flush_block_writes(sheet, asset, pending):
                                 merged_rows.append(list(prev[i]))
                             else:
                                 merged_rows.append(list(values[i]))
-                        sheet.range(
-                            (5 + lo, block["start"]),
-                            (4 + hi, block["start"] + 8),
-                        ).value = merged_rows
+                        sheet.range((5 + lo, block["start"])).value = merged_rows
                     else:
                         sheet.range((5, block["start"])).options(
                             index=False, header=False
@@ -2599,9 +2592,13 @@ def _write_to_excel(asset):
                         last_row = max(n_rows, prev_n or 0, first_sight)
                         if last_row < n_rows:
                             last_row = n_rows
-                        # Our own block columns only. The customer may keep
-                        # their own formulas in these rows further right.
-                        sheet.range(f"{cs}{5 + n_rows}:{ce}{4 + last_row}").clear()
+                        if last_row > n_rows:
+                            # Our own block columns only. The customer may keep
+                            # their own formulas in these rows further right.
+                            # A reversed range (rows n..n-1) resolves to its
+                            # top-left and clips the wrong row, so only clear
+                            # when there is something below the live rows.
+                            sheet.range(f"{cs}{5 + n_rows}:{ce}{4 + last_row}").clear()
                     except Exception as e:
                         log_excel_exception(asset, e, f"clearing stale rows in block {bi + 1}")
                 _last_rows[(asset, bi)] = n_rows
