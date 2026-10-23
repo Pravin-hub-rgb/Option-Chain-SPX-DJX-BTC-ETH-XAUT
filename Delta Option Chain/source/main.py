@@ -472,6 +472,24 @@ def open_excel_files():
     _open_excel_files()
 
 
+def _pump_com():
+    """Keep the display thread's COM apartment alive between cycles.
+
+    Excel proxies created by DispatchEx need their message queue pumped or
+    the marshaled connection dies underneath us: the very next cycle then
+    answers 'Object is not connected to server' for an Excel that is still
+    running, every attach fails, and the close-all timer ends the tool with
+    Excel right there on the screen. One cheap pump per display cycle keeps
+    the proxy healthy for the whole session.
+    """
+    try:
+        import pythoncom
+
+        pythoncom.PumpWaitingMessages()
+    except Exception:
+        pass
+
+
 def _ensure_owner_app(xw):
     """Return the tool's private Excel instance, creating it when needed.
 
@@ -3547,6 +3565,7 @@ async def display_loop():
                 print_chain(asset, chains_data[asset])
             print(f"Refreshing every {refresh}s | Press Ctrl+C to stop", flush=True)
         else:
+            _pump_com()
             # The chain lives in its private Excel instance, so the write pass
             # runs while that instance is alive - whichever other Excel
             # windows exist on the machine are none of this tool's business.

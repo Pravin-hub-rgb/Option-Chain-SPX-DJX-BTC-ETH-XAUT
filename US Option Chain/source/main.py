@@ -41,6 +41,19 @@ from us_state import (
 )
 
 async def main_async():
+    # The asyncio loop thread owns every COM call in this process (open pass,
+    # workbook finds, sheet writes). pywin32 needs one stable apartment for
+    # the whole session: the open pass CoInitialize/CoUninitialize pair would
+    # otherwise be the ONLY apartment reference in the thread, and its
+    # CoUninitialize would eject the Excel proxies the pass had just created
+    # - the writer then answered "Object is not connected to server" for a
+    # perfectly alive Excel half a second later.
+    try:
+        import pythoncom
+
+        pythoncom.CoInitialize()
+    except Exception:
+        pass
     for sym in active_symbols():
         ensure_sym_state(sym)
     open_excel_files()

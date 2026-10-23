@@ -414,6 +414,24 @@ def maybe_exit_after_close_all(excel_alive=None):
 _OPEN_RETRY_GRACE_SECONDS = 45.0
 
 
+def _pump_com():
+    """Keep the display thread's COM apartment alive between cycles.
+
+    Excel proxies created by DispatchEx need their message queue pumped or
+    the marshaled connection dies underneath us: the very next cycle then
+    answers 'Object is not connected to server' for an Excel that is still
+    running, every attach fails, and the close-all timer ends the tool with
+    Excel right there on the screen. One cheap pump per display cycle keeps
+    the proxy healthy for the whole session.
+    """
+    try:
+        import pythoncom
+
+        pythoncom.PumpWaitingMessages()
+    except Exception:
+        pass
+
+
 def retry_open_pass_after_grace():
     """Retry a wedged startup open pass once, on the display thread.
 
@@ -2249,6 +2267,7 @@ async def display_loop():
                 if not ensure_license():
                     os._exit(1)
         if is_windows:
+            _pump_com()
             # The chain lives in its private Excel instance, so the write pass
             # runs while that instance is alive - whichever other Excel
             # windows exist on the machine are none of this tool's business.

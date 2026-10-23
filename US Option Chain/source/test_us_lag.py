@@ -551,6 +551,30 @@ class AutoOpenLatchTests(unittest.TestCase):
         self.assertIn("tool_exit_close_all", src)
         self.assertIn("os._exit(0)", src)
 
+    def test_display_thread_owns_a_com_apartment(self):
+        """main_async must out-live the open pass's CoInit/CoUninit pair.
+
+        Without its own apartment on the display thread, the open pass's
+        CoUninitialize tears down the only apartment in the thread and
+        ejects the Excel proxies created inside it; the writer then saw
+        "Object is not connected to server" for Excel that was running,
+        nothing ever attached, and the close-all timer killed the tool.
+        """
+        import inspect
+        import main
+        src = inspect.getsource(main.main_async)
+        self.assertIn("pythoncom.CoInitialize()", src)
+        self.assertLess(
+            src.index("pythoncom.CoInitialize()"),
+            src.index("open_excel_files()"),
+        )
+
+    def test_display_loop_pumps_the_com_apartment(self):
+        import inspect
+        import us_excel
+        src = inspect.getsource(us_excel.display_loop)
+        self.assertIn("_pump_com()", src)
+
     def test_exact_book_match_normalizes_short_form_paths(self):
         import inspect
         import us_excel
