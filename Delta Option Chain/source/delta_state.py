@@ -179,10 +179,6 @@ excel_connected = {"BTC": False, "ETH": False, "XAUT": False}
 
 excel_miss_counts = {"BTC": 0, "ETH": 0, "XAUT": 0}
 
-excel_first_attempt = {"BTC": None, "ETH": None, "XAUT": None}
-
-excel_startup_notice_shown = {"BTC": False, "ETH": False, "XAUT": False}
-
 _auto_open_done = {"BTC": False, "ETH": False, "XAUT": False}
 
 _sheet_altered_notice = {"BTC": False, "ETH": False, "XAUT": False}
@@ -191,17 +187,24 @@ _excel_liveness_cache = None
 
 _bulk_owning_manual = False
 
-# Set by the writer once, after 90s of "Excel running but the chain workbook
-# never opened" - it re-runs the auto-open pass exactly one more time.
-_auto_open_rearm_started = False
+# The Excel instance this tool owns. Book finding, the calc session and the
+# miss bookkeeping work only inside it; no other Excel on the machine is
+# ever touched, so the two chain tools cannot interfere with each other.
+_owner_app = None
+_owner_hwnd = None
+
+# Workbook-attach bookkeeping: a failed COM enumeration is "unknown" for a
+# short TTL, never "missing"; `_missing_since` refreshes every cycle a
+# workbook is confirmed absent and drives the close-all exit.
+_enum_unknown = {}
+_missing_since = {}
+_all_gone_since = None
 
 _calc_state_probe = None
 
 _last_window_status = {}
 
 _SHORT_BUILD = None
-
-_workbook_missing = {}
 
 _manual_since = 0.0
 

@@ -1148,13 +1148,15 @@ class DeltaRefreshWidenTests(unittest.TestCase):
 
 
 class AutoOpenRecoveryTests(unittest.TestCase):
-    """A wedged Workbooks.Open must time out, log, and retry in a fresh Excel.
+    """A wedged Workbooks.Open must time out, log, and retry once.
 
     The startup open pass used to be one silent daemon thread: Workbooks.Open
     aimed at an Excel another tool owned (or whose controller died earlier)
     can block forever, the pass never reported anything, and the writer sat
     on "excel_running_workbook_not_found" for the whole session - the
-    customer sees a blank sheet that never fills.
+    customer sees a blank sheet that never fills. Every pass now runs inside
+    (or creates) the tool's private instance; the retry simply re-runs the
+    open once.
     """
 
     def test_open_pass_is_watchdog_gated(self):
@@ -1172,17 +1174,23 @@ class AutoOpenRecoveryTests(unittest.TestCase):
         self.assertIn("finished.set()", opener)
         self.assertIn("own_instance", opener)
 
-    def test_writer_rearms_open_once_when_excel_alive_no_book(self):
+    def test_writer_never_reopens_a_closed_workbook(self):
         writer = inspect.getsource(delta_main._write_to_excel)
-        self.assertIn("excel_auto_open_rearmed", writer)
-        self.assertIn("delta_state._auto_open_rearm_started", writer)
-        self.assertIn("open_excel_files()", writer)
-        # The rearm rides the Excel-alive-but-book-missing path, after the
-        # had-it-once notice branch.
-        self.assertLess(
-            writer.index("notice_workbook_missing(fname)"),
-            writer.index("excel_auto_open_rearmed"),
-        )
+        self.assertNotIn("excel_auto_open_rearmed", writer)
+        self.assertNotIn("delta_state._auto_open_rearm_started", writer)
+        self.assertNotIn("open_excel_files()", writer)
+        self.assertNotIn("os.startfile(", writer)
+        self.assertNotIn("notice_workbook_missing", writer)
+        self.assertNotIn("Microsoft Excel is open", writer)
+        # A busy Excel is "unknown", never "missing".
+        self.assertIn("excel_attach_unknown", writer)
+        self.assertIn("workbook_closed_by_customer", writer)
+
+    def test_open_pass_never_scans_foreign_excel(self):
+        opener = inspect.getsource(delta_main._open_excel_files)
+        self.assertNotIn("apps = list(xw.apps)", opener)
+        self.assertNotIn("apps[0]", opener)
+        self.assertIn("_ensure_owner_app", opener)
 
     def test_loop_thread_initializes_com_apartment(self):
         src = inspect.getsource(delta_main.main_async)
@@ -1224,13 +1232,11 @@ class AutoOpenRecoveryTests(unittest.TestCase):
         src = inspect.getsource(delta_main.find_open_book)
         self.assertIn("_long_form", src)
         self.assertIn("GetLongPathNameW", inspect.getsource(delta_main._long_form))
-        # Path match first, then the same-name fallback (Excel cannot hold
-        # two workbooks with the same name, so the open copy is the one to
-        # use - same policy as the US tool).
-        self.assertLess(
-            src.index("long_form == target_long"),
-            src.index("same_name = same_name or book"),
-        )
+        # Only the private instance is searched, and the match normalises
+        # the workbook's fullname through the Windows long-form API.
+        self.assertIn("_long_form(fullname).lower() == target_long", src)
+        self.assertNotIn("list(xw.apps)", src)
+        self.assertNotIn("same_name", src)
 
     def test_long_form_round_trips_short_paths(self):
         import ctypes

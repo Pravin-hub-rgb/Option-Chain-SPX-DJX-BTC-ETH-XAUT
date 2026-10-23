@@ -91,7 +91,6 @@ from delta_state import (
     _sheet_altered_notice,
     _sheet_cache,
     _usd_fmt_done,
-    _workbook_missing,
     active_expiries,
     active_expiries_dmy,
     available_dates,
@@ -99,9 +98,7 @@ from delta_state import (
     excel_connected,
     excel_fail_notice_shown,
     excel_fail_since,
-    excel_first_attempt,
     excel_miss_counts,
-    excel_startup_notice_shown,
     expiry_symbols,
     feed_state,
     last_spot_change,
@@ -489,6 +486,45 @@ def open_excel_files():
     threading.Thread(target=_watchdog, daemon=True).start()
 
 
+def _ensure_owner_app(xw):
+    """Return the tool's private Excel instance, creating it when needed.
+
+    Every chain workbook opens in this instance and nothing else attaches to
+    any other Excel. That is what makes the US and the Delta chains
+    independent on one machine: separate instances cannot contend over
+    calculation mode, cannot hand workbooks to each other, and a busy dialog
+    in one cannot block the other.
+    """
+    app = delta_state._owner_app
+    if app is not None:
+        try:
+            _ = app.version
+            return app
+        except Exception:
+            delta_state._owner_app = None
+            delta_state._owner_hwnd = None
+            delta_state._app_cache = None
+    try:
+        app = xw.App(visible=True)
+    except Exception as e:
+        print(f"Could not start Excel: {e}", flush=True)
+        return None
+    delta_state._owner_app = app
+    delta_state._app_cache = app
+    try:
+        delta_state._owner_hwnd = app.api.Hwnd
+    except Exception:
+        delta_state._owner_hwnd = None
+    try:
+        feed_log(
+            "excel_open_own_instance",
+            note="starting a private Excel instance for this tool only",
+        )
+    except Exception:
+        pass
+    return app
+
+
 def _open_excel_files(finished=None, own_instance=False):
     pythoncom = None
     app = None
@@ -503,27 +539,21 @@ def _open_excel_files(finished=None, own_instance=False):
     try:
         import xlwings as xw
 
-        try:
-            apps = list(xw.apps)
-        except Exception:
-            apps = []
-        try:
-            if own_instance:
-                # The first pass may still be wedged inside Workbooks.Open on
-                # some busy or orphaned Excel; the retry always creates a
-                # fresh instance of our own so the books land somewhere we
-                # can definitely reach.
-                started_excel = True
-                app = xw.App(visible=True)
-            else:
-                started_excel = not apps
-                app = apps[0] if apps else xw.App(visible=True)
-        except Exception as e:
-            print(f"Could not start Excel: {e}", flush=True)
+        # Nothing to choose between first pass and retry: both use (or
+        # create) the private instance. The retry simply catches a pass that
+        # died before the books made it into Excel.
+        app = _ensure_owner_app(xw)
+        if app is None:
+            show_error(
+                "Microsoft Excel could not be started.\n\n"
+                "Please make sure Excel is installed and works, then run "
+                "the chain again."
+            )
             if finished is not None:
                 finished.set()
             return
-        feed_log("excel_auto_open_started", apps=len(apps), own_instance=own_instance)
+        started_excel = True
+        feed_log("excel_auto_open_started", own_instance=True)
         for asset in ("BTC", "ETH", "XAUT"):
             path = os.path.join(delta_state.BASE_DIR, f"{asset.lower()}_chain.xlsx")
             if not os.path.exists(path):
@@ -1656,12 +1686,56 @@ async def date_loader():
 # customer is told once rather than on every cycle.
 
 
-def excel_apps_count(xw):
+_UNKNOWN_TTL_SECONDS = 10.0
+_unknown_logged_at = {}
+_CLOSE_ALL_EXIT_SECONDS = 75.0
+
+
+def _owner_alive():
+    """Cheap liveness probe on the tool's own Excel instance."""
+    app = delta_state._owner_app
+    if app is None:
+        return False
     try:
-        return len(list(xw.apps))
-    except Exception as e:
-        log_excel_exception("EXCEL", e, "enumerating Excel applications")
-        return -1
+        _ = app.version
+        return True
+    except Exception:
+        return False
+
+
+def maybe_exit_after_close_all(excel_alive=None):
+    """Exit like every application does: when all its windows are gone.
+
+    All three chain workbooks confirmed missing for a while means the
+    customer does not want the chain right now. The old behaviour kept the
+    exe alive and it then reopened workbooks behind the customer's back
+    while they were running the other chain tool - a zombie that kept the
+    popups alive too. The customer simply reruns the exe when they want the
+    chain again.
+    """
+    if excel_alive is False:
+        # No live Excel to write to at all: the private instance closes with
+        # its last workbook, so this is independent confirmation.
+        now = time.monotonic()
+        for asset in ("BTC", "ETH", "XAUT"):
+            delta_state._missing_since[asset] = now
+    if len(delta_state._missing_since) == 3:
+        now = time.monotonic()
+        if delta_state._all_gone_since is None:
+            delta_state._all_gone_since = now
+        elif now - delta_state._all_gone_since >= _CLOSE_ALL_EXIT_SECONDS:
+            feed_log(
+                "tool_exit_close_all",
+                note="every chain workbook is closed; the tool exits like any other app",
+            )
+            try:
+                calc_mode_guard.release(PRODUCT_ID)
+            except Exception:
+                pass
+            os._exit(0)
+    elif delta_state._all_gone_since is not None:
+        delta_state._all_gone_since = None
+        delta_state._missing_since.clear()
 
 
 
@@ -1731,6 +1805,19 @@ def _long_form(path):
 
 
 def find_open_book(xw, fname):
+    """Find the workbook inside the tool's PRIVATE Excel instance.
+
+    The chain books live in the instance the tool started itself (the owner,
+    see _ensure_owner_app), so scanning every Excel on the machine is not
+    only wasted work now - it was the loophole that let the two chain tools
+    open workbooks in each other's Excel and fight over calculation mode.
+    One chain tool, one Excel instance, no cross-searching.
+
+    When our instance is there but does not answer its workbook list (a
+    dialog is up, the instance is being torn down), the failure is recorded
+    as "unknown" and None returned: the caller must treat that as
+    unanswerable this cycle, never as a missing workbook.
+    """
     target = os.path.abspath(fname)
     target_long = _long_form(target).lower()
     target_name = os.path.basename(target).lower()
@@ -1738,37 +1825,26 @@ def find_open_book(xw, fname):
     if not excel_process_running():
         # Do not touch COM at all while Excel is gone.
         return None
-    try:
-        apps = list(xw.apps)
-    except Exception as e:
-        log_excel_exception(asset, e, "enumerating Excel applications")
+    app = delta_state._owner_app
+    if app is None:
         return None
-    same_name = None
-    for app in apps:
+    try:
+        books = list(app.books)
+    except Exception as e:
+        log_excel_exception(asset, e, "enumerating the tool's own Excel workbooks")
+        delta_state._enum_unknown[asset] = time.monotonic()
+        return None
+    for book in books:
         try:
-            books = list(app.books)
-        except Exception as e:
-            log_excel_exception(asset, e, "enumerating open Excel workbooks")
-            continue
-        for book in books:
-            try:
-                fullname = book.fullname
-            except Exception as e:
-                log_excel_exception(asset, e, "reading open workbook path")
-                continue
+            fullname = book.fullname
             base = os.path.basename(fullname).lower()
-            if base != target_name:
-                continue
-            long_form = _long_form(fullname).lower()
-            if long_form == target_long:
-                # Exact file, whatever form the path was opened in.
-                return book
-            if base == target_name:
-                # Excel refuses to open two workbooks with the same name, so
-                # this is the copy the customer can reach - use it rather
-                # than fight with it (same policy as the US tool).
-                same_name = same_name or book
-    return same_name
+        except Exception as e:
+            log_excel_exception(asset, e, "reading open workbook path")
+            continue
+        if base == target_name and _long_form(fullname).lower() == target_long:
+            # Exact file, whatever form the path was opened in.
+            return book
+    return None
 
 
 def _contiguous_runs(indices):
@@ -2095,13 +2171,8 @@ def invalidate_com_cache(asset=None):
 
 
 def excel_alive():
-    """True when at least one Excel instance is reachable."""
-    try:
-        import xlwings as xw
-        return bool(list(xw.apps))
-    except Exception as e:
-        log_excel_exception("ALL", e, "probing for running Excel")
-        return False
+    """True when the tool's private Excel instance is reachable."""
+    return _owner_alive()
 
 
 def setup_expiry_dropdown(sheet, asset):
@@ -2202,42 +2273,6 @@ def excel_environment_detail(book):
 
 
 
-def notice_workbook_missing(fname):
-    """Tell the user once when Excel is open but this workbook is not.
-
-    Without this the tool simply waits, and since it runs without a console the
-    customer sees nothing at all and assumes it has stopped working.
-
-    Tracked per workbook: all three are checked every cycle, so a global timer
-    would be reset by whichever books are still connected and the missing one
-    would never be reported.
-    """
-    now = time.monotonic()
-    entry = _workbook_missing.get(fname)
-    if entry is None:
-        _workbook_missing[fname] = [now, False]
-        return
-    # Excel may still be opening the workbooks it was just asked to open, so
-    # give it a moment before telling the user anything is wrong.
-    if entry[1] or now - entry[0] < 20:
-        return
-    entry[1] = True
-    try:
-        show_error(
-            "Microsoft Excel is open, but this workbook is not:\n\n"
-            f"{os.path.basename(fname)}\n\n"
-            "Open it from:\n"
-            f"{os.path.dirname(fname)}\n\n"
-            "OptionChain will start writing as soon as it is open."
-        )
-    except Exception as e:
-        print(f"Could not show workbook-missing notice: {e}", flush=True)
-
-
-def clear_workbook_missing_notice(fname):
-    _workbook_missing.pop(fname, None)
-
-
 def _write_to_excel(asset):
     try:
         import xlwings as xw
@@ -2269,83 +2304,48 @@ def _write_to_excel(asset):
                 _book_sheet_cache[asset] = book
                 _sheet_cache.pop(asset, None)
         if book is None:
-            apps_count = excel_apps_count(xw)
-            status = (
-                "excel_running_workbook_not_found"
-                if apps_count > 0
-                else "excel_not_found"
+            record_excel_connection(
+                asset,
+                "own_excel_running_workbook_not_found"
+                if _owner_alive() else "excel_not_found",
+                f"expected_workbook={fname}",
             )
-            record_excel_connection(asset, status, f"expected_workbook={fname}")
-            # No book means no window to retitle, so surface the state on any
-            # window we still hold, and say it in plain words.
-            held = _book_sheet_cache.get(asset)
-            message = (
-                f"OPEN {os.path.basename(fname)}"
-                if apps_count > 0
-                else "EXCEL IS CLOSED - reopen it"
-            )
-            if held is not None:
-                show_status(held, asset, "WAITING", message)
-            if apps_count > 0:
-                # Only tell the customer about a workbook we HAD working and
-                # have now lost. While Excel is starting, or right after a
-                # restart, Excel is up before the workbooks are, and a message
-                # then is simply wrong -- it fired on a machine that was
-                # opening them perfectly normally. If it never connected, the
-                # window title stays as the plain file name, which is the tell.
+            now = time.monotonic()
+            if now - delta_state._enum_unknown.get(asset, 0.0) < _UNKNOWN_TTL_SECONDS:
+                # Excel did not answer its workbook list this cycle (a dialog
+                # is up or the instance is being torn down). The truth is
+                # "unknown", never "missing": the session is kept and this
+                # cycle skipped. This is what ends the workbook-missing modal
+                # that used to refire every couple of minutes - a busy Excel
+                # is no longer an error state.
                 if excel_connected[asset]:
-                    notice_workbook_missing(fname)
-                    return
-                # Excel is alive but this chain workbook is not in it. The
-                # startup auto-open pass may be wedged inside Workbooks.Open
-                # on a busy or orphaned Excel - it never reports, never
-                # retries, and the customer waits on a blank sheet forever.
-                # One rearm per process re-runs the open pass; that pass now
-                # carries a watchdog that times out a dead Excel and retries
-                # in a fresh instance of its own.
-                now_wall = time.time()
-                if excel_first_attempt[asset] is None:
-                    excel_first_attempt[asset] = now_wall
-                elif (now_wall - excel_first_attempt[asset] > 90.0
-                      and not delta_state._auto_open_rearm_started):
-                    delta_state._auto_open_rearm_started = True
-                    feed_log(
-                        "excel_auto_open_rearmed",
-                        asset=asset,
-                        note="Excel is running but the chain workbook never opened; retrying the automatic open",
-                    )
-                    open_excel_files()
+                    logged_at = _unknown_logged_at.get(asset, 0.0)
+                    if now - logged_at > _UNKNOWN_TTL_SECONDS:
+                        _unknown_logged_at[asset] = now
+                        feed_log(
+                            "excel_attach_unknown",
+                            asset=asset,
+                            note="Excel did not answer this cycle; keeping the session",
+                        )
                 return
+            # A confirmed absence: the customer closed this workbook, and it
+            # stays closed. No reopen, no modal - just a log line and a kept
+            # hole until the workbook is open again or the tool exits.
             if excel_connected[asset]:
-                # Excel was connected and is now gone (closed by the customer,
-                # crashed, or restarting after an add-in prompt). Keep waiting
-                # for it to come back instead of quitting.
-                #
-                # This used to be `if excel_miss_counts[asset] >= 10:
-                # os._exit(0)`, which silently killed the EXE about 10 seconds
-                # after Excel went away. Nothing then rewrote the sheets even
-                # after the customer reopened Excel -- that was the reported
-                # "EXE writes nothing" behaviour. The miss counter is still
-                # tracked for diagnostics only.
-                excel_miss_counts[asset] += 1
-                return
-            if excel_first_attempt[asset] is None:
-                excel_first_attempt[asset] = time.time()
-            elif time.time() - excel_first_attempt[asset] > 90:
-                if not excel_startup_notice_shown.get(asset):
-                    excel_startup_notice_shown[asset] = True
-                    show_error(
-                        "Microsoft Excel is taking a long time to appear.\n\n"
-                        "The tool is still running and will start as soon as\n"
-                        "Excel is open with the chain workbooks.\n\n"
-                        "Open Excel and the three workbook files, then leave\n"
-                        "them open. No need to run anything else."
-                    )
+                excel_connected[asset] = False
+                _sheet_cache.pop(asset, None)
+                feed_log(
+                    "workbook_closed_by_customer",
+                    asset=asset,
+                    note="the chain workbook was closed; it stays closed",
+                )
+            delta_state._missing_since[asset] = now
             return
         excel_miss_counts[asset] = 0
-        clear_workbook_missing_notice(fname)
+        delta_state._enum_unknown.pop(asset, None)
+        _unknown_logged_at.pop(asset, None)
+        delta_state._missing_since.pop(asset, None)
         excel_connected[asset] = True
-        excel_startup_notice_shown[asset] = False
         show_status(book, asset, "LIVE")
         if _excel_connection_status.get(asset) != "connected":
             record_excel_connection(
@@ -2788,14 +2788,7 @@ def ensure_calculation_not_stranded(app=None):
     if app is None:
         app = delta_state._app_cache
     if app is None:
-        try:
-            import xlwings as xw
-            apps = list(xw.apps)
-            if apps:
-                app = apps[0]
-                delta_state._app_cache = app
-        except Exception:
-            pass
+        app = delta_state._owner_app
     if app is None:
         return
     try:
@@ -3086,12 +3079,9 @@ def _begin_excel_bulk_mode():
     try:
         app = delta_state._app_cache
         if app is None:
-            import xlwings as xw
-            apps = list(xw.apps)
-            if not apps:
-                return None
-            app = apps[0]
-            delta_state._app_cache = app
+            app = delta_state._owner_app
+        if app is None:
+            return None
         try:
             # xlwings.App has no .name; .version is the cheap liveness probe
             # that goes through to Excel and raises if the instance is gone.
@@ -3543,10 +3533,10 @@ async def display_loop():
                 print_chain(asset, chains_data[asset])
             print(f"Refreshing every {refresh}s | Press Ctrl+C to stop", flush=True)
         else:
-            # A dead/crashed Excel must never stop the chain. While Excel is
-            # gone we skip the COM pass and wait for it to be reopened, instead
-            # of letting the RPC failure propagate and kill the EXE.
-            excel_alive = excel_process_running()
+            # The chain lives in its private Excel instance, so the write pass
+            # runs while that instance is alive - whichever other Excel
+            # windows exist on the machine are none of this tool's business.
+            excel_alive = _owner_alive() or delta_state._owner_app is None
             if excel_alive:
                 if delta_state._excel_gone_logged:
                     # Excel came back with freshly opened, empty workbooks, so
@@ -3557,15 +3547,16 @@ async def display_loop():
                     _usd_fmt_done.clear()
                     _dropdown_sig.clear()
                     _colour_state.clear()
+                    _book_sheet_cache.clear()
+                    _sheet_cache.clear()
                     _last_excel_exception.clear()
                     print("Excel reopened - rewriting all sheets from scratch.", flush=True)
                 render_cycle()
             elif not delta_state._excel_gone_logged:
                 delta_state._excel_gone_logged = True
                 print(
-                    "Excel is not running - pausing writes until it is "
-                    "reopened. Open btc_chain, eth_chain and xaut_chain in "
-                    "Excel and the chain will start on its own.",
+                    "The chain Excel was closed. The tool stops on its own "
+                    "shortly - run it again when you want the chain back.",
                     flush=True,
                 )
                 _last_excel_exception.clear()
@@ -3575,6 +3566,11 @@ async def display_loop():
                 delta_state._calc_manual_failed = False
                 delta_state._calc_failed_since = 0.0
                 delta_state._app_cache = None
+                delta_state._owner_app = None
+                delta_state._owner_hwnd = None
+                _book_sheet_cache.clear()
+                _sheet_cache.clear()
+            maybe_exit_after_close_all(excel_alive=excel_alive)
             render_seconds = time.perf_counter() - render_started
             if render_seconds > float(refresh):
                 _performance_metrics.record(
@@ -3709,23 +3705,13 @@ def recover_calc_mode():
         return False
     print(f"  calculation-mode record found: {reason}", flush=True)
     try:
-        import xlwings as xw
-
-        # Retry briefly: Excel is often still registering itself in the running
-        # object table immediately after the workbooks are opened.
-        apps = []
-        for _ in range(10):
-            try:
-                apps = list(xw.apps)
-            except Exception:
-                apps = []
-            if apps:
-                break
-            time.sleep(0.5)
-        if not apps:
-            print("  calc recovery: no Excel instance reachable", flush=True)
+        # Recovery belongs to our private instance only. The old code scanned
+        # the running object table and switched calculation on apps[0] -
+        # whoever that happened to be, including the customer's own Excel.
+        app = delta_state._owner_app
+        if app is None:
+            print("  calc recovery: no private Excel instance yet", flush=True)
             return False          # keep the record so a later launch can retry
-        app = apps[0]
         raw = int(app.api.Calculation)
         if raw != calc_mode_guard.XL_MANUAL:
             print(f"  calc recovery: Excel is not on manual (raw={raw})", flush=True)

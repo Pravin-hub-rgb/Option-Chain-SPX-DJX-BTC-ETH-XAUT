@@ -20,6 +20,8 @@ from us_diagnostics import append_app_exception, feed_log
 from us_licensing import show_error
 from us_state import (
     _auto_open_done,
+    _owner_app,
+    _owner_hwnd,
     _template_ready,
     BASE_DIR,
     DEFAULT_SYMBOL,
@@ -309,37 +311,94 @@ def short_path(path):
     return path
 
 
+def _owner_book(app, path):
+    """The workbook inside the tool's own Excel instance, or None.
+
+    Only the exact file (path-insensitive the way Excel reports fullname,
+    short/long form both accepted) counts. Workbooks elsewhere - the customer's
+    Excel, the other chain tool's instance - are invisible on purpose: one
+    chain tool owns one Excel instance.
+    """
+    try:
+        from excel_helpers import long_form
+    except Exception:
+        return None
+    try:
+        target = long_form(os.path.abspath(path)).lower()
+    except Exception:
+        return None
+    try:
+        books = list(app.books)
+    except Exception:
+        return None
+    for book in books:
+        try:
+            candidate = long_form(os.path.abspath(book.fullname))
+        except Exception:
+            continue
+        if candidate.lower() == target:
+            return book
+    return None
+
+
+def _ensure_owner_app(xw):
+    """Return the tool's private Excel instance, creating it when needed.
+
+    Every chain workbook opens in this instance and nothing else attaches to
+    any other Excel. That is what makes the US and the Delta chains
+    independent on one machine: separate instances cannot contend over
+    calculation mode, cannot hand workbooks to each other, and a busy dialog
+    in one cannot block the other.
+    """
+    import us_state as _sts
+
+    app = _sts._owner_app
+    if app is not None:
+        try:
+            _ = app.version
+            return app
+        except Exception:
+            _sts._owner_app = None
+            _sts._owner_hwnd = None
+            _sts._app_cache = None
+    try:
+        app = xw.App(visible=True)
+    except Exception as e:
+        print(f"Could not start Excel: {e}", flush=True)
+        return None
+    _sts._owner_app = app
+    _sts._app_cache = app
+    try:
+        _sts._owner_hwnd = app.api.Hwnd
+    except Exception:
+        _sts._owner_hwnd = None
+    feed_log(
+        "excel_open_own_instance",
+        role="ALL",
+        note="starting a private Excel instance for this tool only",
+    )
+    return app
+
+
 AUTO_OPEN_TIMEOUT_SECONDS = 45.0
 
 
 def open_excel_files():
-    """Open the three workbooks in ONE Excel, and get on with the data.
+    """Open the three workbooks in the tool's own Excel, and get on with data.
 
-    Two things were wrong with the old way of doing this.
+    The chain keeps a PRIVATE Excel instance: the books are opened inside it
+    and nothing in the tool attaches to any other Excel on the machine. The
+    US chain and the Delta chain therefore never share an instance and cannot
+    hand workbooks to each other, whatever the customer is doing elsewhere.
 
-    It went through the Windows shell, which starts a SEPARATE Excel for
-    every workbook it is given. Three workbooks meant three Excel processes,
-    two of them quit, and the one that survived was never registered where
-    the tool can reach it. The tool then said "Excel is not running" while
-    Excel was sitting right there, and wrote nothing.
-
-    And it opened them through that same shell, so a package under a long
-    path never opened at all. Excel's Workbooks.Open gives up somewhere past
-    128 characters and never returns.
-
-    So: one Excel, opened through the API the tool writes with, using the
-    8.3 short name for a long path. Opening Excel can take a while on a
-    cold or busy machine, and the chain does not need Excel to be up first,
-    so the open runs on its own thread and the render loop picks the
-    workbooks up as soon as they are there.
-
-    The open pass is guarded now. Workbooks.Open aimed at an Excel this
-    process does not own - the Delta tool's instance, or one whose
-    controlling process died earlier - can block forever, because a busy
-    Excel answers automation by simply not answering. A dead-quiet daemon
-    thread and a blank sheet was the exact customer symptom, so a watchdog
-    times the pass out, logs it, and retries the missing workbooks in a
-    fresh Excel instance of our own.
+    An earlier version went through the Windows shell (one Excel per
+    workbook, ephemeral survivors) and later onto `apps[0]`, which was
+    whatever Excel happened to exist - the customer's, the other chain
+    tool's. Workbooks would land in an instance neither tool owned while the
+    writer attached to another, and both products fought over calculation
+    flags. A watchdog still retries the open pass once if the first attempt
+    goes nowhere, but every pass - first or retry - now uses (or creates)
+    the private instance.
     """
     if platform.system() != "Windows":
         return
@@ -352,7 +411,7 @@ def open_excel_files():
         feed_log(
             "excel_auto_open_timeout",
             note=(f"chain workbooks still not open after {int(AUTO_OPEN_TIMEOUT_SECONDS)}s; "
-                  "retrying once in a separate Excel instance"),
+                  "retrying the open pass once"),
         )
         retry_done = threading.Event()
         threading.Thread(target=_open_excel_files, args=(retry_done, True), daemon=True).start()
@@ -361,11 +420,31 @@ def open_excel_files():
             if not retry_done.wait(AUTO_OPEN_TIMEOUT_SECONDS):
                 feed_log(
                     "excel_auto_open_retry_timeout",
-                    note="the retry Excel instance also did not finish; waiting for the customer to open the workbooks",
+                    note="the retry open pass also did not finish; waiting for the customer",
                 )
         threading.Thread(target=_retry_watchdog, daemon=True).start()
 
     threading.Thread(target=_watchdog, daemon=True).start()
+
+
+def _close_empty_book1(app):
+    """Close the empty Book1 a fresh Excel instance always starts with.
+
+    Only the tool's own instance is touched, and only when the book is empty:
+    a customer who has their own Book1 open with work in it must never have
+    it closed underneath them.
+    """
+    try:
+        for book in list(app.books):
+            if book.name.strip().lower() != "book1":
+                continue
+            try:
+                if book.sheets[0].range("A1").value is None:
+                    book.close()
+            except Exception:
+                continue
+    except Exception:
+        pass
 
 
 def _open_excel_files(finished=None, own_instance=False):
@@ -376,31 +455,23 @@ def _open_excel_files(finished=None, own_instance=False):
     except Exception:
         pythoncom = None
     app = None
-    started_excel = False
     try:
         import xlwings as xw
 
-        try:
-            apps = list(xw.apps)
-        except Exception:
-            apps = []
-        try:
-            if own_instance:
-                # The first pass may still be wedged inside Workbooks.Open on
-                # some busy or orphaned Excel; the retry always creates a
-                # fresh instance of our own so the books land somewhere we
-                # can definitely reach.
-                started_excel = True
-                app = xw.App(visible=True)
-            else:
-                started_excel = not apps
-                app = apps[0] if apps else xw.App(visible=True)
-        except Exception as e:
-            print(f"Could not start Excel: {e}", flush=True)
+        # Nothing to choose between first pass and retry: both use (or
+        # create) the private instance. The retry simply catches a pass that
+        # died before the books made it into Excel.
+        app = _ensure_owner_app(xw)
+        if app is None:
+            show_error(
+                "Microsoft Excel could not be started.\n\n"
+                "Please make sure Excel is installed and works, then run "
+                "the chain again."
+            )
             if finished is not None:
                 finished.set()
             return
-        feed_log("excel_auto_open_started", apps=len(apps), own_instance=own_instance)
+        feed_log("excel_auto_open_started", own_instance=True)
         for role in ROLE_ORDER:
             path = excel_path(role)
             try:
@@ -408,13 +479,10 @@ def _open_excel_files(finished=None, own_instance=False):
             except Exception as e:
                 print(f"ensure_excel_file failed ({role}): {e}", flush=True)
             try:
-                # Lazy import: us_excel imports this module, so importing it
-                # at the top would be a circle.
-                from us_excel import find_open_book
-
-                if find_open_book(xw, path) is not None:
-                    # Already open - the customer opened it themselves, so the
-                    # tool must never open it again behind their back.
+                if _owner_book(app, path) is not None:
+                    # Already open in our instance - the customer reopened a
+                    # chain book from the same folder, so the tool must not
+                    # open a second copy.
                     _auto_open_done[role] = True
                     feed_log("excel_auto_open_done", role=role, via="already_open")
                     continue
@@ -440,30 +508,10 @@ def _open_excel_files(finished=None, own_instance=False):
         if finished is not None:
             finished.set()
     finally:
-        if started_excel:
+        if app is not None:
             _close_empty_book1(app)
         if pythoncom is not None:
             try:
                 pythoncom.CoUninitialize()
             except Exception:
                 pass
-
-
-def _close_empty_book1(app):
-    """Close the empty Book1 Excel always starts with.
-
-    Only when this process started Excel, and only when the book is empty:
-    a customer who has their own Book1 open with work in it must never have
-    it closed underneath them.
-    """
-    try:
-        for book in list(app.books):
-            if book.name.strip().lower() != "book1":
-                continue
-            try:
-                if book.sheets[0].range("A1").value is None:
-                    book.close()
-            except Exception:
-                continue
-    except Exception:
-        pass

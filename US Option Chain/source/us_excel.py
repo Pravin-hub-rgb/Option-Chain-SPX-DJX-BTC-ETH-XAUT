@@ -39,8 +39,7 @@ from us_workbook import (
     excel_path, get_column_letter, is_locked_role,
 )
 from excel_helpers import (
-    find_book_and_app_in_apps, find_book_by_name_in_apps, refresh_delay,
-    reopen_due, workbook_name_is_open_in_apps, workbook_name_open_anywhere_in_apps,
+    long_form, refresh_delay,
 )
 from us_diagnostics import (
     append_app_exception, append_connection_event, excel_process_details, feed_log,
@@ -108,13 +107,11 @@ def log_excel_exception(role, exc, context="Excel/COM update"):
 
 excel_connected = {r: False for r in ROLE_ORDER}
 excel_miss_counts = {r: 0 for r in ROLE_ORDER}
-excel_first_attempt = {r: None for r in ROLE_ORDER}
-_excel_startup_notice_shown = {r: False for r in ROLE_ORDER}
-_reopen_after = {r: 0.0 for r in ROLE_ORDER}
-# Set once the tool has asked Excel to open a workbook. After that it never
-# asks again: a customer who closes the workbook must not watch it pop back
-# up. Re-armed only if the file itself disappears, so a deleted workbook can
-# still be recreated and opened.
+# Refreshed each cycle during which Excel could not answer its workbook list
+# (dialog up, instance being torn down). Within the TTL the attach state is
+# "unknown", not "missing".
+_UNKNOWN_TTL_SECONDS = 10.0
+_unknown_logged_at = {}
 
 
 _last_window_status = {}
@@ -286,12 +283,16 @@ def show_status(book, role, status, detail=""):
         log_excel_exception(role, e, "setting window status")
 
 
-def excel_apps_count(xw):
+def _owner_alive():
+    """Cheap liveness probe on the tool's own Excel instance."""
+    app = us_state._owner_app
+    if app is None:
+        return False
     try:
-        return len(list(xw.apps))
-    except Exception as e:
-        log_excel_exception("EXCEL", e, "enumerating Excel applications")
-        return -1
+        _ = app.version
+        return True
+    except Exception:
+        return False
 
 
 def excel_process_running(max_age=2.0):
@@ -330,70 +331,84 @@ def excel_process_running(max_age=2.0):
 
 
 def find_open_book(xw, fname):
-    target = os.path.abspath(fname).lower()
+    """Find the workbook inside the tool's PRIVATE Excel instance.
+
+    The chain books live in the instance the tool started itself (the owner,
+    see us_workbook._ensure_owner_app), so scanning every Excel on the
+    machine is not only wasted work now - it was the loophole that let the
+    two chain tools open workbooks in each other's Excel and fight over
+    calculation mode. One chain tool, one Excel instance, no cross-search.
+
+    When our instance is there but does not answer its workbook list (a
+    dialog is up, the instance is being torn down), the failure is recorded
+    as "unknown" and None returned: the caller must treat that as
+    unanswerable this cycle, never as a missing workbook.
+    """
+    target = os.path.abspath(fname)
     role = next(
-        (candidate for candidate, file_name in ROLE_FILES.items() if file_name.lower() in target),
+        (candidate for candidate, file_name in ROLE_FILES.items() if file_name.lower() in target.lower()),
         "unknown",
     )
-    if not excel_process_running():
-        # Do not touch COM at all while Excel is gone.
+    app = us_state._owner_app
+    if app is None:
         return None
     try:
-        apps = list(xw.apps)
+        books = list(app.books)
     except Exception as e:
-        log_excel_exception(role, e, "enumerating Excel applications")
+        log_excel_exception(role, e, "enumerating the tool's own Excel workbooks")
+        us_state._enum_unknown[role] = time.monotonic()
         return None
-    book, _app = find_book_and_app_in_apps(
-        apps,
-        target,
-        lambda exc, context: log_excel_exception(role, exc, context),
-    )
-    if book is not None:
-        return book
-    # The customer may already have this workbook open from a different folder
-    # (an old install, a copy they made, the source tree). Excel will not open
-    # a second workbook with the same name, so opening our own copy fails and
-    # leaves the tool unable to write anything. Use the copy that is already
-    # open — it is the same product, and it is the one on their screen.
-    book, _app = find_book_by_name_in_apps(
-        apps,
-        fname,
-        lambda exc, context: log_excel_exception(role, exc, context),
-    )
-    if book is not None:
+    try:
+        target_form = long_form(target).lower()
+    except Exception:
+        target_form = target.lower()
+    for book in books:
         try:
-            record_excel_connection(
-                role,
-                "attached_to_open_copy_elsewhere",
-                f"using={book.fullname} expected={os.path.abspath(fname)}",
-            )
-            feed_log(
-                "workbook_attached_elsewhere",
-                role=role,
-                using=book.fullname,
-                expected=os.path.abspath(fname),
-            )
-        except Exception:
-            pass
-    return book
+            candidate = long_form(os.path.abspath(book.fullname)).lower()
+        except Exception as e:
+            log_excel_exception(role, e, "reading open workbook path")
+            continue
+        if candidate == target_form:
+            return book
+    return None
 
 
-def any_book_named(xw, fname):
-    """True if the exact workbook path is open in any reachable Excel app.
+_CLOSE_ALL_EXIT_SECONDS = 75.0
 
-    If an Excel instance cannot be inspected, defer reopening for this cycle
-    rather than risk opening a duplicate workbook.
+
+def maybe_exit_after_close_all(excel_alive=None):
+    """Exit like every application does: when all its windows are gone.
+
+    All three chain workbooks confirmed missing for a while means the
+    customer does not want the chain right now. The old behaviour kept the
+    exe alive and it then reopened workbooks behind the customer's back
+    while they were running the other chain tool - a zombie that kept the
+    popups alive too. The customer simply reruns the exe when they want the
+    chain again.
     """
-    try:
-        apps = list(xw.apps)
-    except Exception as e:
-        log_excel_exception("EXCEL", e, "enumerating Excel applications before reopen")
-        return True
-    return workbook_name_is_open_in_apps(
-        apps,
-        fname,
-        lambda exc, context: log_excel_exception("EXCEL", exc, context),
-    )
+    if excel_alive is False:
+        # No live Excel to write to at all: the private instance closes with
+        # its last workbook, so this is independent confirmation.
+        now = time.monotonic()
+        for role in ROLE_ORDER:
+            us_state._missing_since[role] = now
+    if len(us_state._missing_since) == len(ROLE_ORDER):
+        now = time.monotonic()
+        if us_state._all_gone_since is None:
+            us_state._all_gone_since = now
+        elif now - us_state._all_gone_since >= _CLOSE_ALL_EXIT_SECONDS:
+            feed_log(
+                "tool_exit_close_all",
+                note="every chain workbook is closed; the tool exits like any other app",
+            )
+            try:
+                calc_mode_guard.release(PRODUCT_ID)
+            except Exception:
+                pass
+            os._exit(0)
+    elif us_state._all_gone_since is not None:
+        us_state._all_gone_since = None
+        us_state._missing_since.clear()
 
 
 def update_expiry_dropdowns(sym, sheet):
@@ -773,47 +788,6 @@ def force_usd_block_formats(sheet, block, n_rows):
                     log_excel_exception("EXCEL", e, f"writing open-interest column {c0 + off}")
 
 
-_workbook_missing = {}  # path -> [first_seen_monotonic, already_notified]
-
-
-def notice_workbook_missing(fname):
-    """Tell the user once when Excel is open but this workbook is not.
-
-    Without this the tool simply waits, and since it runs without a console the
-    customer sees nothing at all and assumes it has stopped working.
-
-    Tracked per workbook: all three are checked every cycle, so a global timer
-    would be reset by whichever books are still connected and the missing one
-    would never be reported.
-    """
-    now = time.monotonic()
-    entry = _workbook_missing.get(fname)
-    if entry is None:
-        _workbook_missing[fname] = [now, False]
-        return
-    # Excel may still be opening the workbooks it was just asked to open, so
-    # give it a moment before telling the user anything is wrong.
-    if entry[1] or now - entry[0] < 20:
-        return
-    entry[1] = True
-    try:
-        show_error(
-            "Microsoft Excel is open, but this workbook is not:\n\n"
-            f"{os.path.basename(fname)}\n\n"
-            "Expected in:\n"
-            f"{os.path.dirname(fname)}\n\n"
-            "Open it from there and the tool will start writing again.\n\n"
-            "If a copy of the same file is open in another folder, close that "
-            "one first - Excel will not open two workbooks with the same name."
-        )
-    except Exception as e:
-        print(f"Could not show workbook-missing notice: {e}", flush=True)
-
-
-def clear_workbook_missing_notice(fname):
-    _workbook_missing.pop(fname, None)
-
-
 def _write_to_excel(role):
     try:
         import xlwings as xw
@@ -846,129 +820,47 @@ def _write_to_excel(role):
                 _sheet_cache.pop(role, None)
         if book is None:
             forget_workbook_formatting(path)
-            # If the file itself has gone, allow one more open: it was
-            # recreated from the template, so the customer still needs to see
-            # it. If the file is still there, they closed it on purpose and
-            # we leave it closed.
-            if not os.path.exists(path):
-                _auto_open_done[role] = False
-            apps_count = excel_apps_count(xw)
-            status = (
-                "excel_running_workbook_not_found"
-                if apps_count > 0
-                else "excel_not_found"
+            record_excel_connection(
+                role,
+                "own_excel_running_workbook_not_found" if _owner_alive() else "excel_not_found",
+                f"expected_workbook={path}",
             )
-            record_excel_connection(role, status, f"expected_workbook={path}")
-            message = (
-                f"OPEN {os.path.basename(path)}"
-                if apps_count > 0
-                else "EXCEL IS CLOSED - reopen it"
-            )
-            if apps_count > 0:
-                now = time.monotonic()
-                # Never ask Excel to open a second workbook with a name it
-                # already has open. Excel answers that with a modal "cannot
-                # open two workbooks with the same name" dialog, and the tool
-                # used to put that dialog up every twenty seconds for hours.
-                # The open copy is used instead (see find_open_book).
-                same_name_open = False
-                try:
-                    same_name_open = workbook_name_open_anywhere_in_apps(
-                        list(xw.apps),
-                        path,
-                        lambda exc, context: log_excel_exception(
-                            role, exc, context
-                        ),
-                    )
-                except Exception as e:
-                    log_excel_exception(role, e, "checking for a same-named workbook")
-                if same_name_open:
-                    record_excel_connection(
-                        role,
-                        "same_name_open_elsewhere",
-                        f"expected_workbook={path}",
-                    )
-                # The one-shot reopen below can still end up nowhere - a
-                # startup Workbooks.Open wedged on a busy Excel, or a
-                # startfile handed to an instance nobody answers. The tool
-                # stays on a blank sheet forever that way. Long after the
-                # first reopen fired, allow exactly one more attempt.
-                if (
-                    _auto_open_done.get(role)
-                    and not same_name_open
-                    and not us_state._auto_open_rearm_used.get(role)
-                    and not any_book_named(xw, path)
-                    and now - _reopen_after[role] > us_state._AUTO_OPEN_REARM_SECONDS
-                ):
-                    us_state._auto_open_rearm_used[role] = True
-                    _auto_open_done[role] = False
-                    feed_log(
-                        "excel_auto_open_rearmed",
-                        role=role,
-                        note="workbook still not open long after the first reopen; retrying once",
-                    )
-                if (
-                    reopen_due(now, _reopen_after[role])
-                    and not any_book_named(xw, path)
-                    and not same_name_open
-                    and not _auto_open_done.get(role)
-                ):
-                    _reopen_after[role] = now
-                    # Open it once, then leave it alone.
-                    #
-                    # Reopening on a timer meant that a customer who closed
-                    # the workbook - or closed Excel - watched it pop back up
-                    # every twenty seconds, and each attempt could put Excel's
-                    # "cannot open two workbooks with the same name" dialog
-                    # on screen. One attempt, then we wait for the customer.
-                    _auto_open_done[role] = True
-                    try:
-                        os.startfile(path)
-                        record_excel_connection(
-                            role, "workbook_reopen_requested", f"path={path}"
-                        )
-                    except OSError as e:
-                        log_excel_exception(role, e, "reopening missing workbook")
-                        try:
-                            append_app_exception(f"reopening {role} workbook", e)
-                        except OSError as log_error:
-                            print(
-                                f"Could not log workbook reopen failure ({role}): {log_error}",
-                                flush=True,
-                            )
+            now = time.monotonic()
+            if now - us_state._enum_unknown.get(role, 0.0) < _UNKNOWN_TTL_SECONDS:
+                # Excel did not answer its workbook list this cycle (a dialog
+                # is up or the instance is being torn down). The truth is
+                # "unknown", never "missing": the session is kept and this
+                # cycle skipped. This is what ends the workbook-missing modal
+                # that used to refire every couple of minutes - a busy Excel
+                # is no longer an error state.
                 if excel_connected[role]:
-                    notice_workbook_missing(path)
+                    logged_at = _unknown_logged_at.get(role, 0.0)
+                    if now - logged_at > _UNKNOWN_TTL_SECONDS:
+                        _unknown_logged_at[role] = now
+                        feed_log(
+                            "excel_attach_unknown",
+                            role=role,
+                            note="Excel did not answer this cycle; keeping the session",
+                        )
                 return
+            # A confirmed absence: the customer closed this workbook, and it
+            # stays closed. No reopen, no modal - just a log line and a kept
+            # hole until the workbook is open again or the tool exits.
             if excel_connected[role]:
-                # Excel was connected and is now gone (closed by the customer,
-                # crashed, or restarting after an add-in prompt). Keep waiting
-                # for it to come back instead of quitting.
-                #
-                # This used to be `if excel_miss_counts[role] >= 10:
-                # os._exit(0)`, which silently killed the EXE about 10 seconds
-                # after Excel went away, so nothing rewrote the sheets even
-                # after the customer reopened Excel. The miss counter is now
-                # tracked for diagnostics only.
-                excel_miss_counts[role] += 1
-                return
-            if excel_first_attempt[role] is None:
-                excel_first_attempt[role] = time.time()
-            elif time.time() - excel_first_attempt[role] > 90:
-                if not _excel_startup_notice_shown.get(role):
-                    _excel_startup_notice_shown[role] = True
-                    show_error(
-                        "Microsoft Excel is taking a long time to appear.\n\n"
-                        "The tool is still running and will start as soon as\n"
-                        "Excel is open with the chain workbooks.\n\n"
-                        "Open Excel and the three workbook files, then leave\n"
-                        "them open. No need to run anything else."
-                    )
+                excel_connected[role] = False
+                _sheet_cache.pop(role, None)
+                feed_log(
+                    "workbook_closed_by_customer",
+                    role=role,
+                    note="the chain workbook was closed; it stays closed",
+                )
+            us_state._missing_since[role] = now
             return
         excel_miss_counts[role] = 0
-        _reopen_after[role] = 0.0
-        clear_workbook_missing_notice(path)
+        us_state._enum_unknown.pop(role, None)
+        _unknown_logged_at.pop(role, None)
+        us_state._missing_since.pop(role, None)
         excel_connected[role] = True
-        _excel_startup_notice_shown[role] = False
         show_status(book, role, "LIVE")
         if _excel_connection_status.get(role) != "connected":
             try:
@@ -2096,14 +1988,9 @@ def _begin_excel_bulk_mode(app=None):
         if app is None:
             app = us_state._app_cache
         if app is None:
-            import xlwings as xw
-            for role in ROLE_ORDER:
-                book = find_open_book(xw, excel_path(role))
-                if book is not None:
-                    app = book.app
-                    break
-            if app is None:
-                return None
+            app = us_state._owner_app
+        if app is None:
+            return None
         us_state._app_cache = app
         try:
             # xlwings.App has no .name; .version is the cheap liveness probe
@@ -2295,25 +2182,23 @@ def _begin_excel_bulk_mode(app=None):
 
 def bulk_app():
     """Resolve the Excel App COM object to use for bulk mode, caching it."""
-    try:
-        import xlwings as _xw
-    except ImportError:
-        return None
     if us_state._app_cache is not None:
         try:
             _ = us_state._app_cache.version
             return us_state._app_cache
         except Exception:
             us_state._app_cache = None
+    app = us_state._owner_app
+    if app is None:
+        return None
     try:
-        for role in ROLE_ORDER:
-            book = find_open_book(_xw, excel_path(role))
-            if book is not None:
-                us_state._app_cache = book.app
-                return us_state._app_cache
-    except Exception as e:
-        log_excel_exception("ALL", e, "resolving bulk-mode app")
-    return None
+        _ = app.version
+        us_state._app_cache = app
+        return app
+    except Exception:
+        us_state._owner_app = None
+        us_state._owner_hwnd = None
+        return None
 
 
 async def display_loop():
@@ -2335,11 +2220,10 @@ async def display_loop():
                 if not ensure_license():
                     os._exit(1)
         if is_windows:
-            # A dead/crashed Excel must never stop the chain. Each role is
-            # isolated, and while Excel is gone we skip the COM pass entirely
-            # and wait for the customer to reopen it. Previously the RPC failure
-            # propagated and killed the EXE, after which nothing wrote at all.
-            excel_alive = excel_process_running()
+            # The chain lives in its private Excel instance, so the write pass
+            # runs while that instance is alive - whichever other Excel
+            # windows exist on the machine are none of this tool's business.
+            excel_alive = _owner_alive() or us_state._owner_app is None
             if excel_alive:
                 if us_state._excel_gone_logged:
                     # Excel came back. Everything cached about the sheets is now
@@ -2354,8 +2238,9 @@ async def display_loop():
                     _usd_fmt_done.clear()
                     _dropdown_sig.clear()
                     us_state._app_cache = None
-                    for role in ROLE_ORDER:
-                        _reopen_after[role] = 0.0
+                    _book_sheet_cache.clear()
+                    _sheet_cache.clear()
+                    us_state._missing_since.clear()
                     print("Excel reopened - rewriting all sheets from scratch.", flush=True)
                     _last_excel_exception.clear()
 
@@ -2364,10 +2249,8 @@ async def display_loop():
             elif not us_state._excel_gone_logged:
                 us_state._excel_gone_logged = True
                 print(
-                    "Excel is not running - pausing writes until it is "
-                    "reopened. Open spx_option_chain, djx_option_chain and "
-                    "us_stock_option_chain in Excel and the chain will "
-                    "start on its own.",
+                    "The chain Excel was closed. The tool stops on its own "
+                    "shortly - run it again when you want the chain back.",
                     flush=True,
                 )
                 _last_excel_exception.clear()
@@ -2384,10 +2267,15 @@ async def display_loop():
                 us_state._calc_failed_at = 0.0
                 us_state._bulk_will_recalc = False
                 us_state._app_cache = None
+                us_state._owner_app = None
+                us_state._owner_hwnd = None
+                _book_sheet_cache.clear()
+                _sheet_cache.clear()
                 try:
                     calc_mode_guard.release(PRODUCT_ID)
                 except Exception:
                     pass
+            maybe_exit_after_close_all(excel_alive=excel_alive)
             render_seconds = time.perf_counter() - render_started
             _performance_metrics.record("ALL", "render_cycle", render_seconds)
             if render_seconds > REFRESH:

@@ -128,10 +128,19 @@ _auto_open_done = {r: False for r in ROLE_ORDER}
 # Set when a workbook's layout no longer matches what the tool writes to.
 _sheet_altered = {r: False for r in ROLE_ORDER}
 
-# One extra auto-reopen attempt per role, long after the first one fired -
-# the escape hatch for a startup open that went nowhere.
-_auto_open_rearm_used = {r: False for r in ROLE_ORDER}
-_AUTO_OPEN_REARM_SECONDS = 180.0
+# The Excel instance this tool owns. Nothing else in the module attaches to
+# any other Excel: workbook finding, calculation mode and the save-prompt
+# answerer all work solely inside it.
+_owner_app = None
+_owner_hwnd = None
+
+# Workbook-attach bookkeeping. A failed COM enumeration means "unknown, try
+# again next cycle", never "the workbook is missing"; `_missing_since`
+# refreshes each cycle a workbook is confirmed absent and drives the
+# close-all exit.
+_enum_unknown = {}
+_missing_since = {}
+_all_gone_since = None
 
 _SHORT_BUILD = None
 

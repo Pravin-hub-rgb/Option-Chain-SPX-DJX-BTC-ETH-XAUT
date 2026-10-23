@@ -439,7 +439,10 @@ class AutoOpenLatchTests(unittest.TestCase):
     The tool used to call os.startfile on a timer whenever it could not find
     its workbook. A customer who closed the workbook - or closed Excel - watched
     it reappear every twenty seconds, and each attempt could put Excel's
-    "cannot open two workbooks with the same name" dialog on screen.
+    "cannot open two workbooks with the same name" dialog on screen. The
+    private-instance contract replaced all of that: one Excel instance owned
+    by the tool, books opened in it once at startup, and a deliberately
+    closed workbook stays closed.
     """
 
     def setUp(self):
@@ -448,14 +451,15 @@ class AutoOpenLatchTests(unittest.TestCase):
 
     def test_latch_exists_per_role(self):
         self.assertEqual(
-            sorted(self.main._auto_open_done.keys()),
+            sorted(self.main.us_state._auto_open_done.keys()),
             sorted(self.main.ROLE_ORDER),
         )
 
     def test_reopen_is_gated_on_the_latch(self):
         import inspect
-        src = inspect.getsource(self.main._write_to_excel)
-        self.assertIn("not _auto_open_done.get(role)", src)
+        import us_workbook
+        src = inspect.getsource(us_workbook._open_excel_files)
+        self.assertIn("_owner_book(app, path) is not None", src)
 
     def test_startup_open_sets_the_latch(self):
         import inspect
@@ -464,17 +468,23 @@ class AutoOpenLatchTests(unittest.TestCase):
         self.assertIn("_auto_open_done[role] = True", src)
 
     def test_only_two_places_launch_excel(self):
-        """Nothing else may open a workbook behind the customer's back."""
+        """No os.startfile workbook reopen may survive anywhere.
+
+        main.py keeps a single os.startfile for opening the self-test report
+        file, never a workbook.
+        """
         import inspect
         import main
         import us_workbook
         import us_excel
         self.assertEqual(
-            inspect.getsource(main).count("os.startfile(")
-            + inspect.getsource(us_workbook).count("os.startfile(")
+            inspect.getsource(us_workbook).count("os.startfile(")
             + inspect.getsource(us_excel).count("os.startfile("),
-            2,
+            0,
         )
+        main_src = inspect.getsource(main)
+        self.assertEqual(main_src.count("os.startfile("), 1)
+        self.assertIn("report_path", main_src)
 
     def test_chain_value_writes_anchor_at_row_five(self):
         import inspect
@@ -494,16 +504,15 @@ class AutoOpenLatchTests(unittest.TestCase):
     def test_latch_rearm_paths_exist(self):
         import inspect
         src = inspect.getsource(self.main._write_to_excel)
-        # The file-gone rearm (template recreated) stays.
-        self.assertIn("if not os.path.exists(path):", src)
-        self.assertIn("_auto_open_done[role] = False", src)
-        # And there is a time-based rearm, once per role, long after the
-        # first reopen attempt was spent.
-        self.assertIn("us_state._auto_open_rearm_used", src)
-        self.assertIn("_AUTO_OPEN_REARM_SECONDS", src)
-        self.assertIn("excel_auto_open_rearmed", src)
+        # The rearm is GONE: a confirmed absence keeps the workbook closed.
+        self.assertNotIn("excel_auto_open_rearmed", src)
+        # A busy Excel is recorded as unknown, never as missing.
+        self.assertIn("excel_attach_unknown", src)
+        self.assertIn("workbook_closed_by_customer", src)
+        self.assertNotIn("os.startfile(", src)
+        self.assertNotIn("Microsoft Excel is open", src)
 
-    def test_startup_open_has_watchdog_and_fresh_instance_retry(self):
+    def test_startup_open_has_watchdog_and_private_instance(self):
         import inspect
         import us_workbook
         src = inspect.getsource(us_workbook.open_excel_files)
@@ -514,13 +523,24 @@ class AutoOpenLatchTests(unittest.TestCase):
         self.assertIn("excel_auto_open_started", opener)
         self.assertIn("excel_auto_open_failed", opener)
         self.assertIn("finished.set()", opener)
+        self.assertIn("_ensure_owner_app", opener)
+        self.assertNotIn("apps[0]", opener)
+        self.assertNotIn("list(xw.apps)", opener)
+
+    def test_close_all_exits_the_tool(self):
+        import inspect
+        import us_excel
+        src = inspect.getsource(us_excel.maybe_exit_after_close_all)
+        self.assertIn("tool_exit_close_all", src)
+        self.assertIn("os._exit(0)", src)
 
     def test_exact_book_match_normalizes_short_form_paths(self):
         import inspect
-        import excel_helpers
-        src = inspect.getsource(excel_helpers.find_book_and_app_in_apps)
-        self.assertIn("long_form(os.path.abspath(filename))", src)
+        import us_excel
+        # The private-instance finder keeps the normalisation.
+        src = inspect.getsource(us_excel.find_open_book)
         self.assertIn("long_form(os.path.abspath(book.fullname))", src)
+        self.assertIn("long_form(target)", src)
 
 
 class SheetStructureGuardTests(unittest.TestCase):

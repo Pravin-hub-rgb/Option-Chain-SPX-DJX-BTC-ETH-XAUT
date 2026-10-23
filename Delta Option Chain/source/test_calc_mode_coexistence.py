@@ -111,14 +111,37 @@ class ChurnObservationTests(unittest.TestCase):
 
 
 class WatchdogReconnectTests(unittest.TestCase):
-    """ensure_calculation_not_stranded should reconnect when _app_cache is None."""
+    """ensure_calculation_not_stranded runs against the tool's own Excel only."""
 
     def test_reconnect_in_watchdog_source(self):
         import inspect
         import main as delta_main
         src = inspect.getsource(delta_main.ensure_calculation_not_stranded)
-        self.assertIn('xlwings', src)
-        self.assertIn('xw.apps', src)
+        self.assertIn('delta_state._app_cache', src)
+        self.assertIn('delta_state._owner_app', src)
+        self.assertNotIn('xw.apps', src)
+
+    def test_watchdog_reports_stranded_excel_without_modal(self):
+        import types
+        import main as delta_main
+        old_cache = delta_state._app_cache
+        old_owner = delta_state._owner_app
+        old_manual = delta_state._manual_since
+        try:
+            app = types.SimpleNamespace()
+            delta_state._app_cache = app
+            delta_state._owner_app = app
+            delta_state._manual_since = 1e9
+            with mock.patch.object(delta_main, "_raw_calc_mode", return_value=-4135), \
+                 mock.patch.object(delta_main, "_other_chain_tool_holds", return_value=False), \
+                 mock.patch.object(delta_main, "_set_calc_mode", return_value=True) as mode:
+                delta_main.ensure_calculation_not_stranded(app)
+            mode.assert_called_once_with(app, "automatic")
+            self.assertEqual(delta_state._manual_since, 0.0)
+        finally:
+            delta_state._app_cache = old_cache
+            delta_state._owner_app = old_owner
+            delta_state._manual_since = old_manual
 
 
 if __name__ == "__main__":
