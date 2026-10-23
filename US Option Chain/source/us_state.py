@@ -142,6 +142,12 @@ _enum_unknown = {}
 _missing_since = {}
 _all_gone_since = None
 
+# The startup open pass, run inline on the display thread. `_open_pass_at`
+# timestamps the attempt so the display loop can retry one wedged pass once
+# after a grace period; `_open_pass_retried` limits it to that one retry.
+_open_pass_at = None
+_open_pass_retried = False
+
 _SHORT_BUILD = None
 
 _timezone_warning_logged = False

@@ -12,9 +12,9 @@ main with a late import to stay import-safe.
 
 import math
 import os
-import threading
 import platform
 import shutil
+import time
 
 from us_diagnostics import append_app_exception, feed_log
 from us_licensing import show_error
@@ -396,35 +396,23 @@ def open_excel_files():
     whatever Excel happened to exist - the customer's, the other chain
     tool's. Workbooks would land in an instance neither tool owned while the
     writer attached to another, and both products fought over calculation
-    flags. A watchdog still retries the open pass once if the first attempt
-    goes nowhere, but every pass - first or retry - now uses (or creates)
-    the private instance.
+    flags. A wedged pass is retried once from the display loop after
+    AUTO_OPEN_TIMEOUT_SECONDS (see us_excel.retry_open_pass_after_grace);
+    every pass - first or retry - uses (or creates) the private instance.
+
+    This runs INLINE on the same thread as every other COM call in the
+    process (the display loop). Creating the instance on a one-shot opener
+    thread while the display thread read that App object later was a COM
+    apartment violation: every probe from the display thread answered
+    "The application called an interface that was marshalled for a different
+    thread", the books never attached, and the close-all timer ended the
+    tool with Excel sitting right there on the screen. The pass costs under
+    a second when Excel is warm, so the caller can run it synchronously.
     """
     if platform.system() != "Windows":
         return
-    finished = threading.Event()
-    threading.Thread(target=_open_excel_files, args=(finished, False), daemon=True).start()
-
-    def _watchdog():
-        if finished.wait(AUTO_OPEN_TIMEOUT_SECONDS):
-            return
-        feed_log(
-            "excel_auto_open_timeout",
-            note=(f"chain workbooks still not open after {int(AUTO_OPEN_TIMEOUT_SECONDS)}s; "
-                  "retrying the open pass once"),
-        )
-        retry_done = threading.Event()
-        threading.Thread(target=_open_excel_files, args=(retry_done, True), daemon=True).start()
-
-        def _retry_watchdog():
-            if not retry_done.wait(AUTO_OPEN_TIMEOUT_SECONDS):
-                feed_log(
-                    "excel_auto_open_retry_timeout",
-                    note="the retry open pass also did not finish; waiting for the customer",
-                )
-        threading.Thread(target=_retry_watchdog, daemon=True).start()
-
-    threading.Thread(target=_watchdog, daemon=True).start()
+    us_state._open_pass_at = time.monotonic()
+    _open_excel_files()
 
 
 def _close_empty_book1(app):

@@ -36,7 +36,7 @@ from us_chain import (
 from us_spot import source_delay_note, spot_source_for
 from us_workbook import (
     BLOCKS_PER_SHEET, BLOCK_COLS, EXPIRY_CELLS, default_k1, ensure_excel_file,
-    excel_path, get_column_letter, is_locked_role,
+    excel_path, get_column_letter, is_locked_role, open_excel_files,
 )
 from excel_helpers import (
     long_form, refresh_delay,
@@ -409,6 +409,35 @@ def maybe_exit_after_close_all(excel_alive=None):
     elif us_state._all_gone_since is not None:
         us_state._all_gone_since = None
         us_state._missing_since.clear()
+
+
+_OPEN_RETRY_GRACE_SECONDS = 45.0
+
+
+def retry_open_pass_after_grace():
+    """Retry a wedged startup open pass once, on the display thread.
+
+    The pass runs inline at startup; if Excel answered every call it takes
+    under a second and every role is latched. When the pass wedged (Excel
+    busy coming up, a dead-quiet COM answer), nothing is latched yet - so
+    after the grace period we run the pass another single time and then
+    leave the books alone, exactly as the customer's never-reopen rule
+    requires.
+    """
+    if us_state._open_pass_retried or us_state._open_pass_at is None:
+        return
+    now = time.monotonic()
+    if now - us_state._open_pass_at < _OPEN_RETRY_GRACE_SECONDS:
+        return
+    us_state._open_pass_retried = True
+    if all(us_state._auto_open_done.get(role) for role in ROLE_ORDER):
+        return
+    feed_log(
+        "excel_open_retried",
+        note=(f"nothing latched {int(_OPEN_RETRY_GRACE_SECONDS)}s after the startup "
+              "open pass; retrying it once"),
+    )
+    open_excel_files()
 
 
 def update_expiry_dropdowns(sym, sheet):
@@ -2224,6 +2253,7 @@ async def display_loop():
             # runs while that instance is alive - whichever other Excel
             # windows exist on the machine are none of this tool's business.
             excel_alive = _owner_alive() or us_state._owner_app is None
+            retry_open_pass_after_grace()
             if excel_alive:
                 if us_state._excel_gone_logged:
                     # Excel came back. Everything cached about the sheets is now

@@ -512,20 +512,37 @@ class AutoOpenLatchTests(unittest.TestCase):
         self.assertNotIn("os.startfile(", src)
         self.assertNotIn("Microsoft Excel is open", src)
 
-    def test_startup_open_has_watchdog_and_private_instance(self):
+    def test_startup_open_runs_inline_on_the_display_thread(self):
+        """The open pass must not live on its own thread.
+
+        An opener thread created the private Excel instance while the
+        display loop read that App object from another COM apartment:
+        every probe from the display thread then answered "marshalled for
+        a different thread", the books never attached and the close-all
+        timer ended the tool with Excel on the screen. Inline on the
+        display thread is the contract now; a wedged pass gets exactly
+        one retry from the same thread after a grace period.
+        """
         import inspect
         import us_workbook
         src = inspect.getsource(us_workbook.open_excel_files)
-        self.assertIn("finished.wait(AUTO_OPEN_TIMEOUT_SECONDS)", src)
-        self.assertIn("excel_auto_open_timeout", src)
-        self.assertIn("args=(retry_done, True)", src)
-        opener = inspect.getsource(us_workbook._open_excel_files)
-        self.assertIn("excel_auto_open_started", opener)
-        self.assertIn("excel_auto_open_failed", opener)
-        self.assertIn("finished.set()", opener)
-        self.assertIn("_ensure_owner_app", opener)
-        self.assertNotIn("apps[0]", opener)
-        self.assertNotIn("list(xw.apps)", opener)
+        self.assertNotIn("threading.Thread", src)
+        self.assertNotIn("finished.wait(", src)
+        self.assertIn("_open_excel_files()", src)
+        self.assertIn("_open_pass_at", src)
+        starter = inspect.getsource(us_workbook._open_excel_files)
+        self.assertIn("excel_auto_open_started", starter)
+        self.assertIn("excel_auto_open_failed", starter)
+        self.assertIn("_ensure_owner_app", starter)
+        self.assertNotIn("apps[0]", starter)
+        self.assertNotIn("list(xw.apps)", starter)
+        import us_excel
+        retry_src = inspect.getsource(us_excel.retry_open_pass_after_grace)
+        self.assertIn("_OPEN_RETRY_GRACE_SECONDS", retry_src)
+        self.assertIn("excel_open_retried", retry_src)
+        self.assertIn("open_excel_files()", retry_src)
+        loop_src = inspect.getsource(us_excel.display_loop)
+        self.assertIn("retry_open_pass_after_grace()", loop_src)
 
     def test_close_all_exits_the_tool(self):
         import inspect

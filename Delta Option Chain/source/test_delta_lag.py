@@ -1160,11 +1160,26 @@ class AutoOpenRecoveryTests(unittest.TestCase):
     """
 
     def test_open_pass_is_watchdog_gated(self):
+        """The pass runs inline on the display thread, with one inline retry.
+
+        An opener thread created the private Excel instance while the
+        display loop read that App object from another COM apartment;
+        every probe answered "marshalled for a different thread" and no
+        workbook ever attached. Inline on the display thread is the
+        contract now; a wedged pass is retried exactly once from the
+        same thread after a grace period.
+        """
         src = inspect.getsource(delta_main.open_excel_files)
-        self.assertIn("threading.Event()", src)
-        self.assertIn("finished.wait(AUTO_OPEN_TIMEOUT_SECONDS)", src)
-        self.assertIn("excel_auto_open_timeout", src)
-        self.assertIn("args=(retry_done, True)", src)
+        self.assertNotIn("threading.Thread", src)
+        self.assertNotIn("finished.wait(", src)
+        self.assertIn("_open_excel_files()", src)
+        self.assertIn("_open_pass_at", src)
+        retry_src = inspect.getsource(delta_main.retry_open_pass_after_grace)
+        self.assertIn("_OPEN_RETRY_GRACE_SECONDS", retry_src)
+        self.assertIn("excel_open_retried", retry_src)
+        self.assertIn("open_excel_files()", retry_src)
+        loop_src = inspect.getsource(delta_main.display_loop)
+        self.assertIn("retry_open_pass_after_grace()", loop_src)
 
     def test_open_pass_reports_each_book(self):
         opener = inspect.getsource(delta_main._open_excel_files)

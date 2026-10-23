@@ -448,42 +448,28 @@ def open_excel_files():
     So: one Excel, opened through the API the tool writes with, using the
     8.3 short name for a long path. Opening Excel can take a while on a
     cold or busy machine, and the chain does not need Excel to be up first,
-    so the open runs on its own thread and the render loop picks the
-    workbooks up as soon as they are there.
+    so the open runs on the display thread (inline) and the render loop picks
+    the workbooks up as soon as they are there.
 
     The open pass is also guarded now. Workbooks.Open aimed at an Excel this
     process does not own - the other Option Chain tool's instance, or one
     whose controlling process died earlier - can block forever, because a
-    busy Excel answers automation by simply not answering. A dead-quiet
-    daemon thread on a blank sheet was the exact customer symptom, so a
-    watchdog times the pass out, logs it, and retries the missing workbooks
-    in a fresh Excel instance of our own.
+    busy Excel answers automation by simply not answering. A wedged pass is
+    retried once from the display loop after AUTO_OPEN_TIMEOUT_SECONDS (see
+    retry_open_pass_after_grace below).
+
+    Inline is not just a simplification - it is correctness. Creating the
+    private instance on a one-shot thread while the display loop read that
+    App object made every probe from the display thread answer "The
+    application called an interface that was marshalled for a different
+    thread": the books never attached and the close-all timer ended the
+    tool with Excel right there on the screen. One thread owns COM here,
+    and it is the thread that writes.
     """
     if platform.system() != "Windows":
         return
-    finished = threading.Event()
-    threading.Thread(target=_open_excel_files, args=(finished, False), daemon=True).start()
-
-    def _watchdog():
-        if finished.wait(AUTO_OPEN_TIMEOUT_SECONDS):
-            return
-        feed_log(
-            "excel_auto_open_timeout",
-            note=(f"chain workbooks still not open after {int(AUTO_OPEN_TIMEOUT_SECONDS)}s; "
-                  "retrying once in a separate Excel instance"),
-        )
-        retry_done = threading.Event()
-        threading.Thread(target=_open_excel_files, args=(retry_done, True), daemon=True).start()
-
-        def _retry_watchdog():
-            if not retry_done.wait(AUTO_OPEN_TIMEOUT_SECONDS):
-                feed_log(
-                    "excel_auto_open_retry_timeout",
-                    note="the retry Excel instance also did not finish; waiting for the customer to open the workbooks",
-                )
-        threading.Thread(target=_retry_watchdog, daemon=True).start()
-
-    threading.Thread(target=_watchdog, daemon=True).start()
+    delta_state._open_pass_at = time.monotonic()
+    _open_excel_files()
 
 
 def _ensure_owner_app(xw):
@@ -627,6 +613,34 @@ def _close_empty_book1(app):
                 continue
     except Exception:
         pass
+
+
+_OPEN_RETRY_GRACE_SECONDS = 45.0
+
+
+def retry_open_pass_after_grace():
+    """Retry a wedged startup open pass once, on the display thread.
+
+    The pass runs inline at startup. If Excel answered everything it takes
+    under two seconds and all three books latch; only a wedged pass leaves
+    nothing latched, and that is worth exactly one retry after the grace
+    period - never more, because a workbook the customer closed on purpose
+    must stay closed.
+    """
+    if delta_state._open_pass_retried or delta_state._open_pass_at is None:
+        return
+    now = time.monotonic()
+    if now - delta_state._open_pass_at < _OPEN_RETRY_GRACE_SECONDS:
+        return
+    delta_state._open_pass_retried = True
+    if all(delta_state._auto_open_done.get(asset) for asset in ("BTC", "ETH", "XAUT")):
+        return
+    feed_log(
+        "excel_open_retried",
+        note=(f"nothing latched {int(_OPEN_RETRY_GRACE_SECONDS)}s after the startup "
+              "open pass; retrying it once"),
+    )
+    open_excel_files()
 
 
 def iso_to_dmy(iso):
@@ -3537,6 +3551,7 @@ async def display_loop():
             # runs while that instance is alive - whichever other Excel
             # windows exist on the machine are none of this tool's business.
             excel_alive = _owner_alive() or delta_state._owner_app is None
+            retry_open_pass_after_grace()
             if excel_alive:
                 if delta_state._excel_gone_logged:
                     # Excel came back with freshly opened, empty workbooks, so
