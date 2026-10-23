@@ -3045,6 +3045,20 @@ def _com_dead(exc):
     return any(code in _DEAD_COM_CODES for code in seen)
 
 
+def _excel_alive_after(exc):
+    """Ground truth behind any switch failure: is Excel still running?
+
+    Some teardown moments throw 0x800A03EC ("Unable to set the Calculation
+    property") - the same HRESULT a real dialog-up refusal raises. Only the
+    process check separates a closing Excel from one that is actually there
+    refusing. Errors probing for the process default to "alive".
+    """
+    try:
+        return excel_process_running()
+    except Exception:
+        return True
+
+
 def _release_dead_excel_state():
     """After Excel is gone: drop the session, marks and the stale handle."""
     delta_state._bulk_owning_manual = False
@@ -3189,7 +3203,7 @@ def _begin_excel_bulk_mode():
                         was_guarded = state.get("calc_guarded", False)
                         state["calc"] = None
                         state["calc_guarded"] = False
-                        if _com_dead(exc):
+                        if _com_dead(exc) or not _excel_alive_after(exc):
                             # Excel died mid-window (the customer closed it).
                             # Not a refusal: drop the session so the reopen
                             # path can bring Excel back without the notice.
@@ -3214,29 +3228,31 @@ def _begin_excel_bulk_mode():
                                     calc_mode_guard.release(PRODUCT_ID)
                                 except Exception:
                                     pass
-                        # A workbook close refuses the switch for as long as
-                        # its save prompt is up, and that is not a fault a
-                        # customer needs explained to their face. Only a
-                        # refusal that has held longer than the grace period -
-                        # and the gate above only lets us attempt the switch
-                        # while the chains are open - earns the dialog.
-                        if (
-                            not delta_state._calc_notice_shown
-                            and time.monotonic() - delta_state._calc_failed_since
-                            >= _CALC_NOTICE_GRACE_SECONDS
-                        ):
-                            delta_state._calc_notice_shown = True
-                            show_error(
-                                "Excel will not switch to manual calculation,\n"
-                                "so the workbook recalculates on every update\n"
-                                "and will feel slow.\n\n"
-                                "This is usually one of three things:\n"
-                                "  - a cell is in edit mode - press Escape\n"
-                                "  - an Excel dialog is open - close it\n"
-                                "  - an Excel add-in is busy - turn it off\n\n"
-                                "The tool will speed back up on its own once\n"
-                                "Excel accepts the mode switch again.",
-                            )
+                            # A workbook close refuses the switch for as long as
+                            # its save prompt is up, and that is not a fault a
+                            # customer needs explained to their face. Only a
+                            # refusal that has held longer than the grace period
+                            # - and the gate above only lets us attempt the
+                            # switch while the chains are open - earns the
+                            # dialog. Excel being gone never does: the marks it
+                            # would read were just cleared.
+                            if (
+                                not delta_state._calc_notice_shown
+                                and time.monotonic() - delta_state._calc_failed_since
+                                >= _CALC_NOTICE_GRACE_SECONDS
+                            ):
+                                delta_state._calc_notice_shown = True
+                                show_error(
+                                    "Excel will not switch to manual calculation,\n"
+                                    "so the workbook recalculates on every update\n"
+                                    "and will feel slow.\n\n"
+                                    "This is usually one of three things:\n"
+                                    "  - a cell is in edit mode - press Escape\n"
+                                    "  - an Excel dialog is open - close it\n"
+                                    "  - an Excel add-in is busy - turn it off\n\n"
+                                    "The tool will speed back up on its own once\n"
+                                    "Excel accepts the mode switch again.",
+                                )
         except Exception as e:
             log_excel_exception("ALL", e, "switching to manual calculation")
             state["calc"] = None

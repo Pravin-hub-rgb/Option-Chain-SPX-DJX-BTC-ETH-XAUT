@@ -119,6 +119,10 @@ class UnprotectedWriteTests(unittest.TestCase):
             us_excel.calc_mode_guard, "other_holder_alive", return_value=False
         )
         self._guard_probe.start()
+        self._process_probe = patch.object(
+            us_excel, "excel_process_running", return_value=True
+        )
+        self._process_probe.start()
         self._saved = (
             us_state._calc_manual_failed,
             us_state._calc_manual_notice_shown,
@@ -134,6 +138,7 @@ class UnprotectedWriteTests(unittest.TestCase):
 
     def tearDown(self):
         self._guard_probe.stop()
+        self._process_probe.stop()
         (
             us_state._calc_manual_failed,
             us_state._calc_manual_notice_shown,

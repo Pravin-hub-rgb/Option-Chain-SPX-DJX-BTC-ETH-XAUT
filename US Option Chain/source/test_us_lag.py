@@ -1743,7 +1743,62 @@ class DeadExcelRefusalTests(unittest.TestCase):
 
         alive_refusal = ChainApp(RuntimeError("nope, dialog is up"))
         us_state._app_cache = alive_refusal
-        us_excel._begin_excel_bulk_mode(alive_refusal)
+        with patch.object(us_excel, "excel_process_running", lambda: True):
+            us_excel._begin_excel_bulk_mode(alive_refusal)
+        self.assertTrue(us_state._calc_manual_failed)
+
+
+    def test_teardown_error_with_no_process_is_a_close(self):
+        # The 13:58 shape: Excel throws "Unable to set the Calculation
+        # property" (a real-refusal HRESULT) while the process is dying from
+        # a taskbar close-all. The process check is the ground truth.
+        us_excel = self.us_excel
+        us_state = self.us_state
+
+        teardown_err = pywintypes.com_error(
+            -2147352567, "Exception occurred.", None, None
+        )
+
+        class TeardownApp:
+            def __init__(self):
+                self.err = teardown_err
+
+            @property
+            def version(self):
+                return "16.0"
+
+            @property
+            def books(self):
+                return [type("B", (), {"name": "us_stock_option_chain.xlsx"})()]
+
+            @property
+            def screen_updating(self):
+                return False
+
+            @property
+            def api(self):
+                return type("Api", (), {"Calculation": 2})()
+
+            calculation = property(
+                lambda self: "manual",
+                lambda self, v: self._raise(),
+            )
+
+            def _raise(self):
+                raise self.err
+
+        app = TeardownApp()
+        us_state._app_cache = app
+        with patch.object(us_excel, "excel_process_running", lambda: False):
+            us_excel._begin_excel_bulk_mode(app)
+        self.assertFalse(us_state._calc_manual_failed)
+        self.assertIsNone(us_state._app_cache)
+
+        alive = TeardownApp()
+        us_state._app_cache = alive
+        with patch.object(us_excel, "excel_process_running", lambda: True):
+            us_excel._begin_excel_bulk_mode(alive)
+        # Same error while Excel is genuinely there stays a refusal.
         self.assertTrue(us_state._calc_manual_failed)
 
 

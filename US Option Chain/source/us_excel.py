@@ -1705,6 +1705,20 @@ def _release_dead_excel_state():
     _clear_refused_calc_marks()
 
 
+def _excel_alive_after(exc):
+    """Ground truth behind any switch failure: is Excel still running?
+
+    Some teardown moments throw 0x800A03EC ("Unable to set the Calculation
+    property") - the same HRESULT a real dialog-up refusal raises. Only the
+    process check separates a closing Excel from one that is actually there
+    refusing. Errors probing for the process default to "alive".
+    """
+    try:
+        return excel_process_running()
+    except Exception:
+        return True
+
+
 def _set_calc_mode(app, name):
     app.api.Calculation = _CALC_IDS[name]
     return _raw_calc_mode(app) == _CALC_IDS[name]
@@ -2223,7 +2237,7 @@ def _begin_excel_bulk_mode(app=None):
                         except Exception as exc:
                             state["calc"] = None
                             state["calc_guarded"] = False
-                            if _com_dead(exc):
+                            if _com_dead(exc) or not _excel_alive_after(exc):
                                 # Excel died mid-window (the customer closed
                                 # it). A dead handle is not a refusal: latching
                                 # one would pop the slow-down notice about a

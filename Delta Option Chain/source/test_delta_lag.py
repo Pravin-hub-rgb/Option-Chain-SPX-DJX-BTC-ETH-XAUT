@@ -160,9 +160,17 @@ class DeadExcelRefusalTests(unittest.TestCase):
             delta_main.calc_mode_guard, "release"
         )
         self._release_probe.start()
+        self._holder_probe = patch.object(
+            delta_main.calc_mode_guard, "other_holder_alive", return_value=False
+        )
+        self._holder_probe.start()
+        self._acquire_probe = patch.object(delta_main.calc_mode_guard, "acquire")
+        self._acquire_probe.start()
 
     def tearDown(self):
         self._release_probe.stop()
+        self._holder_probe.stop()
+        self._acquire_probe.stop()
         delta_main.delta_state._calc_manual_failed = False
         delta_main.delta_state._calc_failed_since = 0.0
         delta_main.delta_state._app_cache = None
@@ -192,6 +200,53 @@ class DeadExcelRefusalTests(unittest.TestCase):
         self.assertIsNone(ds._app_cache)
         self.assertFalse(ds._calc_manual_failed)
         self.assertFalse(ds._bulk_owning_manual)
+
+
+    def test_teardown_error_with_no_process_drops_marks(self):
+        import pywintypes as _pw
+
+        teardown_err = _pw.com_error(-2147352567, "Exception occurred.", None, None)
+
+        class TeardownApp:
+            def __init__(self):
+                self.err = teardown_err
+
+            @property
+            def version(self):
+                return "16.0"
+
+            @property
+            def books(self):
+                return [type("B", (), {"name": "btc_chain.xlsx"})()]
+
+            @property
+            def screen_updating(self):
+                return False
+
+            @property
+            def api(self):
+                return type("Api", (), {"Calculation": 2})()
+
+            calculation = property(
+                lambda self: "manual",
+                lambda self, v: self._raise(),
+            )
+
+            def _raise(self):
+                raise self.err
+
+        ds = delta_main.delta_state
+        ds._calc_manual_failed = False
+        ds._app_cache = TeardownApp()
+        with patch.object(delta_main, "excel_process_running", lambda: False):
+            delta_main._begin_excel_bulk_mode()
+        self.assertFalse(ds._calc_manual_failed)
+        self.assertIsNone(ds._app_cache)
+
+        ds._app_cache = TeardownApp()
+        with patch.object(delta_main, "excel_process_running", lambda: True):
+            delta_main._begin_excel_bulk_mode()
+        self.assertTrue(ds._calc_manual_failed)
 
 
 class DeltaMergedBlockWriteTests(unittest.TestCase):
@@ -790,6 +845,8 @@ class ChainsCloseSuppressionTests(unittest.TestCase):
             delta_main.calc_mode_guard, "acquire"
         ), mock.patch.object(
             delta_main.calc_mode_guard, "release"
+        ), mock.patch.object(
+            delta_main, "excel_process_running", return_value=True
         ), mock.patch.object(
             delta_main, "show_error"
         ) as show_error:
