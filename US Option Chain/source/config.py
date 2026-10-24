@@ -5,12 +5,9 @@ import sys
 
 def base_dir():
     if getattr(sys, "frozen", False):
+        # PyInstaller: sys.executable is the real exe
         return os.path.dirname(sys.executable)
-    d = os.path.dirname(os.path.abspath(__file__))
-    pkg = os.path.normpath(os.path.join(d, "..", "client package"))
-    if os.path.isfile(os.path.join(pkg, "optionchain.product")):
-        return pkg
-    return d
+    return os.path.dirname(os.path.abspath(__file__))
 
 
 def load_config():

@@ -2488,6 +2488,37 @@ class ExcelGoneWatchdogTests(unittest.TestCase):
         )
 
 
+class BaseDirTests(unittest.TestCase):
+    """Python runs keep their home in source, never the shipping package.
+
+    base_dir used to redirect source runs into ..\\client package whenever a
+    built onedir sat next door. That made the customer's license, config and
+    the chain workbooks live inside the SHIPPING target - so every build
+    wiped their activated licence and they had to paste the key again. The
+    package stays a pure build artefact; only the frozen exe owns its own
+    folder.
+    """
+
+    def test_python_runs_own_the_source_folder(self):
+        import inspect
+        import config
+
+        self.assertNotIn("client package", inspect.getsource(config.base_dir))
+        # the onedir really does sit next door with its marker - the old
+        # redirect would have swallowed this very test's home
+        pkg = os.path.normpath(
+            os.path.join(
+                os.path.dirname(config.__file__), "..", "client package"
+            )
+        )
+        self.assertTrue(os.path.isfile(os.path.join(pkg, "optionchain.product")))
+        home = config.base_dir()
+        self.assertFalse(home.lower().rstrip(os.sep).endswith("client package"))
+        self.assertTrue(
+            os.path.samefile(home, os.path.dirname(config.__file__))
+        )
+
+
 class PastDatePurgeTests(unittest.TestCase):
     """Past dates in expiry cells must be replaced, not just colored red.
 
