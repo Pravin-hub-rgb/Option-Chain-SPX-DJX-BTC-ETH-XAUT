@@ -124,7 +124,7 @@ _refresh_widen_hold_until = 0.0
 
 WIDEN_STEP = 1.5
 
-WIDEN_MAX = 4.0
+WIDEN_MAX = 2.0
 
 WIDEN_DECAY_SECONDS = 120.0
 

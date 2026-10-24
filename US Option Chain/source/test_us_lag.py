@@ -1438,8 +1438,8 @@ class RefreshWidenTests(unittest.TestCase):
         held_at = time.monotonic() + 10.0
         us_state._refresh_widen_hold_until = held_at
         us_excel._note_recalc_second_pass(time.monotonic())
-        # 3.0 * 1.5 = 4.5 caps at WIDEN_MAX.
-        self.assertEqual(us_state._refresh_widen, 4.0)
+        # 3.0 * 1.5 = 4.5 caps at WIDEN_MAX (2.0).
+        self.assertEqual(us_state._refresh_widen, 2.0)
         # The hold extends past the previous one, so the display loop cannot
         # decay the stretch in the middle of the spell.
         self.assertGreater(us_state._refresh_widen_hold_until, held_at)

@@ -1994,7 +1994,7 @@ def cell_value(pre, sheet, row, col):
 
 
 def force_usd_block_formats(sheet, block, asset, bi, n_rows):
-    """Prices = 0.00, OI = text with $ only (kills the Rs number format).
+    """Prices = 0.00, OI = numeric with $ display (kills the Rs number format).
 
     Formats land once per sheet, and the OI cleanup is one bulk read plus one
     bulk write whenever the sheet is first touched. The previous version

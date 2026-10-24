@@ -1678,8 +1678,8 @@ class DeltaRefreshWidenTests(unittest.TestCase):
         held_at = time.monotonic() + 10.0
         delta_state._refresh_widen_hold_until = held_at
         delta_main._note_recalc_second_pass(time.monotonic())
-        # 3.0 * 1.5 = 4.5 caps at WIDEN_MAX.
-        self.assertEqual(delta_state._refresh_widen, 4.0)
+        # 3.0 * 1.5 = 4.5 caps at WIDEN_MAX (2.0).
+        self.assertEqual(delta_state._refresh_widen, 2.0)
         self.assertGreater(delta_state._refresh_widen_hold_until, held_at)
 
     def test_display_loop_uses_and_decays_widen(self):

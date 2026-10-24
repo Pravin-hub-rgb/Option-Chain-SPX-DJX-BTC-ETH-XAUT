@@ -177,7 +177,7 @@ US default `refresh_interval_seconds` was 0.1s in `config.py` (the shipped
 config.json already ships 0.5; both tools now default 0.5 when no config
 file exists). On top, when the post-restore `CalculationState` probe says
 Excel still owed a recalculation (`excel_recalc_second_pass`), the render
-loop multiplies its sleep by 1.5 per hit (cap 4.0×) and decays back by half
+loop multiplies its sleep by 1.5 per hit (cap 2.0×) and decays back by half
 after 120 quiet seconds; every stretch and decay is feed-logged
 (`refresh_widened` / `refresh_widen_decayed`). A heavy strategy book gets
 idle time instead of being recalc-stormed every 0.1s.
