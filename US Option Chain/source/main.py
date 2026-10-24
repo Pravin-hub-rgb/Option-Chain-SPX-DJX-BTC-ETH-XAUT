@@ -90,6 +90,7 @@ async def main_async():
     # empty even though Excel is already running, and recovery then gave up and
     # discarded the record while leaving Excel stuck on manual.
     recover_calc_mode()
+    us_excel.start_excel_gone_watchdog()
     errs = []
     for sym in active_symbols():
         try:

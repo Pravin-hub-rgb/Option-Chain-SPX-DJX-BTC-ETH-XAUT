@@ -414,6 +414,70 @@ def maybe_exit_after_close_all(excel_alive=None):
 
 _OPEN_RETRY_GRACE_SECONDS = 45.0
 
+_EXCEL_GONE_WATCHDOG_EXIT_SECONDS = 75.0
+
+
+def _excel_gone_tick(dead_since, alive, now=None):
+    """One watchdog beat, kept pure so tests can drive every 75s outcome."""
+    if alive:
+        return None, False
+    now = time.monotonic() if now is None else now
+    if dead_since is None:
+        return now, False
+    return dead_since, now - dead_since >= _EXCEL_GONE_WATCHDOG_EXIT_SECONDS
+
+
+def _excel_gone_watchdog(interval=5.0):
+    """Exit the tool even when the asyncio loop is wedged on dead Excel.
+
+    The display loop handles a closed Excel politely: books go missing, the
+    close-all timer runs, exit <=75s. That path is cooperative - it only
+    works while the loop still turns. A wedged COM retry can freeze the
+    whole loop instead (feed silent while the process lingers). This thread
+    never touches COM: it asks user32 whether our private Excel window is
+    still a window. A destroyed hwnd means the instance was shot; after the
+    same 75s grace the tool exits with the very same close-all receipt.
+    """
+    dead_since = None
+    while True:
+        time.sleep(interval)
+        hwnd = us_state._owner_hwnd
+        if not hwnd:
+            dead_since = None
+            continue
+        try:
+            import ctypes
+
+            alive = bool(ctypes.windll.user32.IsWindow(int(hwnd)))
+        except Exception:
+            continue
+        dead_since, exit_now = _excel_gone_tick(dead_since, alive)
+        if exit_now:
+            feed_log(
+                "tool_exit_close_all",
+                note="every chain workbook is closed; the tool exits like any other app",
+            )
+            try:
+                calc_mode_guard.release(PRODUCT_ID)
+            except Exception:
+                pass
+            _heal_keyboard()
+            os._exit(0)
+
+
+_excel_gone_watchdog_started = False
+
+
+def start_excel_gone_watchdog():
+    """Start the independent dead-Excel net exactly once."""
+    global _excel_gone_watchdog_started
+    if _excel_gone_watchdog_started:
+        return
+    _excel_gone_watchdog_started = True
+    threading.Thread(
+        target=_excel_gone_watchdog, name="excel-gone-watchdog", daemon=True
+    ).start()
+
 
 def _pump_com():
     """Keep the display thread's COM apartment alive between cycles.

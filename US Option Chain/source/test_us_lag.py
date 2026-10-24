@@ -2419,6 +2419,75 @@ class StartupConsoleNoiseTests(unittest.TestCase):
         self.assertEqual(loop.default_calls, [real_problem, other_assert])
 
 
+class ExcelGoneWatchdogTests(unittest.TestCase):
+    """A shot Excel cannot outlive the tool, even with a wedged loop.
+
+    Today's incident: delta exited politely <=75s after Excel vanished, US
+    hung forever because one COM retry froze the whole asyncio loop. The
+    watchdog thread lives OUTSIDE that loop - it asks user32 whether the
+    private instance's window still exists, keeps the same 75s grace and
+    fires the very same close-all receipt.
+    """
+
+    def test_the_tick_holds_and_fires_the_75s_grace(self):
+        import us_excel
+
+        dead_since, exit_now = us_excel._excel_gone_tick(None, False, now=10.0)
+        self.assertEqual(dead_since, 10.0)
+        self.assertFalse(exit_now)
+        dead_since, exit_now = us_excel._excel_gone_tick(dead_since, False, now=90.0)
+        self.assertEqual(dead_since, 10.0)
+        self.assertTrue(exit_now)
+        # A window that lives again simply resets the net.
+        self.assertEqual(us_excel._excel_gone_tick(10.0, True), (None, False))
+        # Before the grace nothing fires.
+        self.assertEqual(
+            us_excel._excel_gone_tick(10.0, False, now=40.0), (10.0, False)
+        )
+
+    def test_the_watchdog_thread_starts_exactly_once(self):
+        from unittest.mock import patch
+        import us_excel
+
+        started = []
+
+        class FakeThread:
+            def __init__(self, *a, **k):
+                self.k = k
+
+            def start(self):
+                started.append(self.k)
+
+        was = us_excel._excel_gone_watchdog_started
+        us_excel._excel_gone_watchdog_started = False
+        try:
+            with patch.object(us_excel.threading, "Thread", FakeThread):
+                us_excel.start_excel_gone_watchdog()
+                us_excel.start_excel_gone_watchdog()
+        finally:
+            us_excel._excel_gone_watchdog_started = was
+        self.assertEqual(len(started), 1)
+        self.assertEqual(started[0].get("name"), "excel-gone-watchdog")
+
+    def test_main_wires_the_watchdog_into_the_startup(self):
+        import inspect
+        import main as us_main
+        import us_excel
+
+        self.assertIn(
+            "us_excel.start_excel_gone_watchdog()",
+            inspect.getsource(us_main.main_async),
+        )
+        src = inspect.getsource(us_excel._excel_gone_watchdog)
+        self.assertIn("IsWindow", src)
+        self.assertIn("tool_exit_close_all", src)
+        self.assertIn("_heal_keyboard()", src)
+        self.assertIn("os._exit(0)", src)
+        self.assertLess(
+            src.index("_heal_keyboard()"), src.index("os._exit(0)")
+        )
+
+
 class PastDatePurgeTests(unittest.TestCase):
     """Past dates in expiry cells must be replaced, not just colored red.
 
