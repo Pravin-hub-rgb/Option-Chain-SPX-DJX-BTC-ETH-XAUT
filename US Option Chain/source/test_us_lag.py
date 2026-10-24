@@ -2419,6 +2419,38 @@ class StartupConsoleNoiseTests(unittest.TestCase):
         self.assertEqual(loop.default_calls, [real_problem, other_assert])
 
 
+    def test_the_drain_is_installed_on_the_dispatcher_itself(self):
+        """The SDK's live loop runs in its own thread with its own loop.
+
+        us_live*.log caught the harmless write-race traceback printing from
+        that SDK-owned loop: no per-loop handler ever reached it. The drain
+        now lives on the dispatch point, so every loop in the process is
+        covered; everything else still reaches the default rendering.
+        """
+        import asyncio
+        import main as us_main
+
+        self.assertIs(
+            asyncio.BaseEventLoop.call_exception_handler,
+            us_main._quietly_call_exception_handler,
+        )
+        seen = []
+        loop = asyncio.ProactorEventLoop()
+        try:
+            loop.set_exception_handler(lambda l, c: seen.append(c))
+            noise = {
+                "exception": AssertionError(),
+                "handle": "<Handle _ProactorBaseWritePipeTransport._loop_writing(...)>",
+            }
+            loop.call_exception_handler(noise)
+            self.assertEqual(seen, [])
+            real = {"exception": OSError("a broken spinner shows"), "handle": "<Handle real>"}
+            loop.call_exception_handler(real)
+            self.assertEqual(seen, [real])
+        finally:
+            loop.close()
+
+
 class ExcelGoneWatchdogTests(unittest.TestCase):
     """A shot Excel cannot outlive the tool, even with a wedged loop.
 

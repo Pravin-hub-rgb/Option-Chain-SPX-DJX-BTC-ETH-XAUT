@@ -4030,6 +4030,13 @@ def init_asset(asset):
         load_expiry_tickers(asset, expiry_iso)
 
 
+def _is_proactor_write_noise(context):
+    """One known-harmless asyncio shape: the proactor write race."""
+    exc = context.get("exception")
+    handle = context.get("handle")
+    return bool(isinstance(exc, AssertionError) and "_loop_writing" in repr(handle))
+
+
 def _drop_proactor_write_noise(loop, context):
     """Swallow one known-harmless asyncio traceback, log everything else.
 
@@ -4043,11 +4050,27 @@ def _drop_proactor_write_noise(loop, context):
     honest: a traceback they see is a traceback worth calling support
     about.
     """
-    exc = context.get("exception")
-    handle = context.get("handle")
-    if isinstance(exc, AssertionError) and "_loop_writing" in repr(handle):
+    if _is_proactor_write_noise(context):
         return
     loop.default_exception_handler(context)
+
+
+_orig_call_exception_handler = asyncio.BaseEventLoop.call_exception_handler
+
+
+def _quietly_call_exception_handler(self, context):
+    """The drain lives on the dispatcher, not on one loop's handler.
+
+    Any loop this process creates - the main asyncio loop, or a helper
+    thread's own loop - gets the same net at the dispatch point instead of
+    relying on per-loop installation timing. Everything else still flows.
+    """
+    if _is_proactor_write_noise(context):
+        return
+    _orig_call_exception_handler(self, context)
+
+
+asyncio.BaseEventLoop.call_exception_handler = _quietly_call_exception_handler
 
 
 async def main_async():

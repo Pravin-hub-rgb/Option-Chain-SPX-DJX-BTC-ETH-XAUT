@@ -41,6 +41,13 @@ from us_state import (
     BASE_DIR, PRODUCT_EXE, PRODUCT_ID, _databento_feed, expiry_roots,
 )
 
+def _is_proactor_write_noise(context):
+    """One known-harmless asyncio shape: the proactor write race."""
+    exc = context.get("exception")
+    handle = context.get("handle")
+    return bool(isinstance(exc, AssertionError) and "_loop_writing" in repr(handle))
+
+
 def _drop_proactor_write_noise(loop, context):
     """Swallow one known-harmless asyncio traceback, log everything else.
 
@@ -53,11 +60,29 @@ def _drop_proactor_write_noise(loop, context):
     one pattern keeps the customer's console honest: a traceback they see is
     a traceback worth calling support about.
     """
-    exc = context.get("exception")
-    handle = context.get("handle")
-    if isinstance(exc, AssertionError) and "_loop_writing" in repr(handle):
+    if _is_proactor_write_noise(context):
         return
     loop.default_exception_handler(context)
+
+
+_orig_call_exception_handler = asyncio.BaseEventLoop.call_exception_handler
+
+
+def _quietly_call_exception_handler(self, context):
+    """The drain lives on the dispatcher, not on one loop's handler.
+
+    The Databento live client runs its websocket in its own thread with its
+    own loop; that loop never gets the per-loop handler and printed the
+    harmless write-race traceback anyway (us_live*.log caught it). Patching
+    the dispatcher applies the same net to every loop in the process - the
+    main one included - while everything else still flows.
+    """
+    if _is_proactor_write_noise(context):
+        return
+    _orig_call_exception_handler(self, context)
+
+
+asyncio.BaseEventLoop.call_exception_handler = _quietly_call_exception_handler
 
 
 async def main_async():

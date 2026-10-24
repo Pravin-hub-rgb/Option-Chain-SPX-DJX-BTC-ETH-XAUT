@@ -1530,6 +1530,33 @@ class StartupConsoleNoiseTests(unittest.TestCase):
         self.assertEqual(loop.default_calls, [real_problem, other_assert])
 
 
+    def test_the_drain_is_installed_on_the_dispatcher_itself(self):
+        """Any loop the process creates - including a helper thread's own -
+        gets the same net at the dispatch point, not at per-loop install."""
+        import asyncio
+        import main as delta_main
+
+        self.assertIs(
+            asyncio.BaseEventLoop.call_exception_handler,
+            delta_main._quietly_call_exception_handler,
+        )
+        seen = []
+        loop = asyncio.ProactorEventLoop()
+        try:
+            loop.set_exception_handler(lambda l, c: seen.append(c))
+            noise = {
+                "exception": AssertionError(),
+                "handle": "<Handle _ProactorBaseWritePipeTransport._loop_writing(...)>",
+            }
+            loop.call_exception_handler(noise)
+            self.assertEqual(seen, [])
+            real = {"exception": OSError("a broken spinner shows"), "handle": "<Handle real>"}
+            loop.call_exception_handler(real)
+            self.assertEqual(seen, [real])
+        finally:
+            loop.close()
+
+
 class ChainExtentStabilityTests(unittest.TestCase):
     """The customer's strategy formulas carry literal row ranges.
 
