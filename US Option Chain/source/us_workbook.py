@@ -18,6 +18,7 @@ import time
 
 from us_diagnostics import append_app_exception, feed_log
 from us_licensing import show_error
+import us_state
 from us_state import (
     _auto_open_done,
     _owner_app,
@@ -436,12 +437,6 @@ def _close_empty_book1(app):
 
 
 def _open_excel_files(finished=None, own_instance=False):
-    try:
-        import pythoncom
-
-        pythoncom.CoInitialize()
-    except Exception:
-        pythoncom = None
     app = None
     try:
         import xlwings as xw
@@ -498,8 +493,3 @@ def _open_excel_files(finished=None, own_instance=False):
     finally:
         if app is not None:
             _close_empty_book1(app)
-        if pythoncom is not None:
-            try:
-                pythoncom.CoUninitialize()
-            except Exception:
-                pass

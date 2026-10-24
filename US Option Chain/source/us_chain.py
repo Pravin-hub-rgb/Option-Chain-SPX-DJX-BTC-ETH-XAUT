@@ -201,8 +201,8 @@ def iso_to_user(iso):
 
 def parse_user_date(s):
     s = str(s).strip()
-    # primary: DD/MM/YYYY
-    m = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})$", s)
+    # accept both slashes and dashes as separator: DD/MM/YYYY or DD-MM-YYYY
+    m = re.match(r"^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$", s)
     if m:
         dd, mm, yyyy = m.groups()
         mi, di = int(mm), int(dd)
@@ -363,7 +363,16 @@ async def load_symbol(sym):
         note_spot(sym, spot, _src)
 
     if expiries:
-        all_known_expiries[sym] = expiries
+        now, _ = eastern_now()
+        today = now.strftime("%Y-%m-%d")
+        all_known_expiries[sym] = [d for d in expiries if d >= today]
+        # Purge any active/pinned slots that have rolled into the past.
+        for i in range(BLOCKS_PER_SHEET):
+            ae = active_expiries[sym][i]
+            if ae and ae < today:
+                print(f"[{sym}] purging past active expiry {ae} from slot {i + 1}", flush=True)
+                active_expiries[sym][i] = None
+                user_pinned[sym][i] = False
     if active_expiries[sym] == [None] * BLOCKS_PER_SHEET:
         # Only re-pick when we actually have expiry data. If this fetch came
         # back empty the previously assigned expiries stay in place and the
@@ -533,6 +542,14 @@ async def expiry_roller():
                 dates = available_expiries(all_known_expiries[sym], sym)
                 if not dates:
                     continue
+                # Purge pin on any slot whose expiry has rolled into the past.
+                now, _ = eastern_now()
+                today = now.strftime("%Y-%m-%d")
+                for i in range(BLOCKS_PER_SHEET):
+                    if active_expiries[sym][i] and active_expiries[sym][i] < today:
+                        print(f"[{sym}] purging past expiry {active_expiries[sym][i]} from slot {i + 1}", flush=True)
+                        active_expiries[sym][i] = None
+                        user_pinned[sym][i] = False
                 pinned = [
                     active_expiries[sym][i]
                     for i in range(BLOCKS_PER_SHEET)
@@ -554,10 +571,13 @@ async def expiry_roller():
                     print(f"[{sym}] slot {i + 1}: {cur or '--'} -> {tgt or '--'}", flush=True)
                 if changed:
                     # Rolling an expiry swaps the strike ladder, so the cached
-                    # payload/shape must go or the new expiry's first write and
-                    # recolour would be skipped as "unchanged".
-                    _main._block_payload.clear()
-                    _main._colour_state.clear()
+                    # payload/shape must go for only the affected role(s).
+                    for role in ROLE_ORDER:
+                        if role_symbol[role] != sym:
+                            continue
+                        for bi in range(BLOCKS_PER_SHEET):
+                            _main._block_payload.pop((role, bi), None)
+                            _main._colour_state.pop((role, bi), None)
                     # write back to every open book currently showing this symbol
                     try:
                         import xlwings as xw
@@ -582,7 +602,6 @@ async def expiry_roller():
                         print(f"Expiry write-back error ({sym}): {e}", flush=True)
             except Exception as e:
                 print(f"Expiry roller error ({sym}): {e}", flush=True)
-    import us_excel as _main
 
 
 
@@ -596,13 +615,21 @@ async def process_pending_dates():
                 if parsed not in all_known_expiries[sym]:
                     print(f"[{sym}] no contracts for {parsed}", flush=True)
                     continue
+                now, _ = eastern_now()
+                today = now.strftime("%Y-%m-%d")
+                if parsed < today:
+                    print(f"[{sym}] rejected past expiry {parsed}", flush=True)
+                    continue
                 active_expiries[sym][i] = parsed
                 user_pinned[sym][i] = True
                 # A different expiry means a different strike ladder, so drop the
-                # cached payload/shape or the first write and the first recolour
-                # of the new expiry would be suppressed.
-                _main._block_payload.clear()
-                _main._colour_state.clear()
+                # cached payload/shape for only the affected role(s).
+                for role in ROLE_ORDER:
+                    if role_symbol[role] != sym:
+                        continue
+                    for bi in range(BLOCKS_PER_SHEET):
+                        _main._block_payload.pop((role, bi), None)
+                        _main._colour_state.pop((role, bi), None)
                 print(f"[{sym}] pinned block {i + 1} -> {parsed}", flush=True)
             except Exception as e:
                 print(f"Date pin error ({sym} {parsed}): {e}", flush=True)
@@ -611,8 +638,8 @@ async def process_pending_dates():
 
 
 def build_option_chain(sym, expiry, range_val=50):
-    sp = spot_cmp[sym]
-    if sp is None or not expiry:
+    sp = spot_cmp[sym] or 0.0
+    if not expiry:
         return None, 0.0
     want = base_root(sym)
     filtered = prefer_expiry_root(live_data[sym].values(), expiry, want)

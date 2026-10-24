@@ -13,7 +13,7 @@ import subprocess
 import threading
 import time
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import us_state
 from us_state import (
@@ -405,6 +405,7 @@ def maybe_exit_after_close_all(excel_alive=None):
                 calc_mode_guard.release(PRODUCT_ID)
             except Exception:
                 pass
+            _heal_keyboard()
             os._exit(0)
     elif us_state._all_gone_since is not None:
         us_state._all_gone_since = None
@@ -465,13 +466,20 @@ def update_expiry_dropdowns(sym, sheet):
     if not dates:
         return
     options = [iso_to_user(d) for d in dates]
-    joined = ",".join(options)
-    if _dropdown_sig.get(sym) == joined:
+    # Include today's date in the signature so the dropdown is forced to
+    # re-sync when the calendar rolls over, and is sheet-aware so a symbol
+    # used by multiple roles doesn't share a stale validation list.
+    from us_time import eastern_now
+    now, _ = eastern_now()
+    today = now.strftime("%Y-%m-%d")
+    sig_key = (sym, id(sheet))
+    joined = f"{today}|{','.join(options)}"
+    if _dropdown_sig.get(sig_key) == joined:
         return
-    _dropdown_sig[sym] = joined
+    _dropdown_sig[sig_key] = joined
     # helper list in far-right column AH (avoids Excel 255-char inline limit)
     helper_col = 34  # AH
-    helper_end = max(len(options), 40)
+    helper_end = 100
     try:
         sheet.range((1, helper_col), (helper_end, helper_col)).clear()
     except Exception as e:
@@ -489,7 +497,9 @@ def update_expiry_dropdowns(sym, sheet):
         sheet.range((1, helper_col)).api.EntireColumn.Hidden = True
     except Exception as e:
         log_excel_exception(sym, e, "hiding expiry dropdown helper column")
-    formula = f"=$AH$1:$AH${len(options)}"
+    # Add one trailing blank cell to the formula to bust Excel's validation
+    # cache: a stale list can persist even after the helper column changes.
+    formula = f"=$AH$1:$AH${len(options) + 1}"
     for cell in EXPIRY_CELLS:
         try:
             sheet.range(cell).api.Validation.Delete()
@@ -504,32 +514,99 @@ def update_expiry_dropdowns(sym, sheet):
             print(f"Dropdown error ({sym} {cell}): {e}", flush=True)
 
 
+def _looks_like_excel_date_serial(val):
+    """Excel serial 40909 = 1/Jan/2012, 49746 = 1/Jan/2024. Dates near now."""
+    if not isinstance(val, (int, float)) or isinstance(val, bool):
+        return False
+    return 40909 <= val <= 60000
+
+
+def _excel_serial_to_date(serial):
+    base = date(1899, 12, 30)
+    return base + timedelta(days=int(serial))
+
+
+def _purge_past_date_cell(sym, i, cell, rng, user_str):
+    """Replace a past date in a cell with the first future expiry.
+    Called before the _user_dates_seen check so old past dates are not
+    adopted and frozen."""
+    from us_time import eastern_now
+    now, _ = eastern_now()
+    today = now.strftime("%Y-%m-%d")
+    parsed = parse_user_date(user_str)
+    if not parsed or parsed >= today:
+        return
+    dates = available_expiries(all_known_expiries[sym], sym, by_date=True)
+    replacement = dates[0] if dates else None
+    if not replacement:
+        return
+    try:
+        rng.value = iso_to_user(replacement)
+        rng.color = (255, 255, 153)
+    except Exception:
+        pass
+    active_expiries[sym][i] = replacement
+    user_pinned[sym][i] = False
+    us_state._user_dates_seen.pop((sym, i), None)
+    print(f"[{sym}] purge_past: {parsed} -> {replacement} in {cell}", flush=True)
+    return
+
+
 def update_user_dates(sym, sheet, pre=None):
     for i, cell in enumerate(EXPIRY_CELLS):
         rng = sheet.range(cell)
         try:
             # text — stops Excel date conversion / #####
-            # Setting the format dirties the cell, so only do it once per
-            # sheet instead of on every refresh.
-            fmt_key = (id(sheet), cell)
-            if fmt_key not in _user_fmt_done:
+            # Set the text format only when it is not already "@": a set
+            # dirties the cell and an identical format every cycle is pure
+            # waste. Excel resets the format when the user picks from the
+            # dropdown; the next pass then sees General and re-applies once.
+            if rng.api.NumberFormat != "@":
                 rng.api.NumberFormat = "@"
-                _user_fmt_done.add(fmt_key)
         except Exception:
             pass
         val = cell_value_from_pre(pre, cell) if pre is not None else rng.value
-        # Excel may have converted text into a datetime — force back to DD/MM/YYYY text
+        # Excel may have converted text into a datetime or a serial number
         if isinstance(val, datetime):
-            rng.value = val.strftime("%d/%m/%Y")
+            try:
+                rng.value = val.strftime("%d/%m/%Y")
+            except Exception:
+                pass
             continue
+        # Excel serial number (e.g. 46123 = 23/10/2026). Convert back to text.
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            if _looks_like_excel_date_serial(val):
+                try:
+                    d = _excel_serial_to_date(val)
+                    rng.value = d.strftime("%d/%m/%Y")
+                except Exception:
+                    pass
+                continue
         if val is None or (isinstance(val, str) and val.strip() == ""):
-            rng.value = iso_to_user(active_expiries[sym][i])
+            from us_time import eastern_now
+            now, _ = eastern_now()
+            today = now.strftime("%Y-%m-%d")
+            ae = active_expiries[sym][i]
+            if ae and ae < today:
+                dates = available_expiries(all_known_expiries[sym], sym, by_date=True)
+                ae = dates[0] if dates else None
+                active_expiries[sym][i] = ae
+                user_pinned[sym][i] = False
+            rng.value = iso_to_user(ae) if ae else ""
             user_pinned[sym][i] = False
             continue
         user_str = str(val).strip()
         user_up = user_str.upper()
         if user_up in ("EXPIRY", "DD/MM/YYYY", "DDMMMYY", "EDIT"):
-            rng.value = iso_to_user(active_expiries[sym][i])
+            from us_time import eastern_now
+            now, _ = eastern_now()
+            today = now.strftime("%Y-%m-%d")
+            ae = active_expiries[sym][i]
+            if ae and ae < today:
+                dates = available_expiries(all_known_expiries[sym], sym, by_date=True)
+                ae = dates[0] if dates else None
+                active_expiries[sym][i] = ae
+            rng.value = iso_to_user(ae) if ae else ""
             user_pinned[sym][i] = False
             continue
         # A value the tool itself wrote is not a user edit.
@@ -543,6 +620,10 @@ def update_user_dates(sym, sheet, pre=None):
         written = us_state._tool_written_dates.get((sym, i))
         if written is not None and user_str == str(written).strip():
             continue
+        # Purge past dates BEFORE the _user_dates_seen check, so a leftover
+        # past date from the previous session is not adopted as the user's
+        # choice and frozen forever.
+        _purge_past_date_cell(sym, i, cell, rng, user_str)
         # Only a cell that CHANGED since the tool last looked at it was edited
         # by somebody. The first look just adopts whatever is there, so a
         # leftover from the previous session is never mistaken for a choice.
@@ -553,6 +634,25 @@ def update_user_dates(sym, sheet, pre=None):
         changed_by_user = us_state._user_dates_seen.get(seen_key) != user_str
         us_state._user_dates_seen[seen_key] = user_str
         parsed = parse_user_date(user_str)
+        if parsed:
+            from us_time import eastern_now
+            now, _ = eastern_now()
+            today = now.strftime("%Y-%m-%d")
+            if parsed < today:
+                # Replace past dates with the first future expiry, not just flag.
+                dates = available_expiries(all_known_expiries[sym], sym, by_date=True)
+                replacement = dates[0] if dates else None
+                if replacement:
+                    try:
+                        rng.value = iso_to_user(replacement)
+                        rng.color = (255, 255, 153)
+                    except Exception:
+                        pass
+                    active_expiries[sym][i] = replacement
+                    user_pinned[sym][i] = False
+                    us_state._user_dates_seen.pop((sym, i), None)
+                    print(f"[{sym}] past expiry {parsed} replaced with {replacement}", flush=True)
+                continue
         if parsed and parsed != active_expiries[sym][i] and changed_by_user:
             # normalize display to DD/MM/YYYY
             if not re.match(r"^\d{1,2}/\d{1,2}/\d{4}$", user_str):
@@ -610,6 +710,42 @@ def _note_screen_failed(exc):
             failures=us_state._screen_failures,
             seconds=_SCREEN_BACKOFF_SECONDS,
             error=type(exc).__name__,
+        )
+
+
+def _screen_update_watchdog_tick():
+    """Finish a failed screen restore once Excel starts answering again.
+
+    The restore inside the window retries three times and then hands the
+    job to this tick ("Excel was busy" is a moment, not a state). It runs
+    once per display cycle while no bulk window is open, respects the
+    screen-failure backoff so it never hammers a busy instance, and only
+    ever touches our own private instance's paint state.
+    """
+    app = us_state._app_cache or us_state._owner_app
+    if app is None:
+        return
+    if us_state._bulk_window_open or _screen_pause_active():
+        return
+    try:
+        busy = app.screen_updating
+    except Exception:
+        return
+    if busy:
+        us_state._screen_restore_owed = False
+        return
+    try:
+        app.screen_updating = True
+    except Exception as e:
+        log_excel_exception("ALL", e, "screen watchdog force-on")
+        return
+    us_state._screen_restore_owed = False
+    now = time.monotonic()
+    if now - us_state._screen_watchdog_logged_at >= 60.0:
+        us_state._screen_watchdog_logged_at = now
+        feed_log(
+            "screen_updating_forced_on",
+            note="watchdog restored paint after a failed in-window restore",
         )
 
 
@@ -840,6 +976,7 @@ def _write_to_excel(role):
         import xlwings as xw
     except ImportError:
         show_error("Required component 'xlwings' is missing.")
+        _heal_keyboard()
         os._exit(1)
     path = ensure_excel_file(role)
     try:
@@ -984,7 +1121,7 @@ def _write_to_excel(role):
             print(f"[{role}] symbol {role_symbol[role]} -> {new_sym}", flush=True)
             role_symbol[role] = new_sym
             _pending_date_loads.clear()
-            _dropdown_sig.pop(new_sym, None)
+            _dropdown_sig.clear()
             # New symbol means different rows and a different ladder, so the
             # payload and shape signatures from the old one must not suppress
             # the first write or the first recolour.
@@ -1024,7 +1161,7 @@ def _write_to_excel(role):
         try:
             update_expiry_dropdowns(sym, sheet)
         except Exception as e:
-            _dropdown_sig.pop(sym, None)
+            _dropdown_sig.clear()
             print(f"update_expiry_dropdowns ({sym}): {e}", flush=True)
             log_excel_exception(role, e, "updating expiry dropdowns")
 
@@ -1397,9 +1534,14 @@ def _time_recalc(wrote):
     Application.Calculate, not CalculateUntilAsyncQueriesDone (that is for
     asynchronous queries such as Power Query). Only done when we actually
     wrote something and Excel was on auto/semiauto — recalculating for a
-    customer who chose manual would undo their choice.
+    customer who chose manual would undo their choice. A cycle skipped for
+    customer input owes its recalculation, so _recalc_owed carries it here:
+    the handwritten spreadsheet the customer was working in gets its fresh
+    values on the very next cycle we can actually run.
     """
-    if not wrote:
+    owed = us_state._recalc_owed
+    us_state._recalc_owed = False
+    if not wrote and not owed:
         _performance_metrics.record("ALL", "excel_recalc_skip_nowrite", 0.0)
         return 0.0
     if not us_state._bulk_will_recalc:
@@ -1408,6 +1550,9 @@ def _time_recalc(wrote):
     app = us_state._app_cache
     if app is None:
         _performance_metrics.record("ALL", "excel_recalc_skip_noapp", 0.0)
+        if owed:
+            # Still owed - Excel comes back and the debt is paid then.
+            us_state._recalc_owed = True
         return 0.0
     try:
         started = time.perf_counter()
@@ -1415,10 +1560,144 @@ def _time_recalc(wrote):
         elapsed = (time.perf_counter() - started) * 1000.0
     except Exception as e:
         log_excel_exception("ALL", e, "forcing workbook recalculation")
+        if owed:
+            # A busy Excel must not silently eat a recalculation the skip
+            # promised; retry on the next free cycle.
+            us_state._recalc_owed = True
         return 0.0
     us_state._last_recalc_ms = elapsed
     _performance_metrics.record("ALL", "excel_recalc", elapsed / 1000.0)
     return elapsed
+
+
+# Any keystroke or click inside this window counts as "hands on the keys".
+_USER_INPUT_GRACE_SECONDS = 0.7
+
+
+def _last_user_input_age():
+    """Seconds since the last input event of any kind, or None."""
+    import ctypes
+
+    class _LASTINPUTINFO(ctypes.Structure):
+        _fields_ = (
+            ("cbSize", ctypes.c_uint),
+            ("dwTime", ctypes.c_ulong),
+        )
+
+    info = _LASTINPUTINFO()
+    info.cbSize = ctypes.sizeof(info)
+    try:
+        if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+            return None
+        tick = ctypes.windll.kernel32.GetTickCount()
+        return max(0.0, (tick - int(info.dwTime)) / 1000.0)
+    except Exception:
+        return None
+
+
+def _foreground_pid():
+    """Process id owning the current foreground window, or None."""
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return None
+        pid = wintypes.DWORD(0)
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return pid.value or None
+    except Exception:
+        return None
+
+
+def _owner_window_pid():
+    """Process id of our private Excel instance, or None."""
+    import ctypes
+    from ctypes import wintypes
+
+    hwnd = us_state._owner_hwnd
+    try:
+        if hwnd:
+            pid = wintypes.DWORD(0)
+            ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value:
+                return pid.value
+    except Exception:
+        pass
+    app = us_state._owner_app
+    if app is None:
+        return None
+    try:
+        return int(app.pid)
+    except Exception:
+        return None
+
+
+def _user_is_excel_interacting():
+    """True while the customer's hands are on OUR Excel this very moment.
+
+    Any keystroke or click within the last ~0.7 s counts as active input,
+    but only counts against the chain when the foreground window belongs to
+    our own Excel instance: typing an email or working in some other
+    workbook never pauses the chain. A yielded cycle skips the write
+    window and the forced recalculation alike, and the missed
+    recalculation is carried over so their formulas stay live.
+    """
+    if platform.system() != "Windows":
+        return False
+    try:
+        age = _last_user_input_age()
+        if age is None or age > _USER_INPUT_GRACE_SECONDS:
+            return False
+        pid = _foreground_pid()
+        owner = _owner_window_pid()
+        if pid is None or owner is None:
+            return False
+        return pid == owner
+    except Exception:
+        return False
+
+
+_EXCEL_BUSY_SKIP_MAX = 30
+
+
+def _excel_in_edit_mode(app):
+    """Detect whether the customer is actively editing Excel.
+
+    Returns True when Excel is in a state where a write cycle would deadlock:
+    - CutCopyMode is non-zero (drag-copy in progress)
+    - Application.Ready is False (edit mode, formula bar active)
+
+    Both checks are fast COM property reads (<5ms when Excel is responsive).
+    If the COM call itself fails or raises, treat as edit mode and skip.
+    """
+    if app is None:
+        return False
+    try:
+        if app.api.CutCopyMode:
+            return True
+        if not app.api.Ready:
+            return True
+    except Exception:
+        return True
+    return False
+
+
+def _excel_busy_skipped():
+    """Increment and check the busy-skip counter.
+
+    Returns True if we should keep skipping (still in edit mode),
+    False if we should abort the skip (timeout exceeded).
+    """
+    us_state._excel_busy_skip_count += 1
+    return us_state._excel_busy_skip_count < _EXCEL_BUSY_SKIP_MAX
+
+
+def _excel_busy_clear():
+    """Reset the busy-skip counter when Excel becomes free."""
+    us_state._excel_busy_skip_count = 0
 
 
 def render_cycle():
@@ -1467,6 +1746,28 @@ def render_cycle():
     if us_state._calc_manual_failed:
         _clear_refused_calc_if_chain_gone()
     if us_state._calc_manual_failed:
+        # Don't show the slow-down popup when Excel is gone — the customer
+        # closed it, not a busy cell or add-in.
+        owner_app = us_state._owner_app
+        if owner_app is None:
+            # No owner reference at all — Excel is gone.
+            _clear_refused_calc_marks()
+        else:
+            try:
+                _ = owner_app.version  # COM liveness probe
+            except Exception:
+                # COM is dead but process may still be winding down.
+                _clear_refused_calc_marks()
+            else:
+                # Owner COM is alive — check process table too.
+                try:
+                    if not excel_process_running():
+                        _clear_refused_calc_marks()
+                except Exception:
+                    pass
+        if not us_state._calc_manual_failed:
+            _performance_metrics.record("ALL", "render_cycle_skipped_noexcel", 0.0)
+            return
         now = time.monotonic()
         if now - us_state._last_unprotected_write < _UNPROTECTED_WRITE_INTERVAL:
             _performance_metrics.record("ALL", "render_cycle_skipped_busy", 0.0)
@@ -1489,6 +1790,31 @@ def render_cycle():
                 )
             except Exception:
                 pass
+
+    # Input yield: never open a write window while the customer's hands are
+    # on our Excel. Their keystrokes land on a repaint-numbed frame - the
+    # formula they type shows nothing, backspace appears to do nothing -
+    # and the window's own COM calls race their typing. Skip the cycle as
+    # a whole; the forced recalculation it owed is carried to the next
+    # one, so strategy formulas never sit stale behind the skip.
+    if _user_is_excel_interacting():
+        us_state._recalc_owed = True
+        _performance_metrics.record("ALL", "render_cycle_skipped_user_input", 0.0)
+        return
+
+    # Detect Excel edit mode: the customer may be dragging a formula, filling
+    # cells, or editing a value while the tool runs. Writing to the Chain sheet
+    # at this moment deadlocks Excel's COM apartment (Application.Ready goes
+    # False, CutCopyMode is active). Skip the write cycle entirely and poll
+    # again next tick - the customer keeps control and the tool resumes when
+    # they are done.
+    app = us_state._app_cache
+    if app is not None and _excel_in_edit_mode(app):
+        if _excel_busy_skipped():
+            _performance_metrics.record("ALL", "render_cycle_skipped_user_edit", 0.0)
+            return
+        # Timeout: force the skip counter reset and try once.
+        _excel_busy_clear()
 
     restore = _begin_excel_bulk_mode(bulk_app())
     try:
@@ -1785,32 +2111,169 @@ def _prompt_belongs_to_chain(hwnd):
     return "option chain" in caption or "options chain" in caption
 
 
-def _send_alt_n(hwnd):
-    """Press the Don't Save accelerator (Alt+N) on a prompt window."""
+# ----------------------------------------------------------------- keyboard.
+# The save-prompt answerer used to synthesise its Alt+N press with
+# keybd_event and four time.sleep calls around it. A process killed between
+# the Alt-DOWN and the Alt-UP - close-all exits, a crash, antivirus - leaves
+# Alt stuck down for the whole desktop: typed letters turn into menu
+# accelerators, menus pop open by themselves, ESC becomes Alt+ESC (windows
+# minimise) and the keyboard looks broken until a reboot. The customer saw
+# this on their own machine and it forced a restart. Everything that keeps
+# that from happening again lives here.
+
+_VK_MENU = 0x12
+_VK_N = 0x4E
+_KEYUP = 2
+
+# No human holds a modifier down for ten seconds; a synthetic one stuck down
+# for ten seconds is a leak we are entitled to repair.
+_STUCK_MODIFIER_SECONDS = 10.0
+
+# Nonempty while our chord is in flight, so exit paths can wait for it.
+_alt_chord_active = threading.Event()
+_alt_modifiers_held_since = {}
+
+
+def _prompt_is_foreground(hwnd):
+    """True when the prompt window already has the keyboard focus.
+
+    A modal Excel prompt pops up as the foreground window, so the usual case
+    is a direct match. When anything else is foreground we do NOT steal the
+    focus with SetForegroundWindow: stealing is exactly what pushed our
+    Alt+N chord into whatever the customer was typing.
+    """
     import ctypes
 
-    user32 = ctypes.windll.user32
-    user32.SetForegroundWindow(hwnd)
-    time.sleep(0.08)
-    vk_menu, vk_n = 0x12, 0x4E  # VK_MENU, VK_N
-    user32.keybd_event(vk_menu, 0, 0, 0)
-    time.sleep(0.04)
-    user32.keybd_event(vk_n, 0, 0, 0)
-    time.sleep(0.04)
-    user32.keybd_event(vk_n, 0, 2, 0)
-    time.sleep(0.04)
-    user32.keybd_event(vk_menu, 0, 2, 0)
-    time.sleep(0.10)
+    try:
+        user32 = ctypes.windll.user32
+    except Exception:
+        return False
+    current = user32.GetForegroundWindow()
+    for _ in range(8):
+        if not current:
+            return False
+        if current == hwnd:
+            return True
+        current = user32.GetAncestor(current, 3)  # GA_ROOTOWNER
+    return False
+
+
+def _send_alt_n(hwnd):
+    """Press the Don't Save accelerator (Alt+N) on a prompt window.
+
+    Returns True when the chord fired. Three rules keep the stuck-Alt
+    incident from ever coming back:
+    1. the prompt must already be foreground (no SetForegroundWindow, no
+       focus theft in the middle of the customer's typing);
+    2. Alt-UP goes out last and on EVERY path - the finally block fires
+       even when the chord itself raises - and with the down-leg only a
+       couple of instructions above the release, an interrupted process can
+       strand Alt for microseconds, not the old quarter of a second;
+    3. the chord is one flight: _alt_chord_active lets exit paths wait for
+       it before os._exit, and _watch_stuck_modifiers_tick heals whatever
+       slips through anyway.
+    """
+    import ctypes
+
+    if not _prompt_is_foreground(hwnd):
+        return False
+    try:
+        user32 = ctypes.windll.user32
+    except Exception:
+        return False
+    _alt_chord_active.set()
+    try:
+        user32.keybd_event(_VK_MENU, 0, 0, 0)
+        user32.keybd_event(_VK_N, 0, 0, 0)
+        user32.keybd_event(_VK_N, 0, _KEYUP, 0)
+        return True
+    except Exception as e:
+        log_excel_exception("ALL", e, "alt+n chord")
+        return False
+    finally:
+        try:
+            # LAST leg, unconditional: this key-up is the modifier ever
+            # getting stuck again.
+            user32.keybd_event(_VK_MENU, 0, _KEYUP, 0)
+        except Exception:
+            pass
+        _alt_chord_active.clear()
+
+
+def _heal_keyboard():
+    """Release every modifier the OS may hold keyboard-down.
+
+    A previous crashed run can leave Alt or Win stuck across the whole
+    desktop. Spurious key-UP events are harmless when the keys are not down,
+    so healing at startup and right before every hard exit costs nothing and
+    undoes the sticky state the customer once needed a reboot for.
+    """
+    import ctypes
+
+    try:
+        user32 = ctypes.windll.user32
+    except Exception:
+        return
+    for vk in (0x12, 0xA4, 0x5B, 0x5C):  # menu, Lmenu, Lwin, Rwin
+        try:
+            user32.keybd_event(vk, 0, _KEYUP, 0)
+        except Exception:
+            pass
+
+
+def _watch_stuck_modifiers_tick():
+    """Release Alt/Win held down way too long with no chord of ours going.
+
+    Last-resort self-repair. GetAsyncKeyState cannot tell a physical hold
+    from a stuck synthetic one, so we only fire on something held beyond
+    what a human ever keeps pressed, and only while no chord is active.
+    """
+    import ctypes
+
+    if _alt_chord_active.is_set():
+        _alt_modifiers_held_since.clear()
+        return
+    if platform.system() != "Windows":
+        return
+    try:
+        user32 = ctypes.windll.user32
+    except Exception:
+        return
+    now = time.monotonic()
+    for vk in (0x12, 0x5B, 0x5C):  # menu, Lwin, Rwin
+        try:
+            down = bool(user32.GetAsyncKeyState(vk) & 0x8000)
+        except Exception:
+            down = False
+        key = (vk,)
+        if not down:
+            _alt_modifiers_held_since.pop(key, None)
+            continue
+        since = _alt_modifiers_held_since.setdefault(key, now)
+        if now - since < _STUCK_MODIFIER_SECONDS:
+            continue
+        try:
+            user32.keybd_event(vk, 0, _KEYUP, 0)
+        except Exception:
+            pass
+        _alt_modifiers_held_since.pop(key, None)
+        feed_log(
+            "stuck_modifier_released",
+            vk=hex(vk),
+            seconds=_STUCK_MODIFIER_SECONDS,
+        )
 
 
 def _answer_save_prompt(hwnd):
-    """Press the prompt's Don't Save button; True when a click was sent.
+    """Press the prompt's Don't Save button; the way it was answered.
 
     Classic prompts are plain dialogs owning standard Button children, so a
-    BM_CLICK on the Don't Save button answers them directly. The modern
-    NetUI prompt has no button windows at all - captions empty, everything
-    inside one NetUIHWND - so for those the Alt+N accelerator is pressed
-    once the dialog is foreground, which Excel maps to Don't Save.
+    BM_CLICK on the Don't Save button answers them directly - no keyboard,
+    no focus change. The modern NetUI prompt has no button windows at all -
+    captions empty, everything inside one NetUIHWND - so for those the
+    Alt+N accelerator is pressed while the dialog itself is already the
+    foreground window. Returns "button", "alt_n" or "" (nothing could be
+    sent this poll; the next poll retries within the attempt limit).
     """
     import ctypes
 
@@ -1825,9 +2288,10 @@ def _answer_save_prompt(hwnd):
         label = text.value.replace("&", "").lower()
         if "don" in label and "save" in label:
             user32.SendMessageW(button, 0x00F5, 0, 0)  # BM_CLICK
-            return True
-    _send_alt_n(hwnd)
-    return False
+            return "button"
+    if _send_alt_n(hwnd):
+        return "alt_n"
+    return ""
 
 
 def _chain_save_prompt_once(attempts):
@@ -1864,11 +2328,11 @@ def _chain_save_prompt_once(attempts):
         if count >= _SAVE_PROMPT_ATTEMPT_LIMIT:
             continue
         attempts[hwnd] = count + 1
-        clicked = _answer_save_prompt(hwnd)
+        way = _answer_save_prompt(hwnd)
         feed_log(
             "chain_save_prompt_answered",
             attempt=count + 1,
-            way="button" if clicked else "alt_n",
+            way=way or "unavailable",
         )
 
 
@@ -1971,13 +2435,21 @@ def _clear_refused_calc_if_chain_gone():
             gone = False
         if gone:
             _clear_refused_calc_marks()
+            return
+        # Excel is alive but books can't be enumerated — typically a save
+        # prompt on workbook close. If this state has persisted for more than
+        # _CANNOT_TELL_TIMEOUT seconds, assume the workbook closed and clear
+        # the marks so the notice never fires.
+        if (us_state._calc_failed_since
+                and time.monotonic() - us_state._calc_failed_since >= _CANNOT_TELL_TIMEOUT):
+            _clear_refused_calc_marks()
         return
     if not _chain_books_missing(open_names):
         return
     _clear_refused_calc_marks()
 
-
 _CALC_NOTICE_GRACE_SECONDS = 60.0
+_CANNOT_TELL_TIMEOUT = 15.0
 _NO_BOOK_SKIP_LOG_SECONDS = 60.0
 
 
@@ -2030,6 +2502,9 @@ def _begin_excel_bulk_mode(app=None):
     are expected and non-fatal: both settings raise if the user is mid-edit or
     a dialog is up, and there may be no workbook to talk to yet.
     """
+    # The watchdog needs to know when NOT to interfere; the window is
+    # marked open only when a restore callable actually comes back.
+    us_state._bulk_window_open = False
     state = {"app": None, "screen": None, "calc": None}
     try:
         if app is None:
@@ -2069,25 +2544,47 @@ def _begin_excel_bulk_mode(app=None):
                     note="no chain workbook is open; skipping the write window",
                 )
             return None
-        try:
-            if _screen_pause_active():
-                # Setting it keeps failing and Excel is busy. Stop trying for a
-                # while rather than making four failing calls every cycle.
-                state["screen"] = None
-            elif app.screen_updating:
-                state["screen"] = True
-                app.screen_updating = False
-                _note_screen_ok()
-            else:
-                # Already off: either the customer turned it off, or the other
-                # OptionChain tool has it off for its own write window. Leave it
-                # and do not record it, or we would "restore" the other tool's
-                # temporary setting and leave the customer's Excel hidden.
-                state["screen"] = None
-        except Exception as e:
-            _note_screen_failed(e)
-            log_excel_exception("ALL", e, "disabling screen_updating")
+        if _screen_pause_active():
+            # Setting it keeps failing and Excel is busy. Stop trying for a
+            # while rather than making four failing calls every cycle.
             state["screen"] = None
+        else:
+            try:
+                owner = app.screen_updating
+            except Exception as e:
+                log_excel_exception("ALL", e, "reading screen_updating")
+                owner = None
+            if owner is None:
+                state["screen"] = None
+            elif owner:
+                state["screen"] = True
+                try:
+                    app.screen_updating = False
+                except Exception as e:
+                    log_excel_exception("ALL", e, "disabling screen_updating")
+                    state["screen"] = None
+                else:
+                    _note_screen_ok()
+            else:
+                # Our private instance: only this tool ever turns screen
+                # updating off (Excel has no UI switch for it), so
+                # "already off" is a leftover from a failed restore, not
+                # the customer's choice. Heal it immediately and own the
+                # window this cycle. The old code recorded nothing on
+                # "already off" - a guard from the shared-Excel era, where
+                # the other tool might legitimately hold the screen off for
+                # its own window - and that guard is what turned one failed
+                # restore into a frozen sheet that only killing the process
+                # un-froze.
+                state["screen"] = True
+                us_state._screen_restore_owed = False
+                try:
+                    app.screen_updating = False
+                except Exception as e:
+                    log_excel_exception("ALL", e, "healing leftover screen_updating")
+                    state["screen"] = None
+                else:
+                    _note_screen_ok()
         try:
             # Read the mode through the raw API on purpose. xlwings' own getter
             # is calculation_i2s[self.xl.Calculation], and when Excel is busy or
@@ -2205,25 +2702,43 @@ def _begin_excel_bulk_mode(app=None):
         if state.get("restored"):
             return
         state["restored"] = True
+        us_state._bulk_window_open = False
         app = state.get("app")
         if app is None:
             return
-        try:
-            _ = app.version
-        except Exception:
-            return
+        # Paint FIRST and unconditionally: a liveness probe must never gate
+        # the repaint toggle. The old code returned early when its version
+        # probe failed, which left ScreenUpdating off exactly when Excel was
+        # busiest; the very next cycle then read "already off" and recorded
+        # nothing to restore, and the sheet sat frozen behind a stale frame
+        # until the customer killed the whole tool. A dead app object
+        # answers the write with an exception we guard, never with silence.
+        if state.get("screen") is not None:
+            want = state["screen"]
+            painted = False
+            for _ in range(3):
+                try:
+                    app.screen_updating = want
+                    _note_screen_ok()
+                    painted = True
+                    break
+                except Exception as e:
+                    log_excel_exception("ALL", e, "restoring screen_updating")
+                    try:
+                        time.sleep(0.25)
+                    except Exception:
+                        pass
+            if not painted:
+                # Excel was too busy three times in a row; the watchdog tick
+                # in display_loop finishes the job the cycle could not.
+                us_state._screen_restore_owed = True
         # The calculation mode is deliberately NOT restored here. We take it
         # once for the whole session and release it on exit, so the two
         # OptionChain tools no longer fight over it several times a second.
         # _emergency_restore() puts it back when the tool stops.
-        if state.get("screen") is not None:
-            try:
-                if not app.screen_updating:
-                    app.screen_updating = state["screen"]
-            except Exception as e:
-                log_excel_exception("ALL", e, "restoring screen_updating")
 
     us_state._last_bulk_restore = restore
+    us_state._bulk_window_open = True
     return restore
 
 
@@ -2265,9 +2780,14 @@ async def display_loop():
             ok, _vt = license_is_valid()
             if not ok:
                 if not ensure_license():
+                    _heal_keyboard()
                     os._exit(1)
         if is_windows:
             _pump_com()
+            # A modifier stuck from a crash - or from anything else on the
+            # machine - is healed here, once per cycle, without ever
+            # touching a key a human could legitimately still be holding.
+            _watch_stuck_modifiers_tick()
             # The chain lives in its private Excel instance, so the write pass
             # runs while that instance is alive - whichever other Excel
             # windows exist on the machine are none of this tool's business.
@@ -2293,6 +2813,9 @@ async def display_loop():
                     print("Excel reopened - rewriting all sheets from scratch.", flush=True)
                     _last_excel_exception.clear()
 
+                # The window is closed at this point, so anything the last
+                # restore could not finish gets finished here.
+                _screen_update_watchdog_tick()
                 render_cycle()
 
             elif not us_state._excel_gone_logged:

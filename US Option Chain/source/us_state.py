@@ -169,6 +169,7 @@ _FIRST_SIGHT_BOUND = 300
 # shows values that are wrong with no error anywhere. A fixed geometry keeps
 # every row their formula can see inside the block forever.
 ROW_EXTENT_DEFAULT = 128
+_excel_busy_skip_count = 0
 _row_extent_seen = {}
 # Adaptive refresh. When Excel still owed a recalculation pass the moment we
 # handed the mode back (excel_recalc_second_pass), the customer's own formula
@@ -207,6 +208,17 @@ _screen_failures = 0
 _screen_blocked_until = 0.0
 _SCREEN_FAILURE_LIMIT = 3
 _SCREEN_BACKOFF_SECONDS = 60.0
+# ScreenUpdating self-heal. _screen_restore_owed goes up when all restore
+# shots inside the write window failed (Excel was busy); the display loop's
+# watchdog tick forces paint back on as soon as Excel answers again.
+# _bulk_window_open marks the moment between opening the write window and
+# its restore, so the watchdog never fights the window it is healing for.
+_screen_restore_owed = False
+_bulk_window_open = False
+_screen_watchdog_logged_at = 0.0
+# A render cycle skipped because the customer's hands were on our Excel
+# owes its forced recalculation to the next writable cycle.
+_recalc_owed = False
 
 _last_recalc_ms = 0.0
 # Cached (book, sheet) COM objects per role — book.sheets[0] is a COM round-trip

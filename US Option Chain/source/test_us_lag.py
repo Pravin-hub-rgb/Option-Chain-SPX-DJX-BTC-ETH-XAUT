@@ -383,11 +383,18 @@ class PerCycleWriteGatingTests(unittest.TestCase):
         self.assertNotIn("_oi_fmt_done", src)
         self.assertIn("force_usd_block_formats", src)
 
-    def test_user_date_format_is_gated(self):
+    def test_user_date_format_is_always_reapplied(self):
+        """Expiry cells must keep @ (text) format every cycle, not just once.
+
+        Excel resets a cell to General when the user picks from the dropdown,
+        and the tool then reads a serial number (e.g. 46123) instead of a date
+        string. The format must be re-set on every render pass.
+        """
         import inspect
         import us_excel
         src = inspect.getsource(us_excel.update_user_dates)
-        self.assertIn("_user_fmt_done", src)
+        self.assertIn('NumberFormat = "@"', src)
+        self.assertIn("_looks_like_excel_date_serial", src)
 
     def test_row_level_diff_is_used(self):
         import inspect
@@ -1925,9 +1932,18 @@ class ChainSavePromptAnswererTests(unittest.TestCase):
         self.assertIn("0x00F5", src)
         self.assertIn("_send_alt_n(hwnd)", src)
         accel = inspect.getsource(us_excel._send_alt_n)
-        self.assertIn("SetForegroundWindow(hwnd)", accel)
-        self.assertIn("0x12", accel)
-        self.assertIn("0x4E", accel)
+        # The stuck-Alt incident rules: no focus stealing from a background
+        # prompt, the Alt-UP fires on every path, and the flight flag lets
+        # the exit paths wait for the chord before os._exit.
+        self.assertIn("_prompt_is_foreground(hwnd)", accel)
+        self.assertNotIn("SetForegroundWindow(hwnd)", accel)
+        self.assertEqual(us_excel._VK_MENU, 0x12)
+        self.assertEqual(us_excel._VK_N, 0x4E)
+        self.assertIn("keybd_event(_VK_MENU, 0, 0, 0)", accel)
+        self.assertIn("keybd_event(_VK_N, 0, 0, 0)", accel)
+        self.assertIn("finally:", accel)
+        self.assertIn("keybd_event(_VK_MENU, 0, _KEYUP, 0)", accel)
+        self.assertIn("_alt_chord_active", accel)
 
     def test_a_stuck_prompt_is_never_hammered_forever(self):
         import inspect
@@ -1953,6 +1969,607 @@ class ChainSavePromptAnswererTests(unittest.TestCase):
         # underscore captions like us_stock_option_chain must match too
         self.assertIn('.replace("_", " ")', src)
         self.assertIn('"option chain" in caption', src)
+
+
+class KeyboardModifierArmorTests(unittest.TestCase):
+    """Nothing may leave a modifier stuck system-wide - ever again.
+
+    A customer's whole PC acting like Alt was held down came from the old
+    _send_alt_n: Alt down, four sleeps, Alt up, and an exit in between kept
+    the modifier pressed across every desktop app (typed letters became
+    ribbon accelerators, ESC became Alt+ESC and minimised windows, menus
+    popped open). The pins below hold the rules: no chord to a background
+    prompt, the Alt-UP on every code path, healing at startup and before
+    every hard exit, and a ten-second stuck-modifier repair.
+    """
+
+    def test_a_background_prompt_gets_no_chord(self):
+        from unittest.mock import patch
+        import us_excel
+
+        class FakeUser32:
+            def __init__(self):
+                self.fg = 0x777
+                self.calls = []
+
+            def GetForegroundWindow(self):
+                return self.fg
+
+            def GetAncestor(self, hwnd, flag):
+                return 0
+
+            def keybd_event(self, vk, scan, flags, extra):
+                self.calls.append((vk, flags))
+
+        fake = FakeUser32()
+        with patch("ctypes.windll") as windll:
+            windll.user32 = fake
+            self.assertFalse(us_excel._send_alt_n(0x200))
+            self.assertEqual(
+                fake.calls, [], "no synthetic keys into a background prompt"
+            )
+
+    def test_the_chord_releases_alt_on_every_path(self):
+        from unittest.mock import patch
+        import us_excel
+
+        class FakeUser32:
+            def __init__(self, raise_on_n=False):
+                self.fg = 0x200
+                self.calls = []
+                self.raise_on_n = raise_on_n
+
+            def GetForegroundWindow(self):
+                return self.fg
+
+            def GetAncestor(self, hwnd, flag):
+                return 0
+
+            def keybd_event(self, vk, scan, flags, extra):
+                if self.raise_on_n and vk == us_excel._VK_N and flags == 0:
+                    raise OSError("synthetic failure")
+                self.calls.append((vk, flags))
+
+        fake = FakeUser32()
+        with patch("ctypes.windll") as windll:
+            windll.user32 = fake
+            self.assertTrue(us_excel._send_alt_n(0x200))
+        # The chord ends with an Alt release, always.
+        self.assertEqual(fake.calls[-1], (us_excel._VK_MENU, us_excel._KEYUP))
+
+        fake = FakeUser32(raise_on_n=True)
+        with patch("ctypes.windll") as windll:
+            windll.user32 = fake
+            self.assertFalse(us_excel._send_alt_n(0x200))
+        # Even a failing chord ends with the Alt-UP the desktop needs.
+        self.assertEqual(fake.calls[-1], (us_excel._VK_MENU, us_excel._KEYUP))
+
+    def test_heal_releases_menu_and_win_keys(self):
+        from unittest.mock import patch
+        import us_excel
+
+        class FakeUser32:
+            def __init__(self):
+                self.calls = []
+
+            def keybd_event(self, vk, scan, flags, extra):
+                self.calls.append((vk, flags))
+
+        fake = FakeUser32()
+        with patch("ctypes.windll") as windll:
+            windll.user32 = fake
+            us_excel._heal_keyboard()
+        self.assertIn((0x12, 2), fake.calls)
+        self.assertIn((0x5B, 2), fake.calls)
+        self.assertIn((0x5C, 2), fake.calls)
+
+    def test_startup_heals_and_hard_exits_heal(self):
+        import inspect
+        import main
+        import us_excel
+
+        self.assertIn("us_excel._heal_keyboard()", inspect.getsource(main.main_async))
+        maybe_src = inspect.getsource(us_excel.maybe_exit_after_close_all)
+        self.assertIn("_heal_keyboard()", maybe_src)
+        self.assertIn("os._exit(0)", maybe_src)
+        # The heal precedes the exit, so a mid-chord kill cannot strand Alt.
+        self.assertLess(
+            maybe_src.index("_heal_keyboard()"), maybe_src.index("os._exit(0)")
+        )
+        wl_src = inspect.getsource(us_excel._write_to_excel)
+        self.assertIn("_heal_keyboard()", wl_src)
+        dl_src = inspect.getsource(us_excel.display_loop)
+        self.assertIn("_heal_keyboard()", dl_src)
+        self.assertIn("_watch_stuck_modifiers_tick()", dl_src)
+
+    def test_a_ten_second_stuck_alt_is_released(self):
+        from unittest.mock import patch
+        import time
+        import us_excel
+
+        class FakeUser32:
+            def __init__(self):
+                self.calls = []
+
+            def GetAsyncKeyState(self, vk):
+                return 0x8000
+
+            def keybd_event(self, vk, scan, flags, extra):
+                self.calls.append((vk, flags))
+
+        fake = FakeUser32()
+        us_excel._alt_modifiers_held_since.clear()
+        us_excel._alt_chord_active.clear()
+        try:
+            with patch("ctypes.windll") as windll:
+                windll.user32 = fake
+                # First sight only records - no release inside the grace.
+                us_excel._watch_stuck_modifiers_tick()
+                self.assertEqual(fake.calls, [])
+                # ...ten seconds of the same key later: repaired.
+                us_excel._alt_modifiers_held_since[(0x12,)] = (
+                    time.monotonic() - 11.0
+                )
+                us_excel._watch_stuck_modifiers_tick()
+                self.assertIn((0x12, 2), fake.calls)
+                self.assertNotIn((0x12,), us_excel._alt_modifiers_held_since)
+        finally:
+            us_excel._alt_modifiers_held_since.clear()
+            us_excel._alt_chord_active.clear()
+
+
+class ScreenUpdatingSelfHealTests(unittest.TestCase):
+    """The screen must never stick off behind a stale frame again.
+
+    One failed restore used to be permanent: the next cycle read "already
+    off", recorded nothing (the shared-era guard), and the sheet froze
+    until the tool was killed. The pins force both ends: restore tries
+    paint before any probe and reports what it could not do, and the
+    watchdog finishes the job the moment Excel answers again.
+    """
+
+    def test_restore_attempts_paint_even_when_the_app_goes_busy(self):
+        from unittest.mock import patch
+        import us_state
+        import us_excel
+
+        class EntryOkThenBusyApp:
+            """Screen goes off fine this cycle; restoring it back fails."""
+
+            def __init__(self):
+                self.screen = True
+                self.attempts = []
+
+            @property
+            def version(self):
+                return "16.0"
+
+            @property
+            def books(self):
+                return [type("B", (), {"name": "us_stock_option_chain.xlsx"})()]
+
+            @property
+            def screen_updating(self):
+                return self.screen
+
+            @screen_updating.setter
+            def screen_updating(self, value):
+                if value:
+                    self.attempts.append(value)
+                    raise RuntimeError("Excel is busy now")
+                self.screen = value
+
+            @property
+            def api(self):
+                return type("Api", (), {"Calculation": -4105})()
+
+        app = EntryOkThenBusyApp()
+        us_state._app_cache = app
+        us_state._screen_restore_owed = False
+        us_state._bulk_window_open = False
+        try:
+            with patch.object(
+                us_excel.calc_mode_guard, "other_holder_alive", return_value=False
+            ):
+                with patch.object(us_excel.calc_mode_guard, "release"):
+                    with patch.object(us_excel.time, "sleep", lambda s: None):
+                        # The entry-side set succeeds (True -> False), the
+                        # restore then fails three times in a row.
+                        restore = us_excel._begin_excel_bulk_mode(app)
+                        self.assertIsNotNone(restore)
+                        self.assertTrue(us_state._bulk_window_open)
+                        restore()
+            self.assertFalse(us_state._bulk_window_open)
+            # Three writes were attempted and all failed; the watchdog owes
+            # the repaint now.
+            self.assertEqual(len(app.attempts), 3)
+            self.assertTrue(us_state._screen_restore_owed)
+        finally:
+            us_state._screen_restore_owed = False
+            us_state._app_cache = None
+
+    def test_already_off_screen_is_healed_and_owned(self):
+        from unittest.mock import patch
+        import us_state
+        import us_excel
+
+        class LeftoverApp:
+            def __init__(self):
+                self.screen = True
+
+            @property
+            def version(self):
+                return "16.0"
+
+            @property
+            def books(self):
+                return [type("B", (), {"name": "spx_option_chain.xlsx"})()]
+
+            @property
+            def screen_updating(self):
+                return self.screen
+
+            @screen_updating.setter
+            def screen_updating(self, value):
+                self.screen = value
+
+            @property
+            def api(self):
+                return type("Api", (), {"Calculation": -4135})()
+
+        app = LeftoverApp()
+        # A leftover from a failed previous restore...
+        app.screen = False
+        us_state._app_cache = app
+        try:
+            with patch.object(
+                us_excel.calc_mode_guard, "other_holder_alive", return_value=False
+            ):
+                restore = us_excel._begin_excel_bulk_mode(app)
+                self.assertIsNotNone(restore)
+                self.assertTrue(us_state._bulk_window_open)
+                restore()
+            # ...is healed this cycle and handed back ON, not carried over.
+            self.assertTrue(app.screen)
+            self.assertFalse(us_state._bulk_window_open)
+        finally:
+            us_state._bulk_window_open = False
+
+    def test_the_watchdog_finishes_a_failed_restore(self):
+        import us_state
+        import us_excel
+
+        class StickyApp:
+            def __init__(self):
+                self.screen = False
+                self.attempts = []
+
+            @property
+            def version(self):
+                return "16.0"
+
+            @property
+            def screen_updating(self):
+                return self.screen
+
+            @screen_updating.setter
+            def screen_updating(self, value):
+                self.screen = value
+                self.attempts.append(value)
+
+        app = StickyApp()
+        us_state._app_cache = app
+        us_state._owner_app = app
+        us_state._screen_restore_owed = True
+        us_state._bulk_window_open = False
+        us_state._screen_blocked_until = 0.0
+        try:
+            us_excel._screen_update_watchdog_tick()
+            self.assertTrue(app.screen)
+            self.assertFalse(us_state._screen_restore_owed)
+        finally:
+            us_state._screen_restore_owed = False
+
+    def test_the_watchdog_stays_out_of_the_write_window(self):
+        import us_state
+        import us_excel
+
+        class App:
+            @property
+            def screen_updating(self):
+                raise AssertionError("watchdog probed an open write window")
+
+        app = App()
+        us_state._app_cache = app
+        us_state._bulk_window_open = True
+        try:
+            us_excel._screen_update_watchdog_tick()
+        finally:
+            us_state._bulk_window_open = False
+
+
+class RenderYieldTests(unittest.TestCase):
+    """The chain pauses only while the customer's hands are on OUR Excel.
+
+    Typing a formula into a repaint-numbed frame is what produced "I typed
+    and nothing is showing". Full speed stays the rule; a cycle is skipped
+    only for fresh input in our own instance, and what that skip owes the
+    recalculation is carried, never dropped.
+    """
+
+    def test_our_excel_in_front_with_fresh_input_yields(self):
+        from unittest.mock import patch
+        import us_excel
+
+        with patch.object(us_excel, "_last_user_input_age", return_value=0.1), \
+             patch.object(us_excel, "_foreground_pid", return_value=4242), \
+             patch.object(us_excel, "_owner_window_pid", return_value=4242):
+            self.assertTrue(us_excel._user_is_excel_interacting())
+
+    def test_another_app_in_front_never_yields(self):
+        from unittest.mock import patch
+        import us_excel
+
+        with patch.object(us_excel, "_last_user_input_age", return_value=0.1), \
+             patch.object(us_excel, "_foreground_pid", return_value=4242), \
+             patch.object(us_excel, "_owner_window_pid", return_value=9999):
+            self.assertFalse(us_excel._user_is_excel_interacting())
+
+    def test_older_input_and_unresolvable_windows_do_not_yield(self):
+        from unittest.mock import patch
+        import us_excel
+
+        with patch.object(us_excel, "_last_user_input_age", return_value=2.0), \
+             patch.object(us_excel, "_foreground_pid", return_value=4242), \
+             patch.object(us_excel, "_owner_window_pid", return_value=4242):
+            self.assertFalse(us_excel._user_is_excel_interacting())
+
+        with patch.object(us_excel, "_last_user_input_age", return_value=None), \
+             patch.object(us_excel, "_foreground_pid", return_value=None), \
+             patch.object(us_excel, "_owner_window_pid", return_value=None):
+            self.assertFalse(us_excel._user_is_excel_interacting())
+
+    def test_render_cycle_yields_before_the_write_window(self):
+        import inspect
+        import us_excel
+
+        src = inspect.getsource(us_excel.render_cycle)
+        self.assertIn("_user_is_excel_interacting()", src)
+        self.assertLess(
+            src.index("_user_is_excel_interacting()"),
+            src.index("_begin_excel_bulk_mode("),
+        )
+        self.assertIn("render_cycle_skipped_user_input", src)
+
+    def test_a_yielded_cycle_carries_the_recalc(self):
+        import us_state
+        import us_excel
+
+        us_state._recalc_owed = False
+        us_state._bulk_will_recalc = True
+        us_state._app_cache = None
+        # Nothing written, nothing owed: plain skip.
+        us_excel._time_recalc(False)
+        self.assertFalse(us_state._recalc_owed)
+        # Owed but Excel absent: the debt survives and is paid later.
+        us_state._recalc_owed = True
+        us_excel._time_recalc(False)
+        self.assertTrue(us_state._recalc_owed)
+
+    def test_an_owed_recalc_survives_a_busy_excel(self):
+        import us_state
+        import us_excel
+
+        class BusyRecalcApp:
+            @property
+            def api(self):
+                return self
+
+            Calculation = -4105
+
+            def Calculate(self):
+                raise RuntimeError("Excel is busy mid-recalc")
+
+        app = BusyRecalcApp()
+        us_state._app_cache = app
+        us_state._bulk_will_recalc = True
+        try:
+            with patch.object(us_excel, "log_excel_exception"):
+                # Nothing written this cycle - but a debt was carried in
+                # from a yielded one. A busy Excel must not eat it.
+                us_state._recalc_owed = True
+                us_excel._time_recalc(False)
+                self.assertTrue(
+                    us_state._recalc_owed,
+                    "the skip promised this recalculation; retry next cycle",
+                )
+                # A written cycle owns its own recalc: if it fails, that
+                # failure is one failed write, not an unpaid debt.
+                us_state._recalc_owed = False
+                us_excel._time_recalc(True)
+                self.assertFalse(us_state._recalc_owed)
+        finally:
+            us_state._recalc_owed = False
+            us_state._bulk_will_recalc = False
+            us_state._app_cache = None
+
+
+class PastDatePurgeTests(unittest.TestCase):
+    """Past dates in expiry cells must be replaced, not just colored red.
+
+    Covers two failure modes:
+    1. A past date left over from a previous session gets frozen by
+       _user_dates_seen on the first look - the purge must run before that.
+    2. A user typing a past date must get it replaced with the first future
+       expiry, and the dropdown must reflect only future dates.
+    """
+
+    def setUp(self):
+        import us_excel
+        import us_state
+        import us_chain
+
+        self.us_excel = us_excel
+        self.us_state = us_state
+        self.us_chain = us_chain
+        import us_workbook
+        self.us_workbook = us_workbook
+
+        self._saved_expiry = dict(us_chain.active_expiries)
+        self._saved_pinned = dict(us_chain.user_pinned)
+        self._saved_known = dict(us_chain.all_known_expiries)
+        self._saved_seen = dict(us_state._user_dates_seen)
+        self._saved_fmt = set(us_excel._user_fmt_done)
+        self._saved_sig = dict(us_excel._dropdown_sig)
+
+        sym = "SPY"
+        us_chain.active_expiries[sym] = [None] * self.us_workbook.BLOCKS_PER_SHEET
+        us_chain.user_pinned[sym] = [False] * self.us_workbook.BLOCKS_PER_SHEET
+
+        future = ["2026-11-20", "2026-11-27", "2026-12-18"]
+        us_chain.all_known_expiries[sym] = future
+        us_excel._user_fmt_done.clear()
+        us_excel._dropdown_sig.clear()
+        us_state._user_dates_seen.clear()
+
+    def tearDown(self):
+        import us_excel
+        import us_state
+        import us_chain
+
+        us_chain.active_expiries.clear()
+        us_chain.active_expiries.update(self._saved_expiry)
+        us_chain.user_pinned.clear()
+        us_chain.user_pinned.update(self._saved_pinned)
+        us_chain.all_known_expiries.clear()
+        us_chain.all_known_expiries.update(self._saved_known)
+        us_state._user_dates_seen.clear()
+        us_state._user_dates_seen.update(self._saved_seen)
+        us_excel._user_fmt_done.clear()
+        us_excel._user_fmt_done.update(self._saved_fmt)
+        us_excel._dropdown_sig.clear()
+        us_excel._dropdown_sig.update(self._saved_sig)
+
+    def test_purge_replaces_past_date_before_seen_check(self):
+        """A past date in a cell must be replaced on the very first look,
+        not frozen by _user_dates_seen."""
+        import us_excel
+        import us_state
+        from us_time import eastern_now
+        from us_workbook import EXPIRY_CELLS
+
+        sym = "SPY"
+        now, _ = eastern_now()
+        today = now.strftime("%Y-%m-%d")
+
+        past_date = "01/01/2020"  # well in the past
+
+        class FakeRange:
+            def __init__(self):
+                self.value = past_date
+                self.api = MagicMock()
+
+        class FakeSheet:
+            def range(self, cell_ref):
+                return FakeRange()
+
+        sheet = FakeSheet()
+
+        # Pre-populate the cell with a past date, as if left over from
+        # a previous session.
+        rng = FakeRange()
+        rng.value = past_date
+
+        us_excel._purge_past_date_cell(sym, 0, "D3", rng, past_date)
+
+        self.assertNotEqual(rng.value, past_date)
+        self.assertNotIn((sym, 0), us_state._user_dates_seen)
+
+    def test_purge_clears_seen_key_for_replacement(self):
+        """After purging a past date, _user_dates_seen must not contain the
+        old value, so a subsequent call doesn't re-adopt it."""
+        import us_excel
+        import us_state
+
+        sym = "SPY"
+        past_date = "01/01/2020"
+
+        class FakeRange:
+            def __init__(self):
+                self.value = None
+                self.api = MagicMock()
+
+        cells = {}
+
+        class FakeSheet:
+            def range(self, cell_ref):
+                if cell_ref not in cells:
+                    cells[cell_ref] = FakeRange()
+                return cells[cell_ref]
+
+        sheet = FakeSheet()
+        rng = FakeRange()
+
+        us_state._user_dates_seen[(sym, 0)] = past_date
+        us_excel._purge_past_date_cell(sym, 0, "D3", rng, past_date)
+        self.assertNotIn((sym, 0), us_state._user_dates_seen)
+
+    def test_dropdown_sig_is_sheet_aware_and_date_aware(self):
+        """_dropdown_sig key must include sheet id and today's date so stale
+        lists can't persist across date rollover or sheet changes."""
+        import inspect
+        import us_excel
+
+        src = inspect.getsource(us_excel.update_expiry_dropdowns)
+        self.assertIn("(sym, id(sheet))", src)
+        self.assertIn("today", src)
+
+    def test_cannot_tell_timeout_constant_exists(self):
+        """The timeout that clears marks when Excel can't be probed must exist."""
+        import us_excel
+        self.assertTrue(hasattr(us_excel, "_CANNOT_TELL_TIMEOUT"))
+        self.assertGreater(us_excel._CANNOT_TELL_TIMEOUT, 0)
+
+    def test_excel_in_edit_mode_detected(self):
+        """_excel_in_edit_mode must return True when CutCopyMode or Ready is false."""
+        import us_excel
+
+        class FakeApi:
+            def __init__(self, ready=True, cut_copy=True):
+                self._ready = ready
+                self._cut = cut_copy
+
+            @property
+            def Ready(self):
+                return self._ready
+
+            @property
+            def CutCopyMode(self):
+                return self._cut
+
+        class FakeApp:
+            def __init__(self, ready=True, cut_copy=True):
+                self.api = FakeApi(ready, cut_copy)
+
+        # CutCopyMode active = editing
+        self.assertTrue(us_excel._excel_in_edit_mode(FakeApp(ready=True, cut_copy=True)))
+        # Ready False = busy
+        self.assertTrue(us_excel._excel_in_edit_mode(FakeApp(ready=False, cut_copy=False)))
+        # Neither = not editing
+        self.assertFalse(us_excel._excel_in_edit_mode(FakeApp(ready=True, cut_copy=False)))
+        # None app
+        self.assertFalse(us_excel._excel_in_edit_mode(None))
+
+
+class _FakeCell:
+    """Mock Excel range object for update_user_dates tests."""
+
+    def __init__(self, value=None):
+        self.value = value
+        self.api = MagicMock()
+
+
+
 
 
 class _FakeUser32:

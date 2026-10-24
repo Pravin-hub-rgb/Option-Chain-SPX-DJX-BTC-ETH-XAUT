@@ -954,9 +954,18 @@ class ChainSavePromptAnswererTests(unittest.TestCase):
         self.assertIn("0x00F5", src)
         self.assertIn("_send_alt_n(hwnd)", src)
         accel = inspect.getsource(delta_main._send_alt_n)
-        self.assertIn("SetForegroundWindow(hwnd)", accel)
-        self.assertIn("0x12", accel)
-        self.assertIn("0x4E", accel)
+        # The stuck-Alt incident rules: no focus stealing from a background
+        # prompt, the Alt-UP fires on every path, and the flight flag lets
+        # the exit paths wait for the chord before os._exit.
+        self.assertIn("_prompt_is_foreground(hwnd)", accel)
+        self.assertNotIn("SetForegroundWindow(hwnd)", accel)
+        self.assertEqual(delta_main._VK_MENU, 0x12)
+        self.assertEqual(delta_main._VK_N, 0x4E)
+        self.assertIn("keybd_event(_VK_MENU, 0, 0, 0)", accel)
+        self.assertIn("keybd_event(_VK_N, 0, 0, 0)", accel)
+        self.assertIn("finally:", accel)
+        self.assertIn("keybd_event(_VK_MENU, 0, _KEYUP, 0)", accel)
+        self.assertIn("_alt_chord_active", accel)
 
     def test_a_stuck_prompt_is_never_hammered_forever(self):
         import inspect
@@ -1012,6 +1021,423 @@ class _FakeUser32:
                 return True
 
         self.user32 = _U32()
+
+
+class KeyboardModifierArmorTests(unittest.TestCase):
+    """Nothing may leave a modifier stuck system-wide - ever again.
+
+    A customer's whole PC acting like Alt was held down came from the old
+    _send_alt_n: Alt down, four sleeps, Alt up, and an exit in between kept
+    the modifier pressed across every desktop app (typed letters became
+    ribbon accelerators, ESC became Alt+ESC and minimised windows, menus
+    popped open). The pins below hold the rules: no chord to a background
+    prompt, the Alt-UP on every code path, healing at startup and before
+    every hard exit, and a ten-second stuck-modifier repair.
+    """
+
+    def test_a_background_prompt_gets_no_chord(self):
+        from unittest.mock import patch
+        import main as delta_main
+
+        class FakeUser32:
+            def __init__(self):
+                self.fg = 0x777
+                self.calls = []
+
+            def GetForegroundWindow(self):
+                return self.fg
+
+            def GetAncestor(self, hwnd, flag):
+                return 0
+
+            def keybd_event(self, vk, scan, flags, extra):
+                self.calls.append((vk, flags))
+
+        fake = FakeUser32()
+        with patch("ctypes.windll") as windll:
+            windll.user32 = fake
+            self.assertFalse(delta_main._send_alt_n(0x200))
+            self.assertEqual(
+                fake.calls, [], "no synthetic keys into a background prompt"
+            )
+
+    def test_the_chord_releases_alt_on_every_path(self):
+        from unittest.mock import patch
+        import main as delta_main
+
+        class FakeUser32:
+            def __init__(self, raise_on_n=False):
+                self.fg = 0x200
+                self.calls = []
+                self.raise_on_n = raise_on_n
+
+            def GetForegroundWindow(self):
+                return self.fg
+
+            def GetAncestor(self, hwnd, flag):
+                return 0
+
+            def keybd_event(self, vk, scan, flags, extra):
+                if self.raise_on_n and vk == delta_main._VK_N and flags == 0:
+                    raise OSError("synthetic failure")
+                self.calls.append((vk, flags))
+
+        fake = FakeUser32()
+        with patch("ctypes.windll") as windll:
+            windll.user32 = fake
+            self.assertTrue(delta_main._send_alt_n(0x200))
+        # The chord ends with an Alt release, always.
+        self.assertEqual(fake.calls[-1], (delta_main._VK_MENU, delta_main._KEYUP))
+
+        fake = FakeUser32(raise_on_n=True)
+        with patch("ctypes.windll") as windll:
+            windll.user32 = fake
+            self.assertFalse(delta_main._send_alt_n(0x200))
+        # Even a failing chord ends with the Alt-UP the desktop needs.
+        self.assertEqual(fake.calls[-1], (delta_main._VK_MENU, delta_main._KEYUP))
+
+    def test_heal_releases_menu_and_win_keys(self):
+        from unittest.mock import patch
+        import main as delta_main
+
+        class FakeUser32:
+            def __init__(self):
+                self.calls = []
+
+            def keybd_event(self, vk, scan, flags, extra):
+                self.calls.append((vk, flags))
+
+        fake = FakeUser32()
+        with patch("ctypes.windll") as windll:
+            windll.user32 = fake
+            delta_main._heal_keyboard()
+        self.assertIn((0x12, 2), fake.calls)
+        self.assertIn((0x5B, 2), fake.calls)
+        self.assertIn((0x5C, 2), fake.calls)
+
+    def test_startup_heals_and_hard_exits_heal(self):
+        import inspect
+        import main as delta_main
+
+        self.assertIn("_heal_keyboard()", inspect.getsource(delta_main.main_async))
+        maybe_src = inspect.getsource(delta_main.maybe_exit_after_close_all)
+        self.assertIn("_heal_keyboard()", maybe_src)
+        self.assertIn("os._exit(0)", maybe_src)
+        # The heal precedes the exit, so a mid-chord kill cannot strand Alt.
+        self.assertLess(
+            maybe_src.index("_heal_keyboard()"), maybe_src.index("os._exit(0)")
+        )
+        wl_src = inspect.getsource(delta_main._write_to_excel)
+        self.assertIn("_heal_keyboard()", wl_src)
+        dl_src = inspect.getsource(delta_main.display_loop)
+        self.assertIn("_heal_keyboard()", dl_src)
+        self.assertIn("_watch_stuck_modifiers_tick()", dl_src)
+        self.assertIn("_heal_keyboard()", inspect.getsource(delta_main.main))
+
+    def test_a_ten_second_stuck_alt_is_released(self):
+        from unittest.mock import patch
+        import time
+        import main as delta_main
+
+        class FakeUser32:
+            def __init__(self):
+                self.calls = []
+
+            def GetAsyncKeyState(self, vk):
+                return 0x8000
+
+            def keybd_event(self, vk, scan, flags, extra):
+                self.calls.append((vk, flags))
+
+        fake = FakeUser32()
+        delta_main._alt_modifiers_held_since.clear()
+        delta_main._alt_chord_active.clear()
+        try:
+            with patch("ctypes.windll") as windll:
+                windll.user32 = fake
+                # First sight only records - no release inside the grace.
+                delta_main._watch_stuck_modifiers_tick()
+                self.assertEqual(fake.calls, [])
+                # ...ten seconds of the same key later: repaired.
+                delta_main._alt_modifiers_held_since[(0x12,)] = (
+                    time.monotonic() - 11.0
+                )
+                delta_main._watch_stuck_modifiers_tick()
+                self.assertIn((0x12, 2), fake.calls)
+                self.assertNotIn((0x12,), delta_main._alt_modifiers_held_since)
+        finally:
+            delta_main._alt_modifiers_held_since.clear()
+            delta_main._alt_chord_active.clear()
+
+
+class ScreenUpdatingSelfHealTests(unittest.TestCase):
+    """The screen must never stick off behind a stale frame again.
+
+    One failed restore used to be permanent: the next cycle read "already
+    off", recorded nothing (the shared-era guard), and the sheet froze
+    until the tool was killed. The pins force both ends: restore tries
+    paint before any probe and reports what it could not do, and the
+    watchdog finishes the job the moment Excel answers again.
+    """
+
+    def test_restore_attempts_paint_even_when_the_app_goes_busy(self):
+        from unittest.mock import patch
+        import delta_state
+        import main as delta_main
+
+        class EntryOkThenBusyApp:
+            """Screen goes off fine this cycle; restoring it back fails."""
+
+            def __init__(self):
+                self.screen = True
+                self.attempts = []
+
+            @property
+            def version(self):
+                return "16.0"
+
+            @property
+            def books(self):
+                return [type("B", (), {"name": "btc_chain.xlsx"})()]
+
+            @property
+            def screen_updating(self):
+                return self.screen
+
+            @screen_updating.setter
+            def screen_updating(self, value):
+                if value:
+                    self.attempts.append(value)
+                    raise RuntimeError("Excel is busy now")
+                self.screen = value
+
+            @property
+            def api(self):
+                return type("Api", (), {"Calculation": -4105})()
+
+        app = EntryOkThenBusyApp()
+        delta_state._app_cache = app
+        delta_state._screen_restore_owed = False
+        delta_state._bulk_window_open = False
+        try:
+            with patch.object(delta_main, "time") as time_fake:
+                time_fake.sleep = lambda s: None
+                time_fake.monotonic.return_value = 1234.0
+                with patch.object(
+                    delta_main, "excel_process_running", lambda: True
+                ):
+                    restore = delta_main._begin_excel_bulk_mode()
+                    self.assertIsNotNone(restore)
+                    self.assertTrue(delta_state._bulk_window_open)
+                    restore()
+            self.assertFalse(delta_state._bulk_window_open)
+            # Three writes were attempted and all failed; the watchdog owes
+            # the repaint now.
+            self.assertEqual(len(app.attempts), 3)
+            self.assertTrue(delta_state._screen_restore_owed)
+        finally:
+            delta_state._screen_restore_owed = False
+            delta_state._app_cache = None
+            delta_state._bulk_window_open = False
+
+    def test_already_off_screen_is_healed_and_owned(self):
+        from unittest.mock import patch
+        import delta_state
+        import main as delta_main
+
+        class LeftoverApp:
+            def __init__(self):
+                self.screen = True
+
+            @property
+            def version(self):
+                return "16.0"
+
+            @property
+            def books(self):
+                return [type("B", (), {"name": "btc_chain.xlsx"})()]
+
+            @property
+            def screen_updating(self):
+                return self.screen
+
+            @screen_updating.setter
+            def screen_updating(self, value):
+                self.screen = value
+
+        app = LeftoverApp()
+        # A leftover from a failed previous restore...
+        app.screen = False
+        delta_state._app_cache = app
+        try:
+            restore = delta_main._begin_excel_bulk_mode()
+            self.assertIsNotNone(restore)
+            self.assertTrue(delta_state._bulk_window_open)
+            restore()
+            # ...is healed this cycle and handed back ON, not carried over.
+            self.assertTrue(app.screen)
+            self.assertFalse(delta_state._bulk_window_open)
+        finally:
+            delta_state._bulk_window_open = False
+            delta_state._app_cache = None
+
+    def test_the_watchdog_finishes_a_failed_restore(self):
+        import delta_state
+        import main as delta_main
+
+        class StickyApp:
+            def __init__(self):
+                self.screen = False
+                self.attempts = []
+
+            @property
+            def version(self):
+                return "16.0"
+
+            @property
+            def screen_updating(self):
+                return self.screen
+
+            @screen_updating.setter
+            def screen_updating(self, value):
+                self.screen = value
+                self.attempts.append(value)
+
+        app = StickyApp()
+        delta_state._app_cache = app
+        delta_state._owner_app = app
+        delta_state._screen_restore_owed = True
+        delta_state._bulk_window_open = False
+        delta_state._screen_watchdog_logged_at = 0.0
+        try:
+            delta_main._screen_update_watchdog_tick()
+            self.assertTrue(app.screen)
+            self.assertFalse(delta_state._screen_restore_owed)
+        finally:
+            delta_state._screen_restore_owed = False
+
+    def test_the_watchdog_stays_out_of_the_write_window(self):
+        import delta_state
+        import main as delta_main
+
+        class App:
+            @property
+            def screen_updating(self):
+                raise AssertionError("watchdog probed an open write window")
+
+        app = App()
+        delta_state._app_cache = app
+        delta_state._bulk_window_open = True
+        try:
+            delta_main._screen_update_watchdog_tick()
+        finally:
+            delta_state._bulk_window_open = False
+
+
+class RenderYieldTests(unittest.TestCase):
+    """The chain pauses only while the customer's hands are on OUR Excel.
+
+    Typing a formula into a repaint-numbed frame is what produced "I typed
+    and nothing is showing". Full speed stays the rule; a cycle is skipped
+    only for fresh input in our own instance, and what that skip owes the
+    recalculation is carried, never dropped.
+    """
+
+    def test_our_excel_in_front_with_fresh_input_yields(self):
+        from unittest.mock import patch
+        import main as delta_main
+
+        with patch.object(delta_main, "_last_user_input_age", return_value=0.1), \
+             patch.object(delta_main, "_foreground_pid", return_value=4242), \
+             patch.object(delta_main, "_owner_window_pid", return_value=4242):
+            self.assertTrue(delta_main._user_is_excel_interacting())
+
+    def test_another_app_in_front_never_yields(self):
+        from unittest.mock import patch
+        import main as delta_main
+
+        with patch.object(delta_main, "_last_user_input_age", return_value=0.1), \
+             patch.object(delta_main, "_foreground_pid", return_value=4242), \
+             patch.object(delta_main, "_owner_window_pid", return_value=9999):
+            self.assertFalse(delta_main._user_is_excel_interacting())
+
+    def test_older_input_and_unresolvable_windows_do_not_yield(self):
+        from unittest.mock import patch
+        import main as delta_main
+
+        with patch.object(delta_main, "_last_user_input_age", return_value=2.0), \
+             patch.object(delta_main, "_foreground_pid", return_value=4242), \
+             patch.object(delta_main, "_owner_window_pid", return_value=4242):
+            self.assertFalse(delta_main._user_is_excel_interacting())
+
+        with patch.object(delta_main, "_last_user_input_age", return_value=None), \
+             patch.object(delta_main, "_foreground_pid", return_value=None), \
+             patch.object(delta_main, "_owner_window_pid", return_value=None):
+            self.assertFalse(delta_main._user_is_excel_interacting())
+
+    def test_render_cycle_yields_before_the_write_window(self):
+        import inspect
+        import main as delta_main
+
+        src = inspect.getsource(delta_main.render_cycle)
+        self.assertIn("_user_is_excel_interacting()", src)
+        self.assertLess(
+            src.index("_user_is_excel_interacting()"),
+            src.index("_begin_excel_bulk_mode()"),
+        )
+        self.assertIn("render_cycle_skipped_user_input", src)
+
+    def test_a_yielded_cycle_carries_the_recalc(self):
+        import delta_state
+        import main as delta_main
+
+        delta_state._recalc_owed = False
+        delta_state._bulk_will_recalc = True
+        delta_state._app_cache = None
+        # Nothing written, nothing owed: plain skip.
+        delta_main._time_recalc(False)
+        self.assertFalse(delta_state._recalc_owed)
+        # Owed but Excel absent: the debt survives and is paid later.
+        delta_state._recalc_owed = True
+        delta_main._time_recalc(False)
+        self.assertTrue(delta_state._recalc_owed)
+
+    def test_an_owed_recalc_survives_a_busy_excel(self):
+        import delta_state
+        import main as delta_main
+
+        class BusyRecalcApp:
+            @property
+            def api(self):
+                return self
+
+            Calculation = -4105
+
+            def Calculate(self):
+                raise RuntimeError("Excel is busy mid-recalc")
+
+        app = BusyRecalcApp()
+        delta_state._app_cache = app
+        delta_state._bulk_will_recalc = True
+        try:
+            with patch.object(delta_main, "log_excel_exception"):
+                # Nothing written this cycle - but a debt was carried in
+                # from a yielded one. A busy Excel must not eat it.
+                delta_state._recalc_owed = True
+                delta_main._time_recalc(False)
+                self.assertTrue(
+                    delta_state._recalc_owed,
+                    "the skip promised this recalculation; retry next cycle",
+                )
+                # A written cycle owns its own recalc: if it fails, that
+                # failure is one failed write, not an unpaid debt.
+                delta_state._recalc_owed = False
+                delta_main._time_recalc(True)
+                self.assertFalse(delta_state._recalc_owed)
+        finally:
+            delta_state._recalc_owed = False
+            delta_state._bulk_will_recalc = False
+            delta_state._app_cache = None
 
 
 class ChainExtentStabilityTests(unittest.TestCase):

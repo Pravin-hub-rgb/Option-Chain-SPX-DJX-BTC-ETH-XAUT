@@ -24,6 +24,7 @@ from us_diagnostics import (
     feed_log,
 )
 from us_licensing import ensure_license, show_error
+import us_excel
 from us_excel import display_loop
 from us_workbook import INDEX_SYMBOLS, open_excel_files
 from us_instance import (
@@ -54,6 +55,11 @@ async def main_async():
         pythoncom.CoInitialize()
     except Exception:
         pass
+    # First, undo whatever a previous crashed run left behind: a stuck
+    # synthetic modifier is what once made the whole desktop act like
+    # Alt was held down. Harmless when nothing is stuck.
+    if os.name == "nt":
+        us_excel._heal_keyboard()
     for sym in active_symbols():
         ensure_sym_state(sym)
     open_excel_files()
@@ -74,7 +80,9 @@ async def main_async():
             "still valid, then run the tool again.\n\n"
             + "\n".join(errs)
         )
-        return
+        # Do not exit here: keep Excel open and let the background pollers
+        # keep retrying. When Databento becomes available the chains load
+        # automatically instead of leaving the sheet blank forever.
     await asyncio.gather(
         data_poller(),
         spot_poller(),
@@ -198,6 +206,7 @@ def _start_databento():
             "Databento is required but the 'databento' package is not installed.\n\n"
             "Reinstall the application or contact the owner."
         )
+        us_excel._heal_keyboard()
         os._exit(1)
     key = _ensure_working_databento_key()
     _databento_feed = databento_feed.DatabentoFeed(key, event_log=feed_log)
@@ -274,6 +283,7 @@ def main():
                 "Close the other copy - it is in the taskbar - and run "
                 f"{PRODUCT_EXE} again."
             )
+            us_excel._heal_keyboard()
             os._exit(1)
         # One line that says what is running, from where, and whether this
         # instance owns Excel's calculation mode. The customer never has to
@@ -287,6 +297,7 @@ def main():
             build=_short_build(),
         )
         if not ensure_license():
+            us_excel._heal_keyboard()
             os._exit(1)
         _start_databento()
         asyncio.run(main_async())
