@@ -3261,20 +3261,30 @@ def _release_dead_excel_state():
 
 
 def _begin_excel_bulk_mode():
-    """Suspend repaint + recalculation for the duration of one render cycle.
+    """Take the manual-calculation session for one render cycle.
 
-    Every Excel write otherwise repaints the workbook and triggers a full
-    recalculation. That is cheap in an empty sheet but expensive when the user
-    has a strategy workbook open, which is where refresh times blow up.
+    ScreenUpdating is deliberately never read or written here. Toggling it
+    around the write window made Excel repaint the entire sheet on every
+    release - the sheet visibly flashed - and any click into a cell that
+    landed while the screen was off left the rest of that edit frozen behind
+    a stale frame, so the formula the customer was typing never appeared.
+    With the screen left on, Excel repaints only the ranges we actually
+    write, and their typing, dragging and editing behave normally between
+    cycles. The costly half is the recalculation, and the calculation mode
+    below is what owns it.
+
+    Every Excel write otherwise triggers a full recalculation. That is cheap
+    in an empty sheet but expensive when the user has a strategy workbook
+    open, which is where refresh times blow up.
 
     Returns a restore callable, or None if nothing could be changed. Failures
-    are expected and non-fatal: screen_updating and calculation both raise if
-    the user is mid-edit, and there is no workbook to talk to yet.
+    are expected and non-fatal: the calculation switch raises if the user is
+    mid-edit, and there is no workbook to talk to yet.
     """
     # The watchdog needs to know when NOT to interfere; the window is
     # marked open only when a restore callable actually comes back.
     delta_state._bulk_window_open = False
-    state = {"app": None, "screen": None, "calc": None}
+    state = {"app": None, "calc": None, "calc_guarded": False}
     try:
         app = delta_state._app_cache
         if app is None:
@@ -3331,38 +3341,12 @@ def _begin_excel_bulk_mode():
                 delta_state._calc_manual_failed = False
                 delta_state._calc_failed_since = 0.0
                 delta_state._calc_notice_shown = False
-        try:
-            owner = app.screen_updating
-        except Exception as e:
-            log_excel_exception("ALL", e, "reading screen_updating")
-            owner = None
-        if owner is None:
-            state["screen"] = None
-        elif owner:
-            state["screen"] = True
-            try:
-                app.screen_updating = False
-            except Exception as e:
-                log_excel_exception("ALL", e, "disabling screen_updating")
-                state["screen"] = None
-        else:
-            # Our private instance: only this tool ever turns screen
-            # updating off (Excel has no UI switch for it), so
-            # "already off" is a leftover from a failed restore, not
-            # the customer's choice. Heal it immediately and own the
-            # window this cycle. The old code recorded nothing on
-            # "already off" - a guard from the shared-Excel era, where
-            # the other tool might legitimately hold the screen off for
-            # its own window - and that guard is what turned one failed
-            # restore into a frozen sheet that only killing the process
-            # un-froze.
-            state["screen"] = True
-            delta_state._screen_restore_owed = False
-            try:
-                app.screen_updating = False
-            except Exception as e:
-                log_excel_exception("ALL", e, "healing leftover screen_updating")
-                state["screen"] = None
+        # Deliberate no-op where the ScreenUpdating toggle used to live. The
+        # screen is now left exactly as Excel itself keeps it: flipping it
+        # around the write window repainted the whole sheet on every release
+        # (the flicker count) and froze any edit that started mid-window - the
+        # customer typed a formula and saw nothing until they pressed Enter.
+        # The first COM call below tells us instantly if Excel can talk.
         try:
             # xlwings exposes calculation as a lowercase NAME
             # ("automatic" / "semiautomatic" / "manual"); the setter only
@@ -3522,30 +3506,10 @@ def _begin_excel_bulk_mode():
                 calc_mode_guard.release(PRODUCT_ID)
             except Exception as e:
                 log_excel_exception("ALL", e, "releasing calculation guard")
-        # Paint FIRST and unconditionally: a liveness probe must never gate
-        # the repaint toggle. Exactly this class of early-return is what
-        # left ScreenUpdating off when Excel was busiest, gave the next
-        # cycle "already off", and let the sheet sit frozen behind a stale
-        # frame until the whole tool was killed. A busy Excel answers the
-        # write with an exception we can retry, never with silence.
-        if state.get("screen") is not None:
-            want = state["screen"]
-            painted = False
-            for _ in range(3):
-                try:
-                    app.screen_updating = want
-                    painted = True
-                    break
-                except Exception as e:
-                    log_excel_exception("ALL", e, "restoring screen_updating")
-                    try:
-                        time.sleep(0.25)
-                    except Exception:
-                        pass
-            if not painted:
-                # Excel was too busy three times in a row; the watchdog tick
-                # in display_loop finishes the job the cycle could not.
-                delta_state._screen_restore_owed = True
+        # No paint action here either: the screen was never taken, so it is
+        # already exactly where Excel and the customer want it. Every release
+        # used to force a full-sheet repaint here - that was the flicker - and
+        # an edit that began mid-window froze behind the stale frame.
 
         # The module-level slot, not a local of this closure. Assigned from
         # inside a nested function without going through the state module, it
@@ -3806,13 +3770,23 @@ def render_cycle():
     # a whole; the forced recalculation it owed is carried to the next
     # one, so their strategy formulas never sit stale behind the skip.
     if _user_is_excel_interacting():
+        now_mono_skip = time.monotonic()
+        if now_mono_skip - delta_state._user_input_skip_log_at > 30.0:
+            delta_state._user_input_skip_log_at = now_mono_skip
+            feed_log(
+                "render_cycle_skipped_user_input",
+                note="customer is typing or selecting in our Excel",
+            )
         delta_state._recalc_owed = True
         _performance_metrics.record("ALL", "render_cycle_skipped_user_input", 0.0)
         return
 
     # Detect Excel edit mode: skip the write cycle when the customer is
     # dragging a formula, filling cells, or editing a value. Writing to the
-    # chain sheet at this moment deadlocks Excel's COM apartment.
+    # chain sheet at this moment deadlocks Excel's COM apartment. There is
+    # no timeout that forces a window through while the edit is still live:
+    # opening one freezes the frame the formula is being typed into, and
+    # every write inside it is refused anyway.
     app = delta_state._app_cache
     if app is not None:
         edit_detected = False
@@ -3822,15 +3796,28 @@ def render_cycle():
         except Exception:
             edit_detected = True
         if edit_detected:
-            if delta_state._delta_busy_skip_count < 30:
-                delta_state._delta_busy_skip_count += 1
-                _performance_metrics.record("ALL", "render_cycle_skipped_user_edit", 0.0)
-                return
-            delta_state._delta_busy_skip_count = 0
+            now_mono_edit = time.monotonic()
+            if now_mono_edit - delta_state._user_edit_skip_log_at > 30.0:
+                delta_state._user_edit_skip_log_at = now_mono_edit
+                feed_log(
+                    "render_cycle_skipped_user_edit",
+                    note="Excel is in edit mode; the write window stays shut",
+                )
+            _performance_metrics.record("ALL", "render_cycle_skipped_user_edit", 0.0)
+            return
 
     restore = _begin_excel_bulk_mode()
     try:
         for asset in ("BTC", "ETH", "XAUT"):
+            if _user_is_excel_interacting():
+                # The customer's hands reached our Excel while this window was
+                # open. Drop what is left of the window and let the finally
+                # below hand the screen back; their edit runs on a live frame.
+                delta_state._recalc_owed = True
+                _performance_metrics.record(
+                    "ALL", "render_cycle_aborted_user_input", 0.0
+                )
+                break
             write_to_excel(asset)
         _time_recalc(delta_state._cycle_wrote)
     finally:

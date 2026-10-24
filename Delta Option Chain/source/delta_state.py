@@ -32,17 +32,22 @@ _bulk_will_recalc = False
 
 _last_recalc_ms = 0.0
 
-# ScreenUpdating self-heal. _screen_restore_owed goes up when all restore
-# shots inside the write window failed (Excel was busy); the display loop's
-# watchdog tick forces paint back on as soon as Excel answers again.
-# _bulk_window_open marks the moment between opening the write window and
-# its restore, so the watchdog never fights the window it is healing for.
+# ScreenUpdating self-heal net. The tool no longer toggles ScreenUpdating: the
+# old window era turned one failed restore into a frozen frame, and the toggle
+# itself makes Excel repaint the entire sheet on every release, which reads on
+# a fast render cadence as constant flicker. The only writer left in the
+# product is _screen_update_watchdog_tick (force ON, never OFF). These fields
+# keep its backoff and the owed latch honest.
 _screen_restore_owed = False
 _bulk_window_open = False
 _screen_watchdog_logged_at = 0.0
 # A render cycle skipped because the customer's hands were on our Excel
 # owes its forced recalculation to the next writable cycle.
 _recalc_owed = False
+
+# Rate-limit the skip receipts so support sees one line, not one per cycle.
+_user_input_skip_log_at = 0.0
+_user_edit_skip_log_at = 0.0
 
 _speed_log_at = 0.0
 
@@ -105,7 +110,6 @@ _FIRST_SIGHT_BOUND = 300
 # shows values that are wrong with no error anywhere. A fixed geometry keeps
 # every row their formula can see inside the block forever.
 ROW_EXTENT_DEFAULT = 256
-_delta_busy_skip_count = 0
 
 _row_extent_seen = {}
 

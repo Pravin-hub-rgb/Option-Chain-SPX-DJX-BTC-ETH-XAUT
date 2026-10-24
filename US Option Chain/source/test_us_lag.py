@@ -2119,26 +2119,24 @@ class KeyboardModifierArmorTests(unittest.TestCase):
 
 
 class ScreenUpdatingSelfHealTests(unittest.TestCase):
-    """The screen must never stick off behind a stale frame again.
+    """The tool itself must never touch ScreenUpdating - and never stick off.
 
-    One failed restore used to be permanent: the next cycle read "already
-    off", recorded nothing (the shared-era guard), and the sheet froze
-    until the tool was killed. The pins force both ends: restore tries
-    paint before any probe and reports what it could not do, and the
-    watchdog finishes the job the moment Excel answers again.
+    Toggling the screen around every write window made Excel repaint the
+    whole sheet on each release: at a 0.2 s cadence that reads as constant
+    flicker, and a click into a cell inside a window froze the rest of the
+    edit on a stale frame (typing a formula showed nothing). The toggle-era
+    pins are gone; what remains: (1) opening and closing the calculation
+    session never reads or writes the screen, (2) the watchdog is the only
+    net that pushes paint back on, and only from outside a write window,
+    (3) a screen left off by anything else - an old build, or an add-in -
+    gets fixed by that net.
     """
 
-    def test_restore_attempts_paint_even_when_the_app_goes_busy(self):
-        from unittest.mock import patch
-        import us_state
-        import us_excel
-
-        class EntryOkThenBusyApp:
-            """Screen goes off fine this cycle; restoring it back fails."""
-
+    def _screen_touch_counter_app(self, screen=False):
+        class App:
             def __init__(self):
-                self.screen = True
-                self.attempts = []
+                self.screen = screen
+                self.touches = []
 
             @property
             def version(self):
@@ -2150,90 +2148,64 @@ class ScreenUpdatingSelfHealTests(unittest.TestCase):
 
             @property
             def screen_updating(self):
+                self.touches.append("read")
                 return self.screen
 
             @screen_updating.setter
             def screen_updating(self, value):
-                if value:
-                    self.attempts.append(value)
-                    raise RuntimeError("Excel is busy now")
+                self.touches.append("write")
                 self.screen = value
 
             @property
             def api(self):
-                return type("Api", (), {"Calculation": -4105})()
+                # MANUAL (-4135): the calculation session keeps the customer's
+                # own choice, which keeps this stub off the guard entirely.
+                return type("Api", (), {"Calculation": -4135})()
 
-        app = EntryOkThenBusyApp()
-        us_state._app_cache = app
-        us_state._screen_restore_owed = False
-        us_state._bulk_window_open = False
-        try:
-            with patch.object(
-                us_excel.calc_mode_guard, "other_holder_alive", return_value=False
-            ):
-                with patch.object(us_excel.calc_mode_guard, "release"):
-                    with patch.object(us_excel.time, "sleep", lambda s: None):
-                        # The entry-side set succeeds (True -> False), the
-                        # restore then fails three times in a row.
-                        restore = us_excel._begin_excel_bulk_mode(app)
-                        self.assertIsNotNone(restore)
-                        self.assertTrue(us_state._bulk_window_open)
-                        restore()
-            self.assertFalse(us_state._bulk_window_open)
-            # Three writes were attempted and all failed; the watchdog owes
-            # the repaint now.
-            self.assertEqual(len(app.attempts), 3)
-            self.assertTrue(us_state._screen_restore_owed)
-        finally:
-            us_state._screen_restore_owed = False
-            us_state._app_cache = None
+        return App()
 
-    def test_already_off_screen_is_healed_and_owned(self):
-        from unittest.mock import patch
+    def test_opening_and_closing_the_session_never_touches_the_screen(self):
         import us_state
         import us_excel
 
-        class LeftoverApp:
-            def __init__(self):
-                self.screen = True
-
-            @property
-            def version(self):
-                return "16.0"
-
-            @property
-            def books(self):
-                return [type("B", (), {"name": "spx_option_chain.xlsx"})()]
-
-            @property
-            def screen_updating(self):
-                return self.screen
-
-            @screen_updating.setter
-            def screen_updating(self, value):
-                self.screen = value
-
-            @property
-            def api(self):
-                return type("Api", (), {"Calculation": -4135})()
-
-        app = LeftoverApp()
-        # A leftover from a failed previous restore...
-        app.screen = False
+        app = self._screen_touch_counter_app(screen=True)
         us_state._app_cache = app
+        us_state._bulk_window_open = False
         try:
-            with patch.object(
-                us_excel.calc_mode_guard, "other_holder_alive", return_value=False
-            ):
-                restore = us_excel._begin_excel_bulk_mode(app)
-                self.assertIsNotNone(restore)
-                self.assertTrue(us_state._bulk_window_open)
-                restore()
-            # ...is healed this cycle and handed back ON, not carried over.
+            restore = us_excel._begin_excel_bulk_mode(app)
+            self.assertIsNotNone(restore)
+            self.assertTrue(us_state._bulk_window_open)
+            restore()
+            self.assertEqual(
+                app.touches,
+                [],
+                "ScreenUpdating was read or written; that is the flicker bug",
+            )
             self.assertTrue(app.screen)
             self.assertFalse(us_state._bulk_window_open)
         finally:
             us_state._bulk_window_open = False
+            us_state._app_cache = None
+
+    def test_a_screen_left_off_is_untouched_here_and_netted_by_the_watchdog(self):
+        import us_state
+        import us_excel
+
+        app = self._screen_touch_counter_app(screen=False)
+        us_state._app_cache = app
+        restore = us_excel._begin_excel_bulk_mode(app)
+        restore()
+        self.assertFalse(app.screen, "the write session has no business painting")
+        # Now the net, outside any window.
+        us_state._screen_restore_owed = True
+        us_state._screen_watchdog_logged_at = 0.0
+        us_state._bulk_window_open = False
+        try:
+            us_excel._screen_update_watchdog_tick()
+            self.assertTrue(app.screen)
+        finally:
+            us_state._screen_restore_owed = False
+            us_state._app_cache = None
 
     def test_the_watchdog_finishes_a_failed_restore(self):
         import us_state
