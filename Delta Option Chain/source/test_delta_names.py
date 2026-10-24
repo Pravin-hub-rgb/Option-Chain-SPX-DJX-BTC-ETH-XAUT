@@ -229,7 +229,8 @@ class NestedShadowingTests(unittest.TestCase):
         for fname in NameBindingTests.RUNNABLE:
             with self.subTest(module=fname):
                 path = os.path.join(SOURCE_DIR, fname)
-                src = io.open(path, encoding="utf-8-sig", newline="").read()
+                with io.open(path, encoding="utf-8-sig", newline="") as handle:
+                    src = handle.read()
                 tree = ast.parse(src)
                 top = check_nested_shadowing.module_names(tree)
                 problems = []

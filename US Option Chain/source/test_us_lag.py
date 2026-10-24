@@ -1538,8 +1538,37 @@ class ExpiryLayoutTests(unittest.TestCase):
         self.assertEqual(sheet.cleared, [((1, 23), (2000, 31))])
 
 
-if __name__ == "__main__":
-    unittest.main()
+class RecalcOncePerCycleTests(unittest.TestCase):
+    """Strategy formulas must be recalculated exactly once per render cycle."""
+
+    def test_render_cycle_calls_time_recalc_once(self):
+        import inspect
+        import us_excel
+        src = inspect.getsource(us_excel.render_cycle)
+        self.assertEqual(src.count("_time_recalc("), 1)
+
+    def test_time_recalc_calls_calculate_once(self):
+        import inspect
+        import us_excel
+        src = inspect.getsource(us_excel._time_recalc)
+        self.assertEqual(src.count("app.api.Calculate()"), 1)
+
+
+class OwedRecalcSurvivesBusyExcelTests(unittest.TestCase):
+    """A yielded cycle's owed recalculation must survive a busy Excel."""
+
+    def test_render_cycle_sets_recalc_owed_on_user_input_skip(self):
+        import inspect
+        import us_excel
+        src = inspect.getsource(us_excel.render_cycle)
+        self.assertIn("us_state._recalc_owed = True", src)
+
+    def test_render_cycle_sets_recalc_owed_on_user_input_abort(self):
+        import inspect
+        import us_excel
+        src = inspect.getsource(us_excel.render_cycle)
+        self.assertGreaterEqual(src.count("us_state._recalc_owed = True"), 2)
+
 
 class WatchdogReconnectTests(unittest.TestCase):
     """ensure_calculation_not_stranded should reconnect when _app_cache is None."""
@@ -2764,3 +2793,9 @@ class _FakeUser32:
                 return True
 
         self.user32 = _U32()
+
+
+
+
+if __name__ == "__main__":
+    unittest.main()

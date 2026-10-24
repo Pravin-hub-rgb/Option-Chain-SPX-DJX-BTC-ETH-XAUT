@@ -1816,5 +1816,37 @@ class AutoOpenRecoveryTests(unittest.TestCase):
         )
 
 
+class DeltaRecalcOncePerCycleTests(unittest.TestCase):
+    """Strategy formulas must be recalculated exactly once per render cycle."""
+
+    def test_render_cycle_calls_time_recalc_once(self):
+        import inspect
+        import main as delta_main
+        src = inspect.getsource(delta_main.render_cycle)
+        self.assertEqual(src.count("_time_recalc("), 1)
+
+    def test_time_recalc_calls_calculate_once(self):
+        import inspect
+        import main as delta_main
+        src = inspect.getsource(delta_main._time_recalc)
+        self.assertEqual(src.count("app.api.Calculate()"), 1)
+
+
+class DeltaOwedRecalcSurvivesBusyExcelTests(unittest.TestCase):
+    """A yielded cycle's owed recalculation must survive a busy Excel."""
+
+    def test_render_cycle_sets_recalc_owed_on_user_input_skip(self):
+        import inspect
+        import main as delta_main
+        src = inspect.getsource(delta_main.render_cycle)
+        self.assertIn("delta_state._recalc_owed = True", src)
+
+    def test_render_cycle_sets_recalc_owed_on_user_input_abort(self):
+        import inspect
+        import main as delta_main
+        src = inspect.getsource(delta_main.render_cycle)
+        self.assertGreaterEqual(src.count("delta_state._recalc_owed = True"), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

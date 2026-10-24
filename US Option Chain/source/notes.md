@@ -223,3 +223,23 @@ pure per-cycle Excel tax (writes, recolour region, recalc dirtying).
   full suite 108 passed + real-Excel 6 passed. Its A2-empty "show
   everything" behaviour measured 20-105 rows per expiry in the live logs;
   the briefly-discussed strike cap was dropped and the code now says why.
+
+
+---
+
+# 2026-10-24 — Simplification soak notes
+
+- Watchdogs retained: user32-only watchdog, main-loop watchdog, calc-mode watchdog.
+- `Calculate()` is invoked exactly once per render cycle (`_time_recalc`), guarded by
+  `RecalcOncePerCycleTests` in both test suites.
+- Owed-recalc state survives a busy Excel: skipped/aborted cycles set
+  `_recalc_owed = True` and `_time_recalc(False)` preserves it when Excel is absent
+  or busy; covered by `OwedRecalcSurvivesBusyExcelTests` / existing busy-Excel tests.
+- Dead `_oi_fmt_done` / text-format re-arm paths removed; OI columns stay numeric
+  end to end (only D3/O3/Z3 date cells keep `@`).
+- `force_usd_block_formats` gate keeps `fmt_key` dedup `(sheet_key, c0, "numfmt")`
+  and no longer keys on row count.
+- Adaptive refresh widen cap remains 2.0x in both US and Delta.
+- Soak: monitor feed.log for `excel_recalc_second_pass`, `render_cycle_skipped_user_input`,
+  `calc_watchdog_restored`, and `refresh_widened`; expect no repeated
+  `excel_recalc_skip_mode` storms during normal typing.
