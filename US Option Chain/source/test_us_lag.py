@@ -2366,6 +2366,59 @@ class RenderYieldTests(unittest.TestCase):
             us_state._app_cache = None
 
 
+class StartupConsoleNoiseTests(unittest.TestCase):
+    """Python 3.10 prints a bogus asyncio traceback on most launches.
+
+    _ProactorBaseWritePipeTransport._loop_writing races a finished write
+    and raises `assert f is self._write_fut` inside asyncio itself; the
+    customer sees a red console traceback under a toolbar that took a day
+    of work. Startup wires a loop exception handler that drains exactly
+    that one pattern and hands every other exception to the default
+    handler untouched.
+    """
+
+    def test_main_wires_the_quiet_handler(self):
+        import inspect
+        import main
+
+        src = inspect.getsource(main.main_async)
+        self.assertIn("set_exception_handler(_drop_proactor_write_noise)", src)
+
+    def test_only_the_write_race_is_drained(self):
+        import main
+
+        class _Loop:
+            def __init__(self):
+                self.default_calls = []
+
+            def default_exception_handler(self, context):
+                self.default_calls.append(context)
+
+        loop = _Loop()
+        main._drop_proactor_write_noise(
+            loop,
+            {
+                "exception": AssertionError("assert f is self._write_fut"),
+                "handle": "<Handle _ProactorBaseWritePipeTransport._loop_writing()>",
+            },
+        )
+        self.assertEqual(loop.default_calls, [])
+
+        real_problem = {
+            "exception": OSError("pipe failed for real"),
+            "handle": "<Handle _ProactorBaseWritePipeTransport._loop_writing()>",
+        }
+        main._drop_proactor_write_noise(loop, real_problem)
+        self.assertEqual(loop.default_calls, [real_problem])
+
+        other_assert = {
+            "exception": AssertionError("isolated assert"),
+            "handle": "<Handle somewhere.else>",
+        }
+        main._drop_proactor_write_noise(loop, other_assert)
+        self.assertEqual(loop.default_calls, [real_problem, other_assert])
+
+
 class PastDatePurgeTests(unittest.TestCase):
     """Past dates in expiry cells must be replaced, not just colored red.
 

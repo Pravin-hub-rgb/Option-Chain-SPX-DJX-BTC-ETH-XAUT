@@ -41,6 +41,25 @@ from us_state import (
     BASE_DIR, PRODUCT_EXE, PRODUCT_ID, _databento_feed, expiry_roots,
 )
 
+def _drop_proactor_write_noise(loop, context):
+    """Swallow one known-harmless asyncio traceback, log everything else.
+
+    _ProactorBaseWritePipeTransport._loop_writing can race with a transport
+    that is finishing its previous write and raise
+    `assert f is self._write_fut` inside asyncio itself. Python 3.10 prints
+    the traceback every launch of this tool; nothing in the product fails
+    because of it (the write queue keeps flowing, the tool reads it in the
+    same run for hours). Upstream class of bug, not ours. Dropping just that
+    one pattern keeps the customer's console honest: a traceback they see is
+    a traceback worth calling support about.
+    """
+    exc = context.get("exception")
+    handle = context.get("handle")
+    if isinstance(exc, AssertionError) and "_loop_writing" in repr(handle):
+        return
+    loop.default_exception_handler(context)
+
+
 async def main_async():
     # The asyncio loop thread owns every COM call in this process (open pass,
     # workbook finds, sheet writes). pywin32 needs one stable apartment for
@@ -53,6 +72,10 @@ async def main_async():
         import pythoncom
 
         pythoncom.CoInitialize()
+    except Exception:
+        pass
+    try:
+        asyncio.get_running_loop().set_exception_handler(_drop_proactor_write_noise)
     except Exception:
         pass
     # First, undo whatever a previous crashed run left behind: a stuck
