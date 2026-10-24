@@ -754,6 +754,69 @@ class DeltaCalcModeCoexistenceTests(unittest.TestCase):
                                 'acquire should be called when no other tool holds the guard')
 
 
+class ConsoleNoiseTests(unittest.TestCase):
+    """Network retries go to the console once per site per 2 minutes.
+
+    During the exchange hiccups the per-poll prints were a wall of identical
+    HTTPS stacks - a customer sees ten red lines and calls in, when the
+    poller was already recovering on its own. The console reads one calm
+    line; feed.log keeps every occurrence with full detail. Excel-side
+    prints ("Roller cell write error") keep their old voice - those are not
+    silent-and-recovering network states.
+    """
+
+    NETWORK_SITES = (
+        "OI poller error",
+        "Spot poller error",
+        "Expiry roller error",
+        "Index listener error",
+        "Date fetch error",
+    )
+
+    def test_network_retries_are_quiet_on_the_console(self):
+        import inspect
+        import delta_state
+        import main as delta_main
+
+        src = inspect.getsource(delta_main)
+        for site in self.NETWORK_SITES:
+            self.assertNotIn(
+                f'print(f"{site}', src,
+                f"{site} still prints raw: it must route through "
+                "_quiet_console_error",
+            )
+        self.assertIn("Roller cell write error", src)  # Excel-side, stays loud
+
+    def test_the_throttle_suppresses_repeats_and_logs_every_detail(self):
+        from unittest.mock import patch
+        import delta_state
+        import main as delta_main
+
+        ticks = iter([2000.0, 2001.0, 2049.0, 2200.0])
+        lines, feed_sites = [], []
+        delta_main._console_warn_last.clear()
+        try:
+            with patch.object(delta_main.time, "monotonic",
+                              lambda: next(ticks)), patch.object(
+                delta_main, "print", lambda *a, **k: lines.append(a[0])
+            ), patch.object(
+                delta_main, "feed_log",
+                lambda *a, **k: feed_sites.append((a[0], k.get("site"))),
+            ):
+                delta_main._quiet_console_error("site", "boom one")
+                # 100 s later - inside the window, console stays quiet.
+                delta_main._quiet_console_error("site", "boom two")
+                # 48 s later - still inside the window.
+                delta_main._quiet_console_error("site", "boom three")
+                # 200 s in total - the window is open again.
+                delta_main._quiet_console_error("site", "boom four")
+        finally:
+            delta_main._console_warn_last.clear()
+            self.assertEqual(len(lines), 2)
+            self.assertEqual(len(feed_sites), 4)
+            self.assertTrue(all(first == "network_retry" for first, _ in feed_sites))
+
+
 class ChainsCloseSuppressionTests(unittest.TestCase):
     """Closing the chain workbooks must never put the calc dialog on screen.
 

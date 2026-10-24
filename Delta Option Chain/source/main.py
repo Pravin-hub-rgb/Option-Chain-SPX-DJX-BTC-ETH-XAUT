@@ -171,6 +171,26 @@ def net_note(ok):
         print("Connection lost - retrying in background", flush=True)
 
 
+# --- quiet console retries ----------------------------------------------------
+# The per-poll error prints were a wall of identical HTTPS stacks during every
+# brief exchange hiccup - a customer sees ten red lines in two minutes and
+# panics, when the poller was already retrying and recovering on its own. The
+# console now gets ONE calm line per site per 2-minute window; every occurrence
+# still lands in feed.log with its full detail for support.
+
+_console_warn_last = {}
+
+
+def _quiet_console_error(site, detail):
+    """Rate-limit one site's console error line; keep every detail in feed.log."""
+    now = time.monotonic()
+    if now - _console_warn_last.get(site, 0.0) > 120.0:
+        print(f"{site}: delta.exchange is slow right now - retrying "
+              "(full detail in feed.log)", flush=True)
+        _console_warn_last[site] = now
+    feed_log("network_retry", site=site, detail=str(detail)[:160])
+
+
 def net_badge():
     """Header tag text ('' = sab theek, kuch nahi likhna)."""
     if _net["fails"] < NET_FAIL_LIMIT:
@@ -1072,7 +1092,9 @@ async def oi_poller(asset):
                 )
                 for dmy, res in zip(dmies, results):
                     if isinstance(res, BaseException):
-                        print(f"OI poller error ({asset} {dmy}): {res}", flush=True)
+                        _quiet_console_error(
+                            f"OI poller error ({asset} {dmy})", res
+                        )
                         net_note(False)
                         set_feed_state(asset, "ERROR", str(res)[:80],
                                        retry_in=OI_POLL_SECONDS)
@@ -1086,7 +1108,7 @@ async def oi_poller(asset):
                     # every row.
                     note_feed_good(asset, dmy_to_iso(dmy))
         except Exception as e:
-            print(f"OI poller error ({asset}): {e}", flush=True)
+            _quiet_console_error(f"OI poller error ({asset})", e)
             net_note(False)
             set_feed_state(asset, "ERROR", type(e).__name__,
                            retry_in=OI_POLL_SECONDS)
@@ -1272,7 +1294,7 @@ async def spot_poller():
             res = data.get("result") or {}
             set_spot(asset, res.get("spot_price"), "rest-perp")
         except Exception as e:
-            print(f"Spot poller error ({asset}): {e}", flush=True)
+            _quiet_console_error(f"Spot poller error ({asset})", e)
         await asyncio.sleep(SPOT_POLL_SECONDS)
 
 
@@ -1400,7 +1422,7 @@ async def expiry_roller(asset):
                     print(f"Roller cell write error ({asset}): {e}", flush=True)
                 print(f"[{asset}] expiry rolled: " + ", ".join(f"{o or '--'} -> {n or '--'}" for _, o, n in changed_slots), flush=True)
         except Exception as e:
-            print(f"Expiry roller error ({asset}): {e}", flush=True)
+            _quiet_console_error(f"Expiry roller error ({asset})", e)
 
 
 def current_ws_symbols():
@@ -1489,7 +1511,7 @@ async def index_listener():
                         set_spot(asset, px, "index-public")
                         net_note(True)
         except Exception as e:
-            print(f"Index listener error: {e}", flush=True)
+            _quiet_console_error("Index listener error", e)
             await asyncio.sleep(retry)
             retry = min(retry * 2, 60)
 
@@ -1694,7 +1716,7 @@ async def date_loader():
         except Exception as e:
             # transient failure — allow requeue after short backoff (no 10/s storm)
             _date_req_sig.pop((asset, i), None)
-            print(f"Date fetch error ({asset} {parsed}): {e}", flush=True)
+            _quiet_console_error(f"Date fetch error ({asset} {parsed})", e)
             await asyncio.sleep(3)
 
 
