@@ -1837,6 +1837,21 @@ def render_cycle():
     if us_state._calc_manual_failed:
         # Don't show the slow-down popup when Excel is gone — the customer
         # closed it, not a busy cell or add-in.
+        # If our private Excel window is already gone, Excel is closing (or
+        # closed) - the refusal is a teardown artifact, not a real busy cell
+        # or add-in. Clear the marks so the slow-down popup never fires on
+        # close, and skip this cycle.
+        try:
+            import ctypes
+            _hwnd = us_state._owner_hwnd
+            if _hwnd and not ctypes.windll.user32.IsWindow(int(_hwnd)):
+                _clear_refused_calc_marks()
+        except Exception:
+            pass
+        if not us_state._calc_manual_failed:
+            _performance_metrics.record("ALL", "render_cycle_skipped_noexcel", 0.0)
+            return
+
         owner_app = us_state._owner_app
         if owner_app is None:
             # No owner reference at all — Excel is gone.
