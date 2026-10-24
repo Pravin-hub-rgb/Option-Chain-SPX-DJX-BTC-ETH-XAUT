@@ -585,10 +585,16 @@ class AutoOpenLatchTests(unittest.TestCase):
     def test_exact_book_match_normalizes_short_form_paths(self):
         import inspect
         import us_excel
-        # The private-instance finder keeps the normalisation.
         src = inspect.getsource(us_excel.find_open_book)
         self.assertIn("long_form(os.path.abspath(book.fullname))", src)
         self.assertIn("long_form(target)", src)
+
+    def test_chain_sheet_lookup_by_name_not_index(self):
+        import inspect
+        import us_excel
+        src = inspect.getsource(us_excel)
+        self.assertIn("_find_chain_sheet", src)
+        self.assertIn('book.sheets["Chain"]', src)
 
 
 class SheetStructureGuardTests(unittest.TestCase):

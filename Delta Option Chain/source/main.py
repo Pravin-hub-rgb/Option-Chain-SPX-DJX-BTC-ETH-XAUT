@@ -617,6 +617,13 @@ def _open_excel_files(finished=None, own_instance=False):
         if finished is not None:
             finished.set()
     finally:
+        try:
+            if app is not None:
+                _new = app.api.Hwnd
+                if _new:
+                    delta_state._owner_hwnd = _new
+        except Exception:
+            pass
         if started_excel:
             _close_empty_book1(app)
 
@@ -2316,6 +2323,30 @@ def excel_environment_detail(book):
 
 
 
+def _find_chain_sheet(book, asset):
+    """Return the sheet this product writes to, by NAME not by index.
+
+    Delta's chain sheets are named after the asset (BTC/ETH/XAUT), not "Chain".
+    ``book.sheets[0]`` is the sheet Excel reports as first — which can be a
+    customer's new sheet if they inserted one, not the asset's owned sheet.
+    Writing there overwrites the customer's data with the header band.
+
+    Fall back to sheets[0] only if the named sheet is missing, then let the
+    structure check (``sheet_structure_ok``) decide whether the write is safe.
+    """
+    try:
+        return book.sheets[asset]
+    except Exception:
+        pass
+    for sh in book.sheets:
+        try:
+            if sh.name == asset:
+                return sh
+        except Exception:
+            continue
+    return book.sheets[0]
+
+
 def _write_to_excel(asset):
     try:
         import xlwings as xw
@@ -2399,7 +2430,7 @@ def _write_to_excel(asset):
             record_excel_connection(asset, "connected", "")
         sheet = cached_sheet
         if sheet is None:
-            sheet = book.sheets[0]
+            sheet = _find_chain_sheet(book, asset)
             _sheet_cache[asset] = sheet
 
         # Retire the third expiry block the moment the sheet is reachable —
@@ -3937,6 +3968,15 @@ async def display_loop():
             # The chain lives in its private Excel instance, so the write pass
             # runs while that instance is alive - whichever other Excel
             # windows exist on the machine are none of this tool's business.
+            # Keep the cached hwnd current so _owner_window_pid (and any handle-
+            # based check) does not act on a stale handle after workbooks open.
+            if delta_state._owner_app is not None:
+                try:
+                    _h = delta_state._owner_app.api.Hwnd
+                    if _h:
+                        delta_state._owner_hwnd = _h
+                except Exception:
+                    pass
             excel_alive = _owner_alive() or delta_state._owner_app is None
             retry_open_pass_after_grace()
             if excel_alive:

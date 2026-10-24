@@ -289,9 +289,13 @@ def _owner_alive():
     if app is None:
         return False
     try:
-        _ = app.version
+        v = app.version
         return True
-    except Exception:
+    except Exception as e:
+        try:
+            feed_log("owner_alive_failed", error=type(e).__name__, detail=str(e)[:180], hwnd=us_state._owner_hwnd)
+        except Exception:
+            pass
         return False
 
 
@@ -370,6 +374,16 @@ def find_open_book(xw, fname):
             continue
         if candidate == target_form:
             return book
+    # DEBUG: log mismatch
+    try:
+        feed_log(
+            "find_open_book_nomatch",
+            role=role,
+            target=target_form,
+            books=";".join(long_form(os.path.abspath(b.fullname)).lower() for b in books),
+        )
+    except Exception:
+        pass
     return None
 
 
@@ -392,6 +406,10 @@ def maybe_exit_after_close_all(excel_alive=None):
         now = time.monotonic()
         for role in ROLE_ORDER:
             us_state._missing_since[role] = now
+        try:
+            feed_log("maybe_exit_excel_dead", hwnd=us_state._owner_hwnd, missing=list(us_state._missing_since.keys()))
+        except Exception:
+            pass
     if len(us_state._missing_since) == len(ROLE_ORDER):
         now = time.monotonic()
         if us_state._all_gone_since is None:
@@ -1038,6 +1056,28 @@ def force_usd_block_formats(sheet, block, n_rows):
                     log_excel_exception("EXCEL", e, f"writing open-interest column {c0 + off}")
 
 
+def _find_chain_sheet(book):
+    """Return the sheet this product writes to, by NAME not by index.
+
+    ``book.sheets[0]`` is the sheet Excel reports as first — which is the
+    customer's active/new sheet when they insert one, not necessarily the
+    "Chain" sheet this tool owns. Writing there overwrites the customer's
+    data with the header band (e.g. "Expiry 1" scattered across A1:N3 of a
+    brand-new sheet). Always look the owned sheet up by name.
+    """
+    try:
+        return book.sheets["Chain"]
+    except Exception:
+        pass
+    for sh in book.sheets:
+        try:
+            if sh.name == "Chain":
+                return sh
+        except Exception:
+            continue
+    return book.sheets[0]
+
+
 def _write_to_excel(role):
     try:
         import xlwings as xw
@@ -1136,7 +1176,7 @@ def _write_to_excel(role):
             record_excel_connection(role, "connected", f"workbook={path}{excel_info}")
         sheet = cached_sheet
         if sheet is None:
-            sheet = book.sheets[0]
+            sheet = _find_chain_sheet(book)
             _sheet_cache[role] = sheet
 
         # Retire the third expiry block the moment the sheet is reachable —
@@ -2814,6 +2854,16 @@ async def display_loop():
             # The chain lives in its private Excel instance, so the write pass
             # runs while that instance is alive - whichever other Excel
             # windows exist on the machine are none of this tool's business.
+            # Keep the cached hwnd current: Excel can recreate its main window
+            # when workbooks open/close, and a stale handle makes the independent
+            # watchdog (and IsWindow checks) believe the instance is dead.
+            if us_state._owner_app is not None:
+                try:
+                    _h = us_state._owner_app.api.Hwnd
+                    if _h:
+                        us_state._owner_hwnd = _h
+                except Exception:
+                    pass
             excel_alive = _owner_alive() or us_state._owner_app is None
             retry_open_pass_after_grace()
             if excel_alive:

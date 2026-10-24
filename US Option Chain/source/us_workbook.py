@@ -373,10 +373,17 @@ def _ensure_owner_app(xw):
         _sts._owner_hwnd = app.api.Hwnd
     except Exception:
         _sts._owner_hwnd = None
+    try:
+        import ctypes
+        _alive = bool(ctypes.windll.user32.IsWindow(int(_sts._owner_hwnd))) if _sts._owner_hwnd else None
+    except Exception as _e:
+        _alive = f"exc:{_e}"
     feed_log(
         "excel_open_own_instance",
         role="ALL",
         note="starting a private Excel instance for this tool only",
+        hwnd=_sts._owner_hwnd,
+        iswindow=_alive,
     )
     return app
 
@@ -491,5 +498,17 @@ def _open_excel_files(finished=None, own_instance=False):
         if finished is not None:
             finished.set()
     finally:
+        try:
+            import us_state as _sts
+            _new = None
+            if app is not None:
+                try:
+                    _new = app.api.Hwnd
+                except Exception:
+                    _new = None
+            if _new:
+                _sts._owner_hwnd = _new
+        except Exception:
+            pass
         if app is not None:
             _close_empty_book1(app)

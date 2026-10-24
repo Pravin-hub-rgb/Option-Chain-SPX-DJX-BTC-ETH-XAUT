@@ -1796,6 +1796,11 @@ class AutoOpenRecoveryTests(unittest.TestCase):
         self.assertNotIn("list(xw.apps)", src)
         self.assertNotIn("same_name", src)
 
+    def test_chain_sheet_lookup_by_name_not_index(self):
+        src = inspect.getsource(delta_main)
+        self.assertIn("_find_chain_sheet", src)
+        self.assertIn("book.sheets[asset]", src)
+
     def test_long_form_round_trips_short_paths(self):
         import ctypes
 
