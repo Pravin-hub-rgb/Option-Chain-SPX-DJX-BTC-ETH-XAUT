@@ -18,6 +18,16 @@ if not defined DBN_LIB (
 )
 echo Using native module: %DBN_LIB%
 
+rem pyarrow CANNOT be excluded wholesale (unlike the Delta build, which does
+rem not ship databento): databento/__init__.py imports databento.common.dbnstore
+rem unconditionally, and dbnstore.py does "import pyarrow" + "import pyarrow.parquet"
+rem at module top. The verified pull chain (import databento at runtime) needs only
+rem pyarrow.lib/_compute/ipc/types/util, pyarrow.parquet, pyarrow.fs and the cloud
+rem filesystem backends pyarrow.fs/__init__ imports eagerly (_s3fs/_gcsfs/_azurefs/_hdfs).
+rem The modules below never appear in that chain (verified against sys.modules on
+rem 2026-10-25); excluding them trims ~23 MB of dead arrow DLLs/pyds
+rem (flight, substrait, dataset, acero, orc, csv, json, feather, encryption).
+
 python -m PyInstaller --noconfirm --clean --onedir --noconsole --noupx ^
   --name %PRODUCT_EXE% ^
   --collect-all xlwings ^
@@ -26,6 +36,15 @@ python -m PyInstaller --noconfirm --clean --onedir --noconsole --noupx ^
   --collect-all databento_dbn ^
   --copy-metadata databento ^
   --add-binary "%DBN_LIB%;databento_dbn" ^
+  --exclude-module pyarrow.flight ^
+  --exclude-module pyarrow.substrait ^
+  --exclude-module pyarrow.dataset ^
+  --exclude-module pyarrow.orc ^
+  --exclude-module pyarrow.csv ^
+  --exclude-module pyarrow.json ^
+  --exclude-module pyarrow.feather ^
+  --exclude-module pyarrow.acero ^
+  --exclude-module pyarrow.parquet.encryption ^
   --hidden-import win32com ^
   --hidden-import win32com.client ^
   --hidden-import pythoncom ^
@@ -46,6 +65,21 @@ if exist "dist\%PRODUCT_EXE%\_internal\pyarrow\lib" rd /s /q "dist\%PRODUCT_EXE%
 del /s /q "dist\%PRODUCT_EXE%\*.lib" >nul 2>&1
 del /s /q "dist\%PRODUCT_EXE%\*.pyi" >nul 2>&1
 del /s /q "dist\%PRODUCT_EXE%\*.pxd" >nul 2>&1
+
+rem The --exclude-module flags above keep the excluded pyarrow submodules out
+rem of the PYZ, but PyInstaller's pyarrow contrib hook still ships their
+rem compiled .pyd/.dll plus cython sources as data. Only the modules that the
+rem verified databento pull chain imports must survive
+rem (lib/_compute/ipc/types/util + parquet/_parquet + fs and the cloud
+rem filesystem backends pyarrow.fs imports eagerly: _s3fs/_gcsfs/_azurefs/_hdfs).
+rem The dot in each mask keeps _parquet._/_dataset._ from matching
+rem _parquet_encryption/_dataset_orc etc.; those variants are listed explicitly.
+for %%m in (_acero _csv _dataset _dataset_orc _dataset_parquet _dataset_parquet_encryption _feather _flight _json _orc _parquet_encryption _substrait) do del /q "dist\%PRODUCT_EXE%\_internal\pyarrow\%%m.*.pyd" >nul 2>&1
+for %%d in (arrow_acero arrow_dataset arrow_flight arrow_python_flight arrow_python_parquet_encryption arrow_substrait) do del /q "dist\%PRODUCT_EXE%\_internal\pyarrow\%%d.dll" >nul 2>&1
+rem cython sources, C++ source tree, and pyarrow's own test suite: never runtime
+del /q "dist\%PRODUCT_EXE%\_internal\pyarrow\*.pyx" >nul 2>&1
+del /q "dist\%PRODUCT_EXE%\_internal\pyarrow\*.pxi" >nul 2>&1
+for %%d in (includes src tests) do if exist "dist\%PRODUCT_EXE%\_internal\pyarrow\%%d" rd /s /q "dist\%PRODUCT_EXE%\_internal\pyarrow\%%d"
 echo Trimmed dev-only payload.
 
 set "PKG=..\client package"
