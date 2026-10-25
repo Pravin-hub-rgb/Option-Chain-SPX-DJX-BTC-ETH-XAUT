@@ -1447,6 +1447,8 @@ class RenderYieldTests(unittest.TestCase):
                 return self
 
             Calculation = -4105
+            CutCopyMode = 0
+            Ready = True
 
             def Calculate(self):
                 raise RuntimeError("Excel is busy mid-recalc")
@@ -1455,7 +1457,8 @@ class RenderYieldTests(unittest.TestCase):
         delta_state._app_cache = app
         delta_state._bulk_will_recalc = True
         try:
-            with patch.object(delta_main, "log_excel_exception"):
+            with patch.object(delta_main, "log_excel_exception"), \
+                 patch.object(delta_main, "_input_is_recent", return_value=False):
                 # Nothing written this cycle - but a debt was carried in
                 # from a yielded one. A busy Excel must not eat it.
                 delta_state._recalc_owed = True
@@ -1690,6 +1693,35 @@ class DeltaRefreshWidenTests(unittest.TestCase):
         self.assertIn("_refresh_widen_hold_until", src)
 
 
+class DeltaRecalcBackoffTests(unittest.TestCase):
+    """The Delta loop stretches by real recalc cost, and only when it is heavy."""
+
+    def setUp(self):
+        self._saved = delta_state._recalc_backoff_seconds
+
+    def tearDown(self):
+        delta_state._recalc_backoff_seconds = self._saved
+
+    def test_cheap_recalc_does_not_arm_backoff(self):
+        delta_main._update_recalc_backoff(5.0)
+        self.assertEqual(delta_state._recalc_backoff_seconds, 0.0)
+
+    def test_heavy_recalc_arms_backoff_proportional(self):
+        delta_main._update_recalc_backoff(200.0)
+        self.assertAlmostEqual(delta_state._recalc_backoff_seconds, 0.1, places=3)
+
+    def test_backoff_ewmas_up_across_recalcs(self):
+        delta_main._update_recalc_backoff(200.0)
+        delta_main._update_recalc_backoff(200.0)
+        self.assertAlmostEqual(delta_state._recalc_backoff_seconds, 0.15, places=3)
+
+    def test_display_loop_feeds_backoff_into_sleep_and_caps_it(self):
+        src = inspect.getsource(delta_main.display_loop)
+        self.assertIn("RECALC_BACKOFF_FACTOR *", src)
+        self.assertIn("MAX_REFRESH_SECONDS", src)
+        self.assertIn("_recalc_backoff_seconds", src)
+
+
 class AutoOpenRecoveryTests(unittest.TestCase):
     """A wedged Workbooks.Open must time out, log, and retry once.
 
@@ -1846,6 +1878,136 @@ class DeltaOwedRecalcSurvivesBusyExcelTests(unittest.TestCase):
         import main as delta_main
         src = inspect.getsource(delta_main.render_cycle)
         self.assertGreaterEqual(src.count("delta_state._recalc_owed = True"), 2)
+
+
+class DeltaTypingSafetyTests(unittest.TestCase):
+    """A Calculate must never run while the trader is mid-edit."""
+
+    def setUp(self):
+        import delta_state
+
+        self.saved = (
+            delta_state._app_cache,
+            delta_state._bulk_will_recalc,
+            delta_state._recalc_owed,
+            delta_state._last_recalc_ms,
+            delta_state._manual_since,
+        )
+
+    def tearDown(self):
+        import delta_state
+
+        (
+            delta_state._app_cache,
+            delta_state._bulk_will_recalc,
+            delta_state._recalc_owed,
+            delta_state._last_recalc_ms,
+            delta_state._manual_since,
+        ) = self.saved
+
+    class _App:
+        def __init__(self, mode=-4135, ready=True, cut_copy=0):
+            self.mode = mode
+            self.Ready = ready
+            self.CutCopyMode = cut_copy
+            self.calculations = 0
+
+        @property
+        def api(self):
+            return self
+
+        @property
+        def Calculation(self):
+            return self.mode
+
+        @Calculation.setter
+        def Calculation(self, value):
+            self.mode = value
+
+        def Calculate(self):
+            self.calculations += 1
+
+    def test_recalc_is_skipped_when_fresh_input_arrives(self):
+        import delta_state
+        import main as delta_main
+
+        app = self._App()
+        delta_state._app_cache = app
+        delta_state._bulk_will_recalc = True
+        delta_state._recalc_owed = False
+        with patch.object(delta_main, "_input_is_recent", return_value=True):
+            elapsed = delta_main._time_recalc(True)
+        self.assertEqual(elapsed, 0.0)
+        self.assertEqual(app.calculations, 0)
+        self.assertTrue(delta_state._recalc_owed, "the debt must be carried")
+
+    def test_recalc_is_skipped_while_excel_is_in_edit_mode(self):
+        import delta_state
+        import main as delta_main
+
+        app = self._App(ready=False)
+        delta_state._app_cache = app
+        delta_state._bulk_will_recalc = True
+        delta_state._recalc_owed = False
+        with patch.object(delta_main, "_input_is_recent", return_value=False):
+            elapsed = delta_main._time_recalc(True)
+        self.assertEqual(elapsed, 0.0)
+        self.assertEqual(app.calculations, 0)
+        self.assertTrue(delta_state._recalc_owed)
+
+    def test_watchdog_does_not_touch_calc_mode_during_recent_input(self):
+        import delta_state
+        import main as delta_main
+
+        class Untouchable:
+            @property
+            def api(self):
+                raise AssertionError("watchdog read Excel during typing")
+
+        app = Untouchable()
+        delta_state._app_cache = app
+        delta_state._manual_since = 0.0
+        with patch.object(delta_main, "_input_is_recent", return_value=True):
+            delta_main.ensure_calculation_not_stranded(app)
+
+    def test_render_cycle_guards_recalc_on_abort(self):
+        import inspect
+        import main as delta_main
+
+        src = inspect.getsource(delta_main.render_cycle)
+        self.assertIn("aborted = True", src)
+        self.assertIn("if not aborted:", src)
+
+    def test_render_cycle_does_not_recalc_after_an_abort(self):
+        import delta_state
+        import main as delta_main
+
+        app = self._App()
+        restored = []
+        delta_state._app_cache = app
+        with patch.object(delta_main, "_user_is_excel_interacting",
+                          side_effect=[False, False, True]), \
+             patch.object(delta_main, "_begin_excel_bulk_mode",
+                          return_value=lambda: restored.append("restore")), \
+             patch.object(delta_main, "write_to_excel") as write, \
+             patch.object(delta_main, "_time_recalc") as recalc, \
+             patch.object(delta_main, "_probe_calc_state_after_restore"), \
+             patch.object(delta_main, "_log_speed_summary"), \
+             patch.object(delta_main, "ensure_calculation_not_stranded"), \
+             patch.object(delta_main, "_performance_metrics"):
+            delta_main.render_cycle()
+
+        self.assertFalse(write.called, "abort must stop before any write")
+        self.assertFalse(recalc.called, "no Calculate after the abort")
+        self.assertEqual(restored, ["restore"])
+
+    def test_save_prompt_watchdog_is_gated_on_recent_input(self):
+        import inspect
+        import main as delta_main
+
+        src = inspect.getsource(delta_main._chain_save_prompt_once)
+        self.assertIn("_input_is_recent()", src)
+        self.assertLess(src.index("_input_is_recent()"), src.index("import ctypes"))
 
 
 if __name__ == "__main__":

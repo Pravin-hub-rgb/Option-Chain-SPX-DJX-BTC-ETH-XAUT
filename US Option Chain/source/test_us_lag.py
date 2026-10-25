@@ -938,7 +938,7 @@ class CalcFlapGuardTests(unittest.TestCase):
         # the tests run - the watchdog must stay environment-independent here.
         with patch.object(
             us_excel.calc_mode_guard, "other_holder_alive", return_value=False
-        ):
+        ), patch.object(us_excel, "_input_is_recent", return_value=False):
             us_excel.ensure_calculation_not_stranded(app)
         self.assertEqual(app.mode, -4105)
         self.assertEqual(us_state._manual_since, 0.0)
@@ -1192,6 +1192,8 @@ class CoexistenceGuardTests(unittest.TestCase):
         us_state._manual_since = time.time() - (us_state.MANUAL_WATCHDOG_SECONDS + 5)
         with mock.patch.object(
             self.main.calc_mode_guard, "other_holder_alive", return_value=False
+        ), mock.patch.object(
+            self.main, "_input_is_recent", return_value=False
         ):
             self.main.ensure_calculation_not_stranded(app)
         self.assertEqual(app.mode, -4105)
@@ -1225,6 +1227,8 @@ class CoexistenceGuardTests(unittest.TestCase):
             self.main.calc_mode_guard,
             "other_holder_alive",
             side_effect=RuntimeError("boom"),
+        ), mock.patch.object(
+            self.main, "_input_is_recent", return_value=False
         ):
             self.main.ensure_calculation_not_stranded(app)
         self.assertEqual(app.mode, -4105)
@@ -1453,6 +1457,61 @@ class RefreshWidenTests(unittest.TestCase):
         self.assertIn("_refresh_widen_hold_until", src)
 
 
+class RecalcBackoffTests(unittest.TestCase):
+    """Adaptive refresh is driven by real recalc cost, not the dead probe.
+
+    `_update_recalc_backoff` is fed the measured Application.Calculate duration.
+    A heavy workbook (over the 25 ms threshold) earns idle time via an EWMA; a
+    light workbook stays at the configured refresh and is never throttled, so a
+    healthy, lightly-loaded run behaves exactly as before.
+    """
+
+    def setUp(self):
+        import us_state
+
+        self._saved = us_state._recalc_backoff_seconds
+
+    def tearDown(self):
+        import us_state
+
+        us_state._recalc_backoff_seconds = self._saved
+
+    def test_cheap_recalc_does_not_arm_backoff(self):
+        import us_excel
+        import us_state
+
+        us_state._recalc_backoff_seconds = 0.0
+        us_excel._update_recalc_backoff(5.0)  # 5 ms, below the 25 ms threshold
+        self.assertEqual(us_state._recalc_backoff_seconds, 0.0)
+
+    def test_heavy_recalc_arms_backoff_proportional(self):
+        import us_excel
+        import us_state
+
+        us_state._recalc_backoff_seconds = 0.0
+        us_excel._update_recalc_backoff(200.0)  # 200 ms
+        # alpha 0.5 * 0.2 s = 0.1 s
+        self.assertAlmostEqual(us_state._recalc_backoff_seconds, 0.1, places=3)
+
+    def test_backoff_ewmas_up_across_recalcs(self):
+        import us_excel
+        import us_state
+
+        us_state._recalc_backoff_seconds = 0.0
+        us_excel._update_recalc_backoff(200.0)  # -> 0.1 s
+        us_excel._update_recalc_backoff(200.0)  # 0.5*0.2 + 0.5*0.1 = 0.15 s
+        self.assertAlmostEqual(us_state._recalc_backoff_seconds, 0.15, places=3)
+
+    def test_display_loop_feeds_backoff_into_sleep_and_caps_it(self):
+        import inspect
+        import us_excel
+
+        src = inspect.getsource(us_excel.display_loop)
+        self.assertIn("RECALC_BACKOFF_FACTOR *", src)
+        self.assertIn("MAX_REFRESH_SECONDS", src)
+        self.assertIn("_recalc_backoff_seconds", src)
+
+
 class ExpiryLayoutTests(unittest.TestCase):
     """US sheets show two expiry blocks; the third is retired once per session.
 
@@ -1673,7 +1732,8 @@ class CalcShutdownSuppressionTests(unittest.TestCase):
         us_state._calc_session.update(
             {"owned": True, "failed": False, "mode": "automatic", "app": app}
         )
-        with patch.object(us_excel, "_set_calc_mode") as set_mode:
+        with patch.object(us_excel, "_input_is_recent", return_value=False), \
+             patch.object(us_excel, "_set_calc_mode") as set_mode:
             with patch.object(us_excel.calc_mode_guard, "release") as release:
                 result = us_excel._begin_excel_bulk_mode(app)
         self.assertIsNone(result)
@@ -2373,6 +2433,8 @@ class RenderYieldTests(unittest.TestCase):
                 return self
 
             Calculation = -4105
+            CutCopyMode = 0
+            Ready = True
 
             def Calculate(self):
                 raise RuntimeError("Excel is busy mid-recalc")
@@ -2381,7 +2443,8 @@ class RenderYieldTests(unittest.TestCase):
         us_state._app_cache = app
         us_state._bulk_will_recalc = True
         try:
-            with patch.object(us_excel, "log_excel_exception"):
+            with patch.object(us_excel, "log_excel_exception"), \
+                 patch.object(us_excel, "_input_is_recent", return_value=False):
                 # Nothing written this cycle - but a debt was carried in
                 # from a yielded one. A busy Excel must not eat it.
                 us_state._recalc_owed = True
@@ -2399,6 +2462,241 @@ class RenderYieldTests(unittest.TestCase):
             us_state._recalc_owed = False
             us_state._bulk_will_recalc = False
             us_state._app_cache = None
+
+
+class TypingSafetyTests(unittest.TestCase):
+    """A Calculate must never run while the trader is mid-edit.
+
+    The abort path used to detect fresh input, break out of the write loop,
+    and then call `_time_recalc` anyway. That forced an app-wide Calculate
+    while the formula bar was live, which is the "I typed and nothing shows"
+    bug. These tests pin the last-instant guard, the owed-debt carry, and the
+    sibling-safe abort restore.
+    """
+
+    def setUp(self):
+        import us_state
+
+        self.session = dict(us_state._calc_session)
+        self.saved = (
+            us_state._app_cache,
+            us_state._bulk_will_recalc,
+            us_state._recalc_owed,
+            us_state._manual_since,
+            us_state._last_recalc_ms,
+        )
+
+    def tearDown(self):
+        import us_state
+
+        us_state._calc_session.clear()
+        us_state._calc_session.update(self.session)
+        (
+            us_state._app_cache,
+            us_state._bulk_will_recalc,
+            us_state._recalc_owed,
+            us_state._manual_since,
+            us_state._last_recalc_ms,
+        ) = self.saved
+
+    class _App:
+        def __init__(self, mode=-4135, ready=True, cut_copy=0):
+            self.mode = mode
+            self.Ready = ready
+            self.CutCopyMode = cut_copy
+            self.calculations = 0
+
+        @property
+        def api(self):
+            return self
+
+        @property
+        def Calculation(self):
+            return self.mode
+
+        @Calculation.setter
+        def Calculation(self, value):
+            self.mode = value
+
+        def Calculate(self):
+            self.calculations += 1
+
+    def test_recalc_is_skipped_when_fresh_input_arrives(self):
+        import us_excel
+        import us_state
+
+        app = self._App()
+        us_state._app_cache = app
+        us_state._bulk_will_recalc = True
+        us_state._recalc_owed = False
+        with patch.object(us_excel, "_input_is_recent", return_value=True):
+            elapsed = us_excel._time_recalc(True)
+        self.assertEqual(elapsed, 0.0)
+        self.assertEqual(app.calculations, 0)
+        self.assertTrue(us_state._recalc_owed, "the debt must be carried")
+
+    def test_recalc_is_skipped_while_excel_is_in_edit_mode(self):
+        import us_excel
+        import us_state
+
+        app = self._App(ready=False)
+        us_state._app_cache = app
+        us_state._bulk_will_recalc = True
+        us_state._recalc_owed = False
+        with patch.object(us_excel, "_input_is_recent", return_value=False):
+            elapsed = us_excel._time_recalc(True)
+        self.assertEqual(elapsed, 0.0)
+        self.assertEqual(app.calculations, 0)
+        self.assertTrue(us_state._recalc_owed)
+
+    def test_abort_restore_never_yanks_manual_from_the_sibling(self):
+        import us_excel
+        import us_state
+
+        app = self._App(mode=-4135)
+        us_state._calc_session.update(
+            owned=True, failed=False, mode="automatic", app=app
+        )
+        with patch.object(
+            us_excel.calc_mode_guard, "other_holder_alive", return_value=True
+        ), patch.object(us_excel.calc_mode_guard, "release") as release:
+            restored = us_excel._release_manual_on_user_abort()
+        self.assertFalse(restored)
+        self.assertEqual(app.mode, -4135, "sibling's manual must stay intact")
+        self.assertTrue(us_state._calc_session["owned"])
+        self.assertFalse(release.called)
+
+    def test_abort_restore_returns_the_mode_we_found(self):
+        import us_excel
+        import us_state
+
+        app = self._App(mode=-4135)
+        us_state._calc_session.update(
+            owned=True, failed=False, mode="automatic", app=app
+        )
+        with patch.object(
+            us_excel.calc_mode_guard, "other_holder_alive", return_value=False
+        ), patch.object(us_excel.calc_mode_guard, "release") as release:
+            restored = us_excel._release_manual_on_user_abort()
+        self.assertTrue(restored)
+        self.assertEqual(app.mode, -4105)
+        self.assertFalse(us_state._calc_session["owned"])
+        self.assertIsNone(us_state._calc_session["mode"])
+        self.assertTrue(release.called)
+
+    def test_abort_restore_keeps_the_guard_when_excel_refuses(self):
+        import us_excel
+        import us_state
+
+        app = self._App(mode=-4135)
+        us_state._calc_session.update(
+            owned=True, failed=False, mode="automatic", app=app
+        )
+        us_state._manual_since = 0.0
+        with patch.object(
+            us_excel.calc_mode_guard, "other_holder_alive", return_value=False
+        ), patch.object(
+            us_excel, "_set_calc_mode", return_value=False
+        ), patch.object(us_excel.calc_mode_guard, "release") as release:
+            restored = us_excel._release_manual_on_user_abort()
+        self.assertFalse(restored)
+        self.assertTrue(us_state._calc_session["owned"])
+        self.assertEqual(us_state._calc_session["mode"], "automatic")
+        self.assertGreater(us_state._manual_since, 0.0)
+        self.assertFalse(release.called)
+
+    def test_abort_restore_skips_when_holder_check_fails(self):
+        import us_excel
+        import us_state
+
+        app = self._App(mode=-4135)
+        us_state._calc_session.update(
+            owned=True, failed=False, mode="automatic", app=app
+        )
+        with patch.object(
+            us_excel.calc_mode_guard,
+            "other_holder_alive",
+            side_effect=RuntimeError("guard unreadable"),
+        ), patch.object(us_excel.calc_mode_guard, "release") as release:
+            restored = us_excel._release_manual_on_user_abort()
+        self.assertFalse(restored)
+        self.assertEqual(app.mode, -4135)
+        self.assertTrue(us_state._calc_session["owned"])
+        self.assertFalse(release.called)
+
+    def test_watchdog_does_not_touch_calc_mode_during_recent_input(self):
+        import us_excel
+        import us_state
+
+        class Untouchable:
+            @property
+            def api(self):
+                raise AssertionError("watchdog read Excel during typing")
+
+        app = Untouchable()
+        us_state._app_cache = app
+        us_state._calc_session.update(owned=False, failed=False)
+        us_state._manual_since = 0.0
+        with patch.object(us_excel, "_input_is_recent", return_value=True):
+            us_excel.ensure_calculation_not_stranded(app)
+
+    def test_render_cycle_guards_recalc_and_restores_on_abort(self):
+        import inspect
+        import us_excel
+
+        src = inspect.getsource(us_excel.render_cycle)
+        self.assertIn("aborted = True", src)
+        self.assertIn("if not aborted:", src)
+        self.assertIn("_release_manual_on_user_abort()", src)
+        self.assertLess(
+            src.index("_release_manual_on_user_abort()"),
+            src.index("restore()"),
+        )
+
+    def test_render_cycle_does_not_recalc_after_an_abort(self):
+        import us_excel
+        import us_state
+
+        app = self._App()
+        restored = []
+        us_state._app_cache = app
+        with patch.object(us_excel, "_user_is_excel_interacting",
+                          side_effect=[False, False, True]), \
+             patch.object(us_excel, "_excel_in_edit_mode", return_value=False), \
+             patch.object(us_excel, "bulk_app", return_value=app), \
+             patch.object(us_excel, "_begin_excel_bulk_mode",
+                          return_value=lambda: restored.append("restore")), \
+             patch.object(us_excel, "excel_process_running", return_value=True), \
+             patch.object(us_excel, "write_to_excel") as write, \
+             patch.object(us_excel, "_time_recalc") as recalc, \
+             patch.object(us_excel, "_release_manual_on_user_abort") as release, \
+             patch.object(us_excel, "_performance_metrics"), \
+             patch.object(us_state, "_databento_feed", None), \
+             patch.object(us_state, "_calc_manual_failed", False):
+            us_excel.render_cycle()
+
+        self.assertFalse(write.called, "abort must stop before any write")
+        self.assertFalse(recalc.called, "no Calculate after the abort")
+        self.assertTrue(release.called, "abort must release the manual window")
+        self.assertEqual(restored, ["restore"])
+
+    def test_save_prompt_watchdog_is_gated_on_recent_input(self):
+        import inspect
+        import us_excel
+
+        src = inspect.getsource(us_excel._chain_save_prompt_once)
+        self.assertIn("_input_is_recent()", src)
+        self.assertLess(src.index("_input_is_recent()"), src.index("import ctypes"))
+
+    def test_session_release_is_gated_on_recent_input(self):
+        import inspect
+        import us_excel
+
+        src = inspect.getsource(us_excel._begin_excel_bulk_mode)
+        self.assertLess(
+            src.index("_input_is_recent()"),
+            src.index("_release_session_manual(app)"),
+        )
 
 
 class StartupConsoleNoiseTests(unittest.TestCase):
