@@ -235,5 +235,113 @@ class DeltaStrategyFormulaTests(unittest.TestCase):
                                          f"Iteration {iteration}: lookup is text/error: {val!r}")
 
 
+class DeltaTypingPreservationTests(unittest.TestCase):
+    """Real Excel: a Calculate must not run while a cell is being edited."""
+
+    @classmethod
+    def setUpClass(cls):
+        if xw is None:
+            raise unittest.SkipTest("xlwings not installed")
+        try:
+            cls.app = xw.App(visible=True, add_book=False)
+            cls.app.display_alerts = False
+        except Exception as e:
+            raise unittest.SkipTest(f"Excel not available: {e}")
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "app"):
+            try:
+                cls.app.quit()
+            except Exception:
+                pass
+
+    def setUp(self):
+        import ctypes
+        import time
+
+        import win32com.client
+
+        self.time = time
+        self.shell = win32com.client.Dispatch("WScript.Shell")
+        self.book = self.app.books.add()
+        self.sheet = self.book.sheets[0]
+        self.saved = (
+            delta_state._app_cache,
+            delta_state._bulk_will_recalc,
+            delta_state._recalc_owed,
+        )
+        delta_state._app_cache = self.app
+        delta_state._bulk_will_recalc = True
+        delta_state._recalc_owed = False
+        try:
+            self.shell.AppActivate(self.app.pid)
+        except Exception:
+            pass
+        self.book.activate()
+        self.sheet.activate()
+        self.sheet.range("A1").select()
+        hwnd = self.app.api.Hwnd
+        user32 = ctypes.windll.user32
+        user32.ShowWindow(hwnd, 5)
+        user32.SetForegroundWindow(hwnd)
+        self.time.sleep(0.3)
+
+    def tearDown(self):
+        try:
+            self.app.api.SendKeys("{ESC}")
+        except Exception:
+            pass
+        (
+            delta_state._app_cache,
+            delta_state._bulk_will_recalc,
+            delta_state._recalc_owed,
+        ) = self.saved
+        try:
+            self.book.close()
+        except Exception:
+            pass
+
+    def test_typed_formula_survives_the_recalc_guard(self):
+        import ctypes
+
+        hwnd = self.app.api.Hwnd
+        user32 = ctypes.windll.user32
+        for _ in range(5):
+            try:
+                self.shell.AppActivate(self.app.pid)
+                self.book.activate()
+                self.sheet.activate()
+                self.sheet.range("A1").select()
+            except Exception:
+                pass
+            user32.ShowWindow(hwnd, 5)
+            user32.SetForegroundWindow(hwnd)
+            self.time.sleep(0.2)
+            if user32.GetForegroundWindow() == hwnd:
+                break
+        else:
+            self.skipTest("Excel never took the foreground")
+
+        self.shell.SendKeys("=1{+}2")
+        self.time.sleep(0.35)
+        if not delta_main._excel_in_edit_mode(self.app):
+            self.skipTest("Excel did not enter edit mode")
+
+        elapsed = delta_main._time_recalc(True)
+
+        self.assertEqual(elapsed, 0.0, "guard must skip Calculate")
+        self.assertTrue(delta_state._recalc_owed, "skipped recalc must be carried")
+        self.assertTrue(
+            delta_main._excel_in_edit_mode(self.app),
+            "Excel left edit mode unexpectedly",
+        )
+
+        self.shell.SendKeys("{ENTER}")
+        self.time.sleep(0.35)
+        self.assertEqual(self.sheet.range("A1").formula, "=1+2")
+        self.assertEqual(self.sheet.range("A1").value, 3)
+
+
 if __name__ == "__main__":
     unittest.main()

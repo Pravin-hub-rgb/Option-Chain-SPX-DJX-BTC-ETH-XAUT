@@ -39,6 +39,9 @@ REPS = 20
 TYPE_CELL = "A900"
 CHAIN_PROBE = "C7"          # chain-dependent: proves propagation with the tool ON
 VOL_PROBE = "L7"            # NOW(): proves volatile recalc is actually running
+# A5 is Call LTP, which the Delta feed leaves 0/blank on this template, so it
+# never moves. A1 is the live spot header and always tracks the feed.
+CHAIN_CELL = "A1"
 
 _k32 = ctypes.windll.kernel32
 
@@ -332,7 +335,7 @@ def main():
         try:
             ticks.append({
                 "t": round(time.perf_counter() - start, 1),
-                "chain": jsonable(chain.range("A5").value),
+                "chain": jsonable(chain.range(CHAIN_CELL).value),
                 "spot": spot_of(chain),
                 "strat": jsonable(sh.range(CHAIN_PROBE).value),
                 "vol": jsonable(sh.range(VOL_PROBE).value),

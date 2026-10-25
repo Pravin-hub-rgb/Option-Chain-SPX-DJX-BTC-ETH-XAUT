@@ -2,20 +2,97 @@
   "variant": "A",
   "condition": "on",
   "sheet": "StratA",
-  "seconds_requested": 60,
+  "seconds_requested": 20,
   "precondition_exchange_feed_live": true,
   "exchange_feed": {
-    "frames": 121,
-    "distinct": 80,
-    "first": 83545.8,
-    "last": 83452.8
+    "frames": 77,
+    "distinct": 42,
+    "first": 80384.8,
+    "last": 80417.1
   },
-  "precondition_tool_header_live": false,
+  "precondition_tool_header_live": true,
   "tool_header": {
-    "samples": 0,
-    "distinct_moves": 0,
-    "first": null,
-    "last": null
+    "samples": 30,
+    "distinct_moves": 18,
+    "first": "80417.20",
+    "last": "80423.80"
   },
-  "ABORTED": "tool header never went live"
+  "excel_cpu_avg_pct": 30.1,
+  "excel_cpu_max_pct": 43.5,
+  "excel_cpu_samples": 10,
+  "not_responding": [],
+  "wall_seconds": 21.0,
+  "tick_samples": 10,
+  "chain_cell_moves": 8,
+  "strategy_cell_moves": 7,
+  "strategy_tracked_chain": true,
+  "volatile_cell_moves": 9,
+  "volatile_recalc_running": true,
+  "typing_avg_ms": 40.5,
+  "typing_median_ms": 40.3,
+  "typing_p95_ms": 46.4,
+  "typing_worst_ms": 64.6,
+  "typing_retries": 0,
+  "perf": {
+    "excel_recalc": {
+      "count": 40,
+      "avg_ms": 1.15,
+      "max_ms": 2.28
+    },
+    "excel_recalc_second_pass": {
+      "count": 42,
+      "avg_ms": 0.0,
+      "max_ms": 0.0
+    },
+    "refresh_overrun": {
+      "count": 1,
+      "avg_ms": 803.87,
+      "max_ms": 803.87
+    },
+    "render_cycle": {
+      "count": 42,
+      "avg_ms": 210.77,
+      "max_ms": 343.52
+    },
+    "chain_build": {
+      "count": 84,
+      "avg_ms": 2.67,
+      "max_ms": 5.04
+    },
+    "excel_block_prep": {
+      "count": 84,
+      "avg_ms": 0.14,
+      "max_ms": 0.32
+    },
+    "excel_formatting": {
+      "count": 84,
+      "avg_ms": 2.34,
+      "max_ms": 34.31
+    },
+    "excel_pass": {
+      "count": 42,
+      "avg_ms": 41.34,
+      "max_ms": 105.37
+    },
+    "excel_range_skipped": {
+      "count": 74,
+      "avg_ms": 0.0,
+      "max_ms": 0.0
+    },
+    "excel_range_write": {
+      "count": 7,
+      "avg_ms": 45.06,
+      "max_ms": 58.56
+    },
+    "excel_recalc_skip_nowrite": {
+      "count": 1,
+      "avg_ms": 0.0,
+      "max_ms": 0.0
+    },
+    "excel_recalc_skip_user_input": {
+      "count": 2,
+      "avg_ms": 0.0,
+      "max_ms": 0.0
+    }
+  }
 }
