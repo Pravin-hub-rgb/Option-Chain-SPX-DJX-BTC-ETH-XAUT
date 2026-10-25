@@ -40,6 +40,11 @@ POLL_GAP = float(cfg.get("poll_gap_seconds", 2))
 ROUND_PAUSE = float(cfg.get("round_pause_seconds", 2))
 EXPIRY_REFRESH = float(cfg.get("expiry_refresh_seconds", 60))
 REFRESH = float(cfg.get("refresh_interval_seconds", 0.5))
+# A write window stays shut while the trader's hands are on our Excel. 0.7 s
+# was shorter than a normal pause between words, so a window could open in the
+# middle of an edit; 1.5 s is long enough to cover real typing and still
+# resumes as soon as the keys go quiet.
+INPUT_GRACE_SECONDS = float(cfg.get("input_grace_seconds", 1.5))
 # How often each symbol's chain is rebuilt. The old loop rebuilt all three in
 # one pass and slept between passes, so every symbol was about six seconds
 # behind. Each symbol now has its own period.
@@ -224,6 +229,16 @@ _user_input_skip_log_at = 0.0
 _user_edit_skip_log_at = 0.0
 
 _last_recalc_ms = 0.0
+# Real Application.Calculate cost, used to drive the adaptive refresh. The
+# CalculationState probe (_calc_state_probe above) only ever reads 0 in
+# practice - it runs after a synchronous Calculate that already finished - so it
+# never stretched the loop. The measured recalc duration is the signal instead.
+_recalc_backoff_seconds = 0.0
+RECALC_BACKOFF_FACTOR = float(cfg.get("recalc_backoff_factor", 5.0))
+RECALC_BACKOFF_THRESHOLD_SECONDS = float(cfg.get("recalc_backoff_threshold_seconds", 0.025))
+RECALC_BACKOFF_ALPHA = 0.5
+RECALC_BACKOFF_DECAY = 0.9
+MAX_REFRESH_SECONDS = float(cfg.get("max_refresh_seconds", 5.0))
 # Cached (book, sheet) COM objects per role — book.sheets[0] is a COM round-trip
 # every call, and it dominated the render loop. Cached and dropped on staleness.
 _book_sheet_cache = {}
