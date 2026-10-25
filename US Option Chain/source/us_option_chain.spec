@@ -25,7 +25,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['pyarrow.flight', 'pyarrow.substrait', 'pyarrow.dataset', 'pyarrow.orc', 'pyarrow.csv', 'pyarrow.json', 'pyarrow.feather', 'pyarrow.acero', 'pyarrow.parquet.encryption'],
     noarchive=False,
     optimize=0,
 )

@@ -1665,7 +1665,7 @@ def _time_recalc(wrote):
     the handwritten spreadsheet the customer was working in gets its fresh
     values on the very next cycle we can actually run.
     """
-    global _recalc_input_skip_logged_at
+    global _recalc_input_skip_logged_at, _recalc_strategy_skip_logged_at
     owed = us_state._recalc_owed
     us_state._recalc_owed = False
     if not wrote and not owed:
@@ -1695,6 +1695,24 @@ def _time_recalc(wrote):
             )
         _performance_metrics.record("ALL", "excel_recalc_skip_user_input", 0.0)
         return 0.0
+    # Strategy-safe: never run a heavy full-workbook Calculate while parked on a
+    # non-Chain sheet; carry the debt until back on a Chain sheet.
+    try:
+        _on_strategy_sheet = (_active_sheet_is_chain(app) is False)
+    except Exception:
+        _on_strategy_sheet = False
+    if _on_strategy_sheet:
+        now = time.monotonic()
+        if now - _recalc_strategy_skip_logged_at > 30.0:
+            _recalc_strategy_skip_logged_at = now
+            feed_log(
+                "excel_recalc_skipped_strategy_sheet",
+                note="active sheet is not a chain sheet; recalculation carried",
+            )
+        if owed:
+            us_state._recalc_owed = True
+        _performance_metrics.record("ALL", "excel_recalc_skipped_strategy_sheet", 0.0)
+        return 0.0
     try:
         started = time.perf_counter()
         app.api.Calculate()
@@ -1717,6 +1735,7 @@ def _time_recalc(wrote):
 _USER_INPUT_GRACE_SECONDS = us_state.INPUT_GRACE_SECONDS
 
 _recalc_input_skip_logged_at = 0.0
+_recalc_strategy_skip_logged_at = 0.0
 _watchdog_input_skip_logged_at = 0.0
 _session_release_input_skip_logged_at = 0.0
 
@@ -2066,6 +2085,24 @@ def render_cycle():
         )
         return
 
+    # Strategy-safe mode (data-freshness variant): chain data keeps updating
+    # every cycle even while parked on a non-Chain sheet. Writing is cheap in
+    # manual calc mode, so only the heavy Calculate and calc-mode flip are
+    # deferred (see _time_recalc and the watchdog). Owed recalc carried.
+    if app is not None and _active_sheet_is_chain(app) is False:
+        now_mono_strat = time.monotonic()
+        if now_mono_strat - us_state._strategy_sheet_skip_log_at > 30.0:
+            us_state._strategy_sheet_skip_log_at = now_mono_strat
+            feed_log(
+                "render_cycle_skipped_strategy_sheet",
+                note="active sheet is not a chain sheet; writes continue, recalc deferred",
+            )
+        us_state._recalc_owed = True
+        _performance_metrics.record(
+            "ALL", "render_cycle_skipped_strategy_sheet", 0.0
+        )
+
+
     aborted = False
     restore = _begin_excel_bulk_mode(bulk_app())
     try:
@@ -2341,6 +2378,32 @@ def _chain_books_missing(open_names):
     if not open_names:
         return False
     return not any(name in open_names for name in ROLE_FILES.values())
+
+
+_US_CHAIN_SHEET_NAMES = frozenset({"CHAIN"})
+
+
+def _active_sheet_is_chain(app):
+    """True if Excel's active sheet is this tool's Chain sheet.
+
+    Returns None when the active sheet cannot be read (COM failure or no app),
+    which callers treat as "cannot tell" -> do NOT pause, so a COM hiccup
+    never stalls the whole feed. Only an explicit non-Chain sheet name pauses.
+    """
+    if app is None:
+        return None
+    try:
+        name = app.api.ActiveSheet.Name
+    except Exception:
+        return None
+    if name is None:
+        return None
+    try:
+        return str(name).strip().upper() in _US_CHAIN_SHEET_NAMES
+    except Exception:
+        return None
+
+
 
 
 _SAVE_PROMPT_CLASSES = ("NUIDialog", "#32770")
@@ -2815,6 +2878,19 @@ def ensure_calculation_not_stranded(app=None):
         app = bulk_app()
     if app is None:
         return
+    # Strategy-safe parity: while the trader is parked on a non-Chain sheet,
+    # never flip calc mode back to automatic behind their back.
+    if _active_sheet_is_chain(app) is False:
+        now = time.monotonic()
+        if now - _watchdog_input_skip_logged_at > 30.0:
+            _watchdog_input_skip_logged_at = now
+            feed_log(
+                "watchdog_skipped_strategy_sheet",
+                note="active sheet is not a chain sheet; calc mode left alone",
+            )
+        return
+
+
     if _calc_session.get("owned") and not _calc_session.get("failed"):
         return
     try:

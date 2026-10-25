@@ -95,6 +95,23 @@ class WatchdogCoexistenceTests(TempStateTestBase):
             delta_main.ensure_calculation_not_stranded(app=app)
         self.assertEqual(int(app.api.Calculation), -4105)
         delta_state._manual_since = 0.0
+    def test_watchdog_leaves_manual_alone_on_non_chain_sheet(self):
+        self._idle_input()
+        app = FakeApp(mode=-4135)
+        delta_state._manual_since = time.time() - delta_main.MANUAL_WATCHDOG_SECONDS - 1
+        delta_main._watchdog_input_skip_logged_at = 0.0
+
+
+        with mock.patch.object(delta_main, "_active_sheet_is_chain", return_value=False), \
+             mock.patch.object(delta_main, "feed_log") as log:
+            delta_main.ensure_calculation_not_stranded(app=app)
+        self.assertEqual(int(app.api.Calculation), -4135)
+        events = [c for c in log.call_args_list
+                  if c.args and c.args[0] == "watchdog_skipped_strategy_sheet"]
+        self.assertEqual(len(events), 1)
+        delta_state._manual_since = 0.0
+
+
 
 
 class ChurnObservationTests(unittest.TestCase):

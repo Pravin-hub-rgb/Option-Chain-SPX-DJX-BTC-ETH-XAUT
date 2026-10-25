@@ -1214,6 +1214,33 @@ class CoexistenceGuardTests(unittest.TestCase):
             self.main.ensure_calculation_not_stranded(app)
         self.assertEqual(app.mode, -4135)
         self.assertEqual(us_state._manual_since, manual)
+    def test_watchdog_leaves_manual_alone_on_non_chain_sheet(self):
+        import time
+        import us_state
+        from unittest import mock
+
+        app = self._flippable_app()
+        us_state._calc_session.pop("owned", None)
+        manual = time.time() - (us_state.MANUAL_WATCHDOG_SECONDS + 5)
+        us_state._manual_since = manual
+        self.main._watchdog_input_skip_logged_at = 0.0
+        with mock.patch.object(
+            self.main.calc_mode_guard, "other_holder_alive", return_value=False
+        ), mock.patch.object(
+            self.main, "_input_is_recent", return_value=False
+        ), mock.patch.object(
+            self.main, "_active_sheet_is_chain", return_value=False
+        ), mock.patch.object(
+            self.main, "feed_log"
+        ) as log:
+            self.main.ensure_calculation_not_stranded(app)
+        self.assertEqual(app.mode, -4135)
+        self.assertEqual(us_state._manual_since, manual)
+        events = [c for c in log.call_args_list
+                  if c.args and c.args[0] == "watchdog_skipped_strategy_sheet"]
+        self.assertEqual(len(events), 1)
+
+
 
     def test_holder_check_failure_fails_open(self):
         import time
@@ -2679,6 +2706,52 @@ class TypingSafetyTests(unittest.TestCase):
         self.assertFalse(recalc.called, "no Calculate after the abort")
         self.assertTrue(release.called, "abort must release the manual window")
         self.assertEqual(restored, ["restore"])
+
+    def test_render_cycle_writes_on_non_chain_sheet_recalc_carried(self):
+        import us_excel
+        import us_state
+
+        app = self._App()
+        restored = []
+        us_state._app_cache = app
+        us_state._recalc_owed = False
+        us_state._strategy_sheet_skip_log_at = 0.0
+        with patch.object(us_excel, "_user_is_excel_interacting", return_value=False), \
+             patch.object(us_excel, "_excel_in_edit_mode", return_value=False), \
+             patch.object(us_excel, "_active_sheet_is_chain", return_value=False), \
+             patch.object(us_excel, "bulk_app", return_value=app), \
+             patch.object(us_excel, "_begin_excel_bulk_mode",
+                          return_value=lambda: restored.append("restore")), \
+             patch.object(us_excel, "excel_process_running", return_value=True), \
+             patch.object(us_excel, "write_to_excel") as write, \
+             patch.object(us_excel, "_time_recalc") as recalc, \
+             patch.object(us_excel, "_performance_metrics"), \
+             patch.object(us_state, "_databento_feed", None), \
+             patch.object(us_state, "_calc_manual_failed", False), \
+             patch.object(us_excel, "feed_log") as log:
+            us_excel.render_cycle()
+
+        self.assertTrue(write.called, "chain data keeps updating on a non-chain sheet")
+        self.assertTrue(recalc.called, "recalc path runs (internally skipped)")
+        self.assertEqual(restored, ["restore"], "bulk window opens for writes")
+        events = [c for c in log.call_args_list
+                  if c.args and c.args[0] == "render_cycle_skipped_strategy_sheet"]
+        self.assertEqual(len(events), 1, "strategy-sheet activity must be logged")
+        self.assertTrue(us_state._recalc_owed, "owed recalc carried")
+
+
+    def test_render_cycle_strategy_sheet_guard_precedes_bulk_mode(self):
+        import inspect
+        import us_excel
+
+        src = inspect.getsource(us_excel.render_cycle)
+        self.assertIn("render_cycle_skipped_strategy_sheet", src)
+        self.assertIn("_active_sheet_is_chain", src)
+        self.assertLess(
+            src.index("_active_sheet_is_chain("),
+            src.index("_begin_excel_bulk_mode("),
+        )
+
 
     def test_save_prompt_watchdog_is_gated_on_recent_input(self):
         import inspect

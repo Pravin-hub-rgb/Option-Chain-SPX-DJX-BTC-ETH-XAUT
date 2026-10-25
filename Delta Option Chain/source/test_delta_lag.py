@@ -1996,6 +1996,19 @@ class DeltaTypingSafetyTests(unittest.TestCase):
         src = inspect.getsource(delta_main.render_cycle)
         self.assertIn("aborted = True", src)
         self.assertIn("if not aborted:", src)
+    def test_render_cycle_strategy_sheet_guard_precedes_bulk_mode(self):
+        import inspect
+        import main as delta_main
+
+        src = inspect.getsource(delta_main.render_cycle)
+        self.assertIn("render_cycle_skipped_strategy_sheet", src)
+        self.assertIn("_active_sheet_is_chain", src)
+        self.assertLess(
+            src.index("_active_sheet_is_chain("),
+            src.index("_begin_excel_bulk_mode()"),
+        )
+
+
 
     def test_render_cycle_does_not_recalc_after_an_abort(self):
         import delta_state
@@ -2019,6 +2032,37 @@ class DeltaTypingSafetyTests(unittest.TestCase):
         self.assertFalse(write.called, "abort must stop before any write")
         self.assertFalse(recalc.called, "no Calculate after the abort")
         self.assertEqual(restored, ["restore"])
+    def test_render_cycle_writes_on_non_chain_sheet_recalc_carried(self):
+        import delta_state
+        import main as delta_main
+
+        app = self._App()
+        restored = []
+        delta_state._app_cache = app
+        delta_state._recalc_owed = False
+        delta_state._strategy_sheet_skip_log_at = 0.0
+        with patch.object(delta_main, "_user_is_excel_interacting", return_value=False), \
+             patch.object(delta_main, "_active_sheet_is_chain", return_value=False), \
+             patch.object(delta_main, "_begin_excel_bulk_mode",
+                          return_value=lambda: restored.append("restore")), \
+             patch.object(delta_main, "write_to_excel") as write, \
+             patch.object(delta_main, "_time_recalc") as recalc, \
+             patch.object(delta_main, "_probe_calc_state_after_restore"), \
+             patch.object(delta_main, "_log_speed_summary"), \
+             patch.object(delta_main, "ensure_calculation_not_stranded"), \
+             patch.object(delta_main, "_performance_metrics"), \
+             patch.object(delta_main, "feed_log") as log:
+            delta_main.render_cycle()
+
+        self.assertTrue(write.called, "chain data keeps updating on a non-chain sheet")
+        self.assertTrue(recalc.called, "recalc path runs (internally skipped)")
+        self.assertEqual(restored, ["restore"], "bulk window opens for writes")
+        events = [c for c in log.call_args_list
+                  if c.args and c.args[0] == "render_cycle_skipped_strategy_sheet"]
+        self.assertEqual(len(events), 1, "strategy-sheet activity must be logged")
+        self.assertTrue(delta_state._recalc_owed, "owed recalc carried")
+
+
 
     def test_save_prompt_watchdog_is_gated_on_recent_input(self):
         import inspect

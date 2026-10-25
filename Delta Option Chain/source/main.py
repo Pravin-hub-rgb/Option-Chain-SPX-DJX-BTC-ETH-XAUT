@@ -2035,6 +2035,20 @@ def ensure_calculation_not_stranded(app=None):
         app = delta_state._owner_app
     if app is None:
         return
+    # Strategy-safe parity: while the trader is parked on a non-chain sheet,
+    # never flip calc mode back to automatic behind their back. Their heavy
+    # workbook must stay as they left it.
+    if _active_sheet_is_chain(app) is False:
+        now = time.monotonic()
+        if now - _watchdog_input_skip_logged_at > 30.0:
+            _watchdog_input_skip_logged_at = now
+            feed_log(
+                "watchdog_skipped_strategy_sheet",
+                note="active sheet is not a chain sheet; calc mode left alone",
+            )
+        return
+
+
     try:
         mode = _raw_calc_mode(app)
     except Exception:
@@ -2089,6 +2103,32 @@ def _chain_books_missing(open_names):
     if not open_names:
         return False
     return not any(name in open_names for name in _CHAIN_BOOK_NAMES)
+
+
+_CHAIN_SHEET_NAMES = frozenset({"BTC", "ETH", "XAUT"})
+
+
+def _active_sheet_is_chain(app):
+    """True if Excel's active sheet is one of this tool's chain sheets.
+
+    Returns None when the active sheet cannot be read (COM failure or no app),
+    which callers treat as "cannot tell" -> do NOT pause, so a COM hiccup
+    never stalls the whole feed. Only an explicit non-chain sheet name pauses.
+    """
+    if app is None:
+        return None
+    try:
+        name = app.api.ActiveSheet.Name
+    except Exception:
+        return None
+    if name is None:
+        return None
+    try:
+        return str(name).strip().upper() in _CHAIN_SHEET_NAMES
+    except Exception:
+        return None
+
+
 
 
 _SAVE_PROMPT_CLASSES = ("NUIDialog", "#32770")
@@ -2791,7 +2831,7 @@ def _time_recalc(wrote):
     manual would be doing something they asked us not to. A cycle skipped for
     customer input owes its recalculation, so _recalc_owed carries it here.
     """
-    global _recalc_input_skip_logged_at
+    global _recalc_input_skip_logged_at, _recalc_strategy_skip_logged_at
     owed = delta_state._recalc_owed
     delta_state._recalc_owed = False
     if not wrote and not owed:
@@ -2820,6 +2860,24 @@ def _time_recalc(wrote):
                 note="customer's hands are on Excel; recalculation carried",
             )
         _performance_metrics.record("ALL", "excel_recalc_skip_user_input", 0.0)
+        return 0.0
+    # Strategy-safe: never run a heavy full-workbook Calculate while the trader
+    # is parked on a non-chain sheet; carry the debt until back on a chain sheet.
+    try:
+        _on_strategy_sheet = (_active_sheet_is_chain(app) is False)
+    except Exception:
+        _on_strategy_sheet = False
+    if _on_strategy_sheet:
+        now = time.monotonic()
+        if now - _recalc_strategy_skip_logged_at > 30.0:
+            _recalc_strategy_skip_logged_at = now
+            feed_log(
+                "excel_recalc_skipped_strategy_sheet",
+                note="active sheet is not a chain sheet; recalculation carried",
+            )
+        if owed:
+            delta_state._recalc_owed = True
+        _performance_metrics.record("ALL", "excel_recalc_skipped_strategy_sheet", 0.0)
         return 0.0
     try:
         started = time.perf_counter()
@@ -2918,6 +2976,7 @@ def _note_recalc_second_pass(now):
 _USER_INPUT_GRACE_SECONDS = float(cfg.get("input_grace_seconds", 1.5))
 
 _recalc_input_skip_logged_at = 0.0
+_recalc_strategy_skip_logged_at = 0.0
 _watchdog_input_skip_logged_at = 0.0
 
 
@@ -3164,6 +3223,25 @@ def render_cycle():
             "ALL", "render_cycle_skipped_user_input_late", 0.0
         )
         return
+
+    # Strategy-safe mode (P2.4, data-freshness variant): chain data keeps
+    # updating every cycle even while the trader is parked on a non-chain sheet
+    # (Strategy/Calendar). Writing is cheap in manual calc mode, so only the
+    # heavy Application.Calculate() and the calc-mode flip are deferred (see
+    # _time_recalc and the watchdog). The owed recalc is carried.
+    if app is not None and _active_sheet_is_chain(app) is False:
+        now_mono_strat = time.monotonic()
+        if now_mono_strat - delta_state._strategy_sheet_skip_log_at > 30.0:
+            delta_state._strategy_sheet_skip_log_at = now_mono_strat
+            feed_log(
+                "render_cycle_skipped_strategy_sheet",
+                note="active sheet is not a chain sheet; writes continue, recalc deferred",
+            )
+        delta_state._recalc_owed = True
+        _performance_metrics.record(
+            "ALL", "render_cycle_skipped_strategy_sheet", 0.0
+        )
+
 
     aborted = False
     restore = _begin_excel_bulk_mode()

@@ -48,6 +48,7 @@ _recalc_owed = False
 # Rate-limit the skip receipts so support sees one line, not one per cycle.
 _user_input_skip_log_at = 0.0
 _user_edit_skip_log_at = 0.0
+_strategy_sheet_skip_log_at = 0.0
 
 _speed_log_at = 0.0
 
