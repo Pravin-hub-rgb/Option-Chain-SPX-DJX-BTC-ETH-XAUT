@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import main as delta_main
 import delta_state
+import delta_chain
 
 
 class DeltaComTaxTests(unittest.TestCase):
@@ -816,9 +817,9 @@ class ConsoleNoiseTests(unittest.TestCase):
         try:
             with patch.object(delta_main.time, "monotonic",
                               lambda: next(ticks)), patch.object(
-                delta_main, "print", lambda *a, **k: lines.append(a[0])
+                delta_chain, "print", lambda *a, **k: lines.append(a[0])
             ), patch.object(
-                delta_main, "feed_log",
+                delta_chain, "feed_log",
                 lambda *a, **k: feed_sites.append((a[0], k.get("site"))),
             ):
                 delta_main._quiet_console_error("site", "boom one")
@@ -2046,13 +2047,14 @@ class DeltaPutIntrinsicWarningTests(unittest.TestCase):
     def tearDown(self):
         import main as delta_main
 
-        delta_main._PUT_INTRINSIC_WARNED = self._saved_warned
+        delta_main._PUT_INTRINSIC_WARNED.clear()
+        delta_main._PUT_INTRINSIC_WARNED.update(self._saved_warned)
 
     def _frame(self, strike, ltp):
         return self.pd.DataFrame([{"strike": strike, "Put LTP": ltp}])
 
     def test_put_below_intrinsic_is_flagged_with_full_context(self):
-        with patch.object(delta_main, "feed_log") as log:
+        with patch.object(delta_chain, "feed_log") as log:
             delta_main._put_intrinsic_rows(
                 "BTC", 81815.0, self._frame(79200, 0.4))
         events = [c for c in log.call_args_list if c.args[0] == "put_intrinsic_warning"]
@@ -2067,26 +2069,26 @@ class DeltaPutIntrinsicWarningTests(unittest.TestCase):
     def test_the_quoted_price_is_never_removed_or_rewritten(self):
         frame = self._frame(79200, 0.4)
         before = list(frame.itertuples(index=False))
-        with patch.object(delta_main, "feed_log"):
+        with patch.object(delta_chain, "feed_log"):
             delta_main._put_intrinsic_rows("BTC", 81815.0, frame)
         self.assertEqual(list(frame.itertuples(index=False)), before)
 
     def test_put_at_or_above_intrinsic_is_never_flagged(self):
-        with patch.object(delta_main, "feed_log") as log:
+        with patch.object(delta_chain, "feed_log") as log:
             delta_main._put_intrinsic_rows("BTC", 81815.0, self._frame(84000, 1200.0))
         self.assertFalse(log.called)
         self.assertFalse(delta_main._PUT_INTRINSIC_WARNED)
 
     def test_bad_rows_and_missing_columns_are_ignored(self):
         empty = self.pd.DataFrame([{"strike": 0, "Put LTP": 0.0}])
-        with patch.object(delta_main, "feed_log") as log:
+        with patch.object(delta_chain, "feed_log") as log:
             delta_main._put_intrinsic_rows("BTC", 81815.0, empty)
             delta_main._put_intrinsic_rows("BTC", None, self._frame(79200, 0.4))
             delta_main._put_intrinsic_rows("BTC", 81815.0, self.pd.DataFrame())
         self.assertFalse(log.called)
 
     def test_warning_is_throttled_per_asset_within_the_interval(self):
-        with patch.object(delta_main, "feed_log"):
+        with patch.object(delta_chain, "feed_log"):
             delta_main._put_intrinsic_rows("BTC", 81815.0, self._frame(79200, 0.4))
             delta_main._put_intrinsic_rows("BTC", 81815.0, self._frame(79000, 0.2))
             # a different asset keeping its own throttle window

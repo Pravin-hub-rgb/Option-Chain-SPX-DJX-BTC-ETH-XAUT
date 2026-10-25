@@ -269,6 +269,12 @@ PARITY_MAX_SPREAD_PCT = float(cfg.get("parity_max_spread_pct", 0.05))
 PARITY_SANITY_PCT = float(cfg.get("parity_sanity_pct", 0.05))
 
 _parity_spot_cache = {}
+
+# put_intrinsic_warning observer throttle. Lives in state (not in delta_chain) so
+# the dict identity stays stable across the import-alias rebinds the tests perform
+# on delta_main._PUT_INTRINSIC_WARNED.
+_PUT_INTRINSIC_WARNED = {}
+_PUT_INTRINSIC_WARN_INTERVAL = 300.0
 _spot_divergence = {}
 _parity_log_at = {}
 
