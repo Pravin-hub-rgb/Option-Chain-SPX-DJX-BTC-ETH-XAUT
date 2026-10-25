@@ -2028,5 +2028,80 @@ class DeltaTypingSafetyTests(unittest.TestCase):
         self.assertLess(src.index("_input_is_recent()"), src.index("import ctypes"))
 
 
+class DeltaPutIntrinsicWarningTests(unittest.TestCase):
+    """The observer notes exchange-implausible puts without touching them."""
+
+    def setUp(self):
+        import delta_state
+        import pandas as pd
+        import main as delta_main
+
+        self.delta_main = delta_main
+        self.delta_state = delta_state
+        self.pd = pd
+        self.patch = patch
+        self._saved_warned = dict(delta_main._PUT_INTRINSIC_WARNED)
+        delta_main._PUT_INTRINSIC_WARNED.clear()
+
+    def tearDown(self):
+        import main as delta_main
+
+        delta_main._PUT_INTRINSIC_WARNED = self._saved_warned
+
+    def _frame(self, strike, ltp):
+        return self.pd.DataFrame([{"strike": strike, "Put LTP": ltp}])
+
+    def test_put_below_intrinsic_is_flagged_with_full_context(self):
+        with patch.object(delta_main, "feed_log") as log:
+            delta_main._put_intrinsic_rows(
+                "BTC", 81815.0, self._frame(79200, 0.4))
+        events = [c for c in log.call_args_list if c.args[0] == "put_intrinsic_warning"]
+        self.assertEqual(len(events), 1)
+        payload = events[0].kwargs
+        self.assertEqual(payload["asset"], "BTC")
+        self.assertEqual(payload["strike"], "79200")
+        self.assertEqual(payload["intrinsic"], "2615.00")
+        self.assertEqual(payload["ltp"], "0.4")
+        self.assertIn("shown as-is", payload["note"])
+
+    def test_the_quoted_price_is_never_removed_or_rewritten(self):
+        frame = self._frame(79200, 0.4)
+        before = list(frame.itertuples(index=False))
+        with patch.object(delta_main, "feed_log"):
+            delta_main._put_intrinsic_rows("BTC", 81815.0, frame)
+        self.assertEqual(list(frame.itertuples(index=False)), before)
+
+    def test_put_at_or_above_intrinsic_is_never_flagged(self):
+        with patch.object(delta_main, "feed_log") as log:
+            delta_main._put_intrinsic_rows("BTC", 81815.0, self._frame(84000, 1200.0))
+        self.assertFalse(log.called)
+        self.assertFalse(delta_main._PUT_INTRINSIC_WARNED)
+
+    def test_bad_rows_and_missing_columns_are_ignored(self):
+        empty = self.pd.DataFrame([{"strike": 0, "Put LTP": 0.0}])
+        with patch.object(delta_main, "feed_log") as log:
+            delta_main._put_intrinsic_rows("BTC", 81815.0, empty)
+            delta_main._put_intrinsic_rows("BTC", None, self._frame(79200, 0.4))
+            delta_main._put_intrinsic_rows("BTC", 81815.0, self.pd.DataFrame())
+        self.assertFalse(log.called)
+
+    def test_warning_is_throttled_per_asset_within_the_interval(self):
+        with patch.object(delta_main, "feed_log"):
+            delta_main._put_intrinsic_rows("BTC", 81815.0, self._frame(79200, 0.4))
+            delta_main._put_intrinsic_rows("BTC", 81815.0, self._frame(79000, 0.2))
+            # a different asset keeping its own throttle window
+            delta_main._put_intrinsic_rows("ETH", 3000.0, self._frame(2800, 0.3))
+        self.assertGreaterEqual(len(delta_main._PUT_INTRINSIC_WARNED), 2)
+
+    def test_build_option_chain_installs_the_observer(self):
+        import inspect
+        import main as delta_main
+
+        src = inspect.getsource(delta_main.build_option_chain)
+        self.assertIn("_put_intrinsic_rows(asset, sp, merged)", src)
+        self.assertLess(src.index("_put_intrinsic_rows(asset, sp, merged)"),
+                        src.index("return merged[available], pcr"))
+
+
 if __name__ == "__main__":
     unittest.main()

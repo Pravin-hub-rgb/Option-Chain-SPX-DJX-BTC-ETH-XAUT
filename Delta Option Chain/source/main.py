@@ -1608,6 +1608,46 @@ def print_chain(asset, chains_data):
         print()
 
 
+_PUT_INTRINSIC_WARNED = {}
+_PUT_INTRINSIC_WARN_INTERVAL = 300.0
+
+
+def _put_intrinsic_rows(asset, spot, frame):
+    """Observer: note puts quoted below their intrinsic value; never change them.
+
+    The exchange occasionally publishes a put near zero while the live spot
+    sits far above its strike (79200 put at 0.4 against BTC ~81815). The
+    trader sees the exchange's numbers faithfully - this only notes the
+    anomaly in feed.log so support can tell a data blip from a real price.
+    """
+    if spot is None or spot <= 0 or frame is None or getattr(frame, "empty", True):
+        return
+    if "Put LTP" not in frame.columns:
+        return
+    now = time.time()
+    for key in [k for k in _PUT_INTRINSIC_WARNED if k[0] == asset]:
+        if now - _PUT_INTRINSIC_WARNED[key] < _PUT_INTRINSIC_WARN_INTERVAL:
+            return
+    strikes = frame["strike"].apply(safe_float)
+    ltps = frame["Put LTP"].apply(safe_float)
+    intrinsic = float(spot) - strikes
+    below = (strikes > 0) & (ltps > 0) & (intrinsic > ltps)
+    if not below.any():
+        return
+    row = frame.loc[below.idxmax()]
+    strike, ltp = safe_float(row.get("strike")), safe_float(row.get("Put LTP"))
+    _PUT_INTRINSIC_WARNED[(asset, str(row.get("strike")))] = now
+    feed_log(
+        "put_intrinsic_warning",
+        asset=asset,
+        strike=f"{strike:g}",
+        spot=f"{float(spot):.2f}",
+        ltp=str(row.get("Put LTP")),
+        intrinsic=f"{float(spot) - strike:.2f}",
+        note="exchange quote looks wrong; shown as-is",
+    )
+
+
 def build_option_chain(asset, expiry_iso, range_val=50):
     sp = spot_cmp[asset]
     ld = live_data[asset]
@@ -1654,6 +1694,7 @@ def build_option_chain(asset, expiry_iso, range_val=50):
     merged["Call OI"] = merged["Call OI"].apply(fmt_oi)
     merged["Put OI"] = merged["Put OI"].apply(fmt_oi)
     pcr = total_put_oi / total_call_oi if total_call_oi > 0 else 0.0
+    _put_intrinsic_rows(asset, sp, merged)
     cols = ["Call LTP", "Call Bid", "Call Ask", "Call OI", "strike", "Put OI", "Put Bid", "Put Ask", "Put LTP"]
     available = [c for c in cols if c in merged.columns]
     return merged[available], pcr
