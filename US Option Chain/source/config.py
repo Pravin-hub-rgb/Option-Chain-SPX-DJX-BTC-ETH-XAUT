@@ -14,6 +14,7 @@ def load_config():
     path = os.path.join(base_dir(), "config.json")
     defaults = {
         "refresh_interval_seconds": 0.5,
+        "input_grace_seconds": 1.5,
         "poll_gap_seconds": 2,
         "round_pause_seconds": 2,
         "expiry_refresh_seconds": 60,
