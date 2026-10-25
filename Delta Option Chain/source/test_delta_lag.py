@@ -615,6 +615,24 @@ class DeltaOiNumericsTests(unittest.TestCase):
         self.assertNotIn('NumberFormat = "@"',
                          src.split('for off in (3, 5)')[1].split('_usd_fmt_done')[0])
 
+    def test_delta_o_i_numeric(self):
+        """Whole-path regression: OI is float end to end, never text.
+
+        print_chain applies fmt_oi to BOTH OI columns before the write
+        (main.py, "Call OI"/"Put OI" .apply line) and force_usd_block_formats
+        sets the OI columns to #,##0. If either pin is removed, the cells
+        quietly turn into text ("$1.23M") and every client XLOOKUP/VLOOKUP
+        on OI regresses to #VALUE!.
+        """
+        self.assertIsInstance(delta_main.fmt_oi("$1.23M"), float)
+        self.assertEqual(delta_main.fmt_oi("$1.23M"), 1_230_000.0)
+        self.assertIsInstance(delta_main.fmt_oi(1_230_000), float)
+        src = inspect.getsource(delta_main.build_option_chain)
+        self.assertIn('merged["Call OI"].apply(fmt_oi)', src)
+        self.assertIn('merged["Put OI"].apply(fmt_oi)', src)
+        fmt_src = inspect.getsource(delta_main.force_usd_block_formats)
+        self.assertIn('NumberFormat = "#,##0"', fmt_src)
+
 
 class DeltaParitySpotTests(unittest.TestCase):
     """Parity spot fills the gap when the external spot feed goes stale."""

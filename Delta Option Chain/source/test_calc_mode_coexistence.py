@@ -63,7 +63,22 @@ class FakeApp:
 
 
 class WatchdogCoexistenceTests(TempStateTestBase):
+    # Phase-1 gate: the watchdog skips any restore while a human is typing.
+    # These tests drive the rescue paths, so pin the input timer to "idle"
+    # instead of letting physical typing on the dev machine trip the skip:
+    # the real _last_user_input_age reads system-wide GetLastInputInfo, which
+    # is whatever the developer typing happens to do during the run.
+    def _idle_input(self):
+        both = (
+            mock.patch.object(delta_main, "_input_is_recent", return_value=False),
+            mock.patch.object(delta_main, "_last_user_input_age", return_value=999.0),
+        )
+        for p in both:
+            p.start()
+            self.addCleanup(p.stop)
+
     def test_watchdog_leaves_manual_alone_while_the_sibling_runs(self):
+        self._idle_input()
         self._write_record({"us": os.getpid()})
         app = FakeApp(mode=-4135)
         delta_state._manual_since = time.time() - delta_main.MANUAL_WATCHDOG_SECONDS - 1
@@ -73,6 +88,7 @@ class WatchdogCoexistenceTests(TempStateTestBase):
         delta_state._manual_since = 0.0
 
     def test_watchdog_still_rescues_when_no_tool_holds_the_record(self):
+        self._idle_input()
         app = FakeApp(mode=-4135)
         delta_state._manual_since = time.time() - delta_main.MANUAL_WATCHDOG_SECONDS - 1
         with mock.patch.object(delta_main, "feed_log"):
@@ -132,7 +148,9 @@ class WatchdogReconnectTests(unittest.TestCase):
             delta_state._app_cache = app
             delta_state._owner_app = app
             delta_state._manual_since = 1e9
-            with mock.patch.object(delta_main, "_raw_calc_mode", return_value=-4135), \
+            with mock.patch.object(delta_main, "_input_is_recent", return_value=False), \
+                 mock.patch.object(delta_main, "_last_user_input_age", return_value=999.0), \
+                 mock.patch.object(delta_main, "_raw_calc_mode", return_value=-4135), \
                  mock.patch.object(delta_main, "_other_chain_tool_holds", return_value=False), \
                  mock.patch.object(delta_main, "_set_calc_mode", return_value=True) as mode:
                 delta_main.ensure_calculation_not_stranded(app)
