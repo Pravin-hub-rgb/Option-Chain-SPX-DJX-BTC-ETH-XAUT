@@ -2860,6 +2860,16 @@ def ensure_calculation_not_stranded(app=None):
     put it back. Without this, one failed restore leaves every formula the
     trader types silently uncalculated, with no visible cause.
     """
+    global _watchdog_input_skip_logged_at
+    if _input_is_recent():
+        now = time.monotonic()
+        if now - _watchdog_input_skip_logged_at > 30.0:
+            _watchdog_input_skip_logged_at = now
+            feed_log(
+                "watchdog_skipped_recent_input",
+                note="customer is actively using Excel; calc mode left alone",
+            )
+        return
     if app is None:
         app = delta_state._app_cache
     if app is None:
@@ -3153,6 +3163,10 @@ def _chain_save_prompt_once(attempts):
     dialog from cycling clicks until the workbook is closed one way or the
     other.
     """
+    if _input_is_recent():
+        # Never send Alt+N (or click a button) while the trader is typing:
+        # a save prompt that is already foreground can be mid-edit too.
+        return
     import ctypes
     from ctypes import wintypes
 
@@ -3584,6 +3598,23 @@ def write_to_excel(asset):
         )
 
 
+def _update_recalc_backoff(elapsed_ms):
+    """Feed the real cost of Application.Calculate into the adaptive refresh.
+
+    The CalculationState probe only ever reads 0 in practice - it runs after a
+    synchronous Calculate that already finished - so it never stretched the loop.
+    Use the measured recalc duration instead: a heavy workbook earns idle time
+    proportional to that cost; a light workbook stays at the configured refresh.
+    """
+    secs = float(elapsed_ms) / 1000.0
+    if secs <= delta_state.RECALC_BACKOFF_THRESHOLD_SECONDS:
+        return
+    alpha = delta_state.RECALC_BACKOFF_ALPHA
+    delta_state._recalc_backoff_seconds = (
+        alpha * secs + (1.0 - alpha) * delta_state._recalc_backoff_seconds
+    )
+
+
 def _time_recalc(wrote):
     """Recalculate once, inside the manual window, and time it.
 
@@ -3601,6 +3632,7 @@ def _time_recalc(wrote):
     manual would be doing something they asked us not to. A cycle skipped for
     customer input owes its recalculation, so _recalc_owed carries it here.
     """
+    global _recalc_input_skip_logged_at
     owed = delta_state._recalc_owed
     delta_state._recalc_owed = False
     if not wrote and not owed:
@@ -3616,6 +3648,20 @@ def _time_recalc(wrote):
             # Still owed - Excel comes back and the debt is paid then.
             delta_state._recalc_owed = True
         return 0.0
+    # Last-instant guard: the trader may have started typing after the
+    # pre-window check but before this Calculate. Force-calculating now is
+    # exactly what froze the edit frame, so carry the debt instead.
+    if _input_is_recent() or _excel_in_edit_mode(app):
+        delta_state._recalc_owed = True
+        now = time.monotonic()
+        if now - _recalc_input_skip_logged_at > 30.0:
+            _recalc_input_skip_logged_at = now
+            feed_log(
+                "excel_recalc_skipped_user_input",
+                note="customer's hands are on Excel; recalculation carried",
+            )
+        _performance_metrics.record("ALL", "excel_recalc_skip_user_input", 0.0)
+        return 0.0
     try:
         started = time.perf_counter()
         app.api.Calculate()
@@ -3628,6 +3674,7 @@ def _time_recalc(wrote):
             delta_state._recalc_owed = True
         return 0.0
     delta_state._last_recalc_ms = elapsed
+    _update_recalc_backoff(elapsed)
     _performance_metrics.record("ALL", "excel_recalc", elapsed / 1000.0)
     return elapsed
 
@@ -3708,7 +3755,11 @@ def _note_recalc_second_pass(now):
 
 
 # Any keystroke or click inside this window counts as "hands on the keys".
-_USER_INPUT_GRACE_SECONDS = 0.7
+# Config-driven so a slower typist can be covered without a code change.
+_USER_INPUT_GRACE_SECONDS = float(cfg.get("input_grace_seconds", 1.5))
+
+_recalc_input_skip_logged_at = 0.0
+_watchdog_input_skip_logged_at = 0.0
 
 
 def _last_user_input_age():
@@ -3730,6 +3781,93 @@ def _last_user_input_age():
         return max(0.0, (tick - int(info.dwTime)) / 1000.0)
     except Exception:
         return None
+
+
+def _input_is_recent():
+    """True while any keyboard/mouse input happened inside the grace window."""
+    age = _last_user_input_age()
+    return age is not None and age < _USER_INPUT_GRACE_SECONDS
+
+
+def _excel_focus_is_edit_control(app):
+    """True when the cell/formula-bar edit control owns Excel's focus.
+
+    Application.Ready stays True during in-cell editing, so it cannot tell
+    "trader is typing a formula" from "Excel is idle". The Win32 focus class
+    can: the grid is EXCEL7, while the live edit control is EXCEL6.
+    """
+    if platform.system() != "Windows":
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        hwnd = int(app.api.Hwnd)
+    except Exception:
+        return False
+    if not hwnd:
+        return False
+    try:
+        user32 = ctypes.windll.user32
+        user32.GetWindowThreadProcessId.argtypes = [
+            wintypes.HWND, ctypes.POINTER(wintypes.DWORD)
+        ]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        user32.GetGUIThreadInfo.argtypes = [wintypes.DWORD, ctypes.c_void_p]
+        user32.GetGUIThreadInfo.restype = wintypes.BOOL
+        user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+
+        class _GUITHREADINFO(ctypes.Structure):
+            _fields_ = (
+                ("cbSize", wintypes.DWORD),
+                ("flags", wintypes.DWORD),
+                ("hwndActive", wintypes.HWND),
+                ("hwndFocus", wintypes.HWND),
+                ("hwndCapture", wintypes.HWND),
+                ("hwndMenuOwner", wintypes.HWND),
+                ("hwndMoveSize", wintypes.HWND),
+                ("hwndCaret", wintypes.HWND),
+                ("rcCaret", wintypes.RECT),
+            )
+
+        pid = wintypes.DWORD()
+        tid = user32.GetWindowThreadProcessId(
+            wintypes.HWND(hwnd), ctypes.byref(pid)
+        )
+        if not tid:
+            return False
+        info = _GUITHREADINFO()
+        info.cbSize = ctypes.sizeof(info)
+        if not user32.GetGUIThreadInfo(tid, ctypes.byref(info)):
+            return False
+        focus = info.hwndFocus
+        if not focus:
+            return False
+        buf = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(focus, buf, 64)
+        cls = buf.value.upper()
+        return cls.startswith("EXCEL6") or cls == "EXCEL<"
+    except Exception:
+        return False
+
+
+def _excel_in_edit_mode(app):
+    """True when Excel is in an edit/drag state a write would deadlock on."""
+    if app is None:
+        return False
+    try:
+        if app.api.CutCopyMode:
+            return True
+    except Exception:
+        return True
+    if _excel_focus_is_edit_control(app):
+        return True
+    try:
+        if not app.api.Ready:
+            return True
+    except Exception:
+        return True
+    return False
 
 
 def _foreground_pid():
@@ -3859,6 +3997,17 @@ def render_cycle():
             _performance_metrics.record("ALL", "render_cycle_skipped_user_edit", 0.0)
             return
 
+    # Final pre-window guard: the input/edit checks above take a few COM
+    # round-trips, and the trader can start typing during them. Opening the
+    # window now is the freeze we are fixing, so yield once more.
+    if _user_is_excel_interacting():
+        delta_state._recalc_owed = True
+        _performance_metrics.record(
+            "ALL", "render_cycle_skipped_user_input_late", 0.0
+        )
+        return
+
+    aborted = False
     restore = _begin_excel_bulk_mode()
     try:
         for asset in ("BTC", "ETH", "XAUT"):
@@ -3866,13 +4015,15 @@ def render_cycle():
                 # The customer's hands reached our Excel while this window was
                 # open. Drop what is left of the window and let the finally
                 # below hand the screen back; their edit runs on a live frame.
+                aborted = True
                 delta_state._recalc_owed = True
                 _performance_metrics.record(
                     "ALL", "render_cycle_aborted_user_input", 0.0
                 )
                 break
             write_to_excel(asset)
-        _time_recalc(delta_state._cycle_wrote)
+        if not aborted:
+            _time_recalc(delta_state._cycle_wrote)
     finally:
         if restore is not None:
             try:
@@ -4044,10 +4195,24 @@ async def display_loop():
                 feed_log(
                     "refresh_widen_decayed", widen=round(delta_state._refresh_widen, 2)
                 )
+        # Relax the recalc-driven backoff between cycles so a workbook that went
+        # quiet shrinks back toward the configured refresh instead of staying
+        # throttled.
+        if delta_state._recalc_backoff_seconds > 0.0:
+            delta_state._recalc_backoff_seconds *= delta_state.RECALC_BACKOFF_DECAY
+            if (
+                delta_state._recalc_backoff_seconds
+                < delta_state.RECALC_BACKOFF_THRESHOLD_SECONDS
+            ):
+                delta_state._recalc_backoff_seconds = 0.0
         await asyncio.sleep(
-            max(
-                float(refresh) * delta_state._refresh_widen,
-                time.perf_counter() - render_started,
+            min(
+                delta_state.MAX_REFRESH_SECONDS,
+                max(
+                    float(refresh) * delta_state._refresh_widen,
+                    time.perf_counter() - render_started,
+                    delta_state.RECALC_BACKOFF_FACTOR * delta_state._recalc_backoff_seconds,
+                ),
             )
         )
 

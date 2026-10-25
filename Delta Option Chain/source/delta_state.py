@@ -128,6 +128,16 @@ WIDEN_MAX = 2.0
 
 WIDEN_DECAY_SECONDS = 120.0
 
+# Real Application.Calculate cost, used to drive the adaptive refresh. The
+# CalculationState probe only ever reads 0 in practice, so the measured recalc
+# duration drives the backoff instead of the no-op probe.
+_recalc_backoff_seconds = 0.0
+RECALC_BACKOFF_FACTOR = float(cfg.get("recalc_backoff_factor", 5.0))
+RECALC_BACKOFF_THRESHOLD_SECONDS = float(cfg.get("recalc_backoff_threshold_seconds", 0.025))
+RECALC_BACKOFF_ALPHA = 0.5
+RECALC_BACKOFF_DECAY = 0.9
+MAX_REFRESH_SECONDS = float(cfg.get("max_refresh_seconds", 5.0))
+
 _block_payload = {}
 
 _block_values = {}
