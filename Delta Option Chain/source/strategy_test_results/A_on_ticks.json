@@ -1,0 +1,72 @@
+[
+  {
+    "t": 0.1,
+    "chain": "BTC Spot: 80420.00 | 27 strikes",
+    "spot": "80420.00",
+    "strat": "BTC Spot: 80420.00 | 27 strikes",
+    "vol": 46320.58373125
+  },
+  {
+    "t": 2.2,
+    "chain": "BTC Spot: 80420.00 | 27 strikes",
+    "spot": "80420.00",
+    "strat": "BTC Spot: 80420.00 | 27 strikes",
+    "vol": 46320.583755671294
+  },
+  {
+    "t": 4.3,
+    "chain": "BTC Spot: 80418.30 | 27 strikes",
+    "spot": "80418.30",
+    "strat": "BTC Spot: 80420.00 | 27 strikes",
+    "vol": 46320.58377291667
+  },
+  {
+    "t": 6.4,
+    "chain": "BTC Spot: 80418.20 | 27 strikes",
+    "spot": "80418.20",
+    "strat": "BTC Spot: 80418.20 | 27 strikes",
+    "vol": 46320.58380613426
+  },
+  {
+    "t": 8.5,
+    "chain": "BTC Spot: 80419.60 | 27 strikes",
+    "spot": "80419.60",
+    "strat": "BTC Spot: 80423.40 | 27 strikes",
+    "vol": 46320.58382337963
+  },
+  {
+    "t": 10.6,
+    "chain": "BTC Spot: 80422.20 | 27 strikes",
+    "spot": "80422.20",
+    "strat": "BTC Spot: 80422.20 | 27 strikes",
+    "vol": 46320.583849305556
+  },
+  {
+    "t": 12.7,
+    "chain": "BTC Spot: 80423.00 | 27 strikes",
+    "spot": "80423.00",
+    "strat": "BTC Spot: 80423.00 | 27 strikes",
+    "vol": 46320.58387581018
+  },
+  {
+    "t": 14.8,
+    "chain": "BTC Spot: 80422.30 | 27 strikes",
+    "spot": "80422.30",
+    "strat": "BTC Spot: 80422.30 | 27 strikes",
+    "vol": 46320.58390081018
+  },
+  {
+    "t": 16.9,
+    "chain": "BTC Spot: 80422.20 | 27 strikes",
+    "spot": "80422.20",
+    "strat": "BTC Spot: 80422.20 | 27 strikes",
+    "vol": 46320.58392511574
+  },
+  {
+    "t": 19.0,
+    "chain": "BTC Spot: 80422.60 | 27 strikes",
+    "spot": "80422.60",
+    "strat": "BTC Spot: 80422.60 | 27 strikes",
+    "vol": 46320.583951388886
+  }
+]

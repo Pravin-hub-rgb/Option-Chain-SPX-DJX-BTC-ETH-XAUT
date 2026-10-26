@@ -1,0 +1,36 @@
+Delta Option Chain self-test
+folder: C:\Users\Pravin\Downloads\Telegram Desktop\new2-deltax-option-chain\deltax-option-chain\Delta Option Chain\source  (113 characters)
+
+--- folder ----------------------------------------------------
+[PASS] folder path is short enough for Excel - 113 characters
+
+--- software --------------------------------------------------
+[PASS] python - 3.10.11
+[PASS] package xlwings - talks to Excel
+[PASS] package requests - talks to the data sources
+[PASS] package pandas - builds the chain
+[PASS] package websockets - receives live quotes
+[PASS] package openpyxl - reads and writes the workbooks
+
+--- activation ------------------------------------------------
+[PASS] activation key saved - next to the tool
+
+--- Delta Exchange --------------------------------------------
+[PASS] Delta Exchange reachable - 258 products returned
+
+--- Excel -----------------------------------------------------
+[PASS] Excel is running - 0 instance(s) visible
+[PASS] Excel is running - not started yet - the tool opens it for you
+
+--- workbooks -------------------------------------------------
+[PASS] workbook btc_chain.xlsx - 7293 bytes
+[PASS] workbook eth_chain.xlsx - 8830 bytes
+[PASS] workbook xaut_chain.xlsx - 8832 bytes
+
+--- logs ------------------------------------------------------
+[PASS] log feed.log - C:\Users\Pravin\AppData\Local\DeltaOptionChain\feed.log
+[PASS] log startup_diag.log - C:\Users\Pravin\AppData\Local\DeltaOptionChain\startup_diag.log
+
+================================================================
+Everything needed is in place. The tool should work.
+================================================================

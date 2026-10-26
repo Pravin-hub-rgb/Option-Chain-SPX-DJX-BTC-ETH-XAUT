@@ -230,6 +230,14 @@ _user_edit_skip_log_at = 0.0
 _strategy_sheet_skip_log_at = 0.0
 
 _last_recalc_ms = 0.0
+
+# Strategy-safe recalc (Option C): when parked on a non-chain sheet, run a live
+# Application.Calculate() only if the last measured full-workbook Calculate cost
+# was below this threshold (ms). Cheap workbooks get live P&L; heavy ones fall
+# back to the deferred (Option B) behaviour. Tunable; 0/unknown measurement
+# always skips.
+STRATEGY_RECALC_MAX_MS = float(cfg.get("strategy_recalc_max_ms", 200.0))
+
 # Real Application.Calculate cost, used to drive the adaptive refresh. The
 # CalculationState probe (_calc_state_probe above) only ever reads 0 in
 # practice - it runs after a synchronous Calculate that already finished - so it

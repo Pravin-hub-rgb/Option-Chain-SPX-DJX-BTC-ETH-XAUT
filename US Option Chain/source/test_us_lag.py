@@ -2576,6 +2576,58 @@ class TypingSafetyTests(unittest.TestCase):
         self.assertEqual(app.calculations, 0)
         self.assertTrue(us_state._recalc_owed)
 
+    def test_strategy_sheet_fast_recalc_runs_live(self):
+        import us_excel
+        import us_state
+
+        app = self._App()
+        us_state._app_cache = app
+        us_state._bulk_will_recalc = True
+        us_state._recalc_owed = False
+        us_state._last_recalc_ms = 50.0
+        with patch.object(us_excel, "_input_is_recent", return_value=False), \
+             patch.object(us_excel, "_excel_in_edit_mode", return_value=False), \
+             patch.object(us_excel, "_active_sheet_is_chain", return_value=False):
+            elapsed = us_excel._time_recalc(True)
+        self.assertGreater(elapsed, 0.0)
+        self.assertEqual(app.calculations, 1)
+        self.assertFalse(us_state._recalc_owed)
+
+    def test_strategy_sheet_slow_recalc_skips_and_carries(self):
+        import us_excel
+        import us_state
+
+        app = self._App()
+        us_state._app_cache = app
+        us_state._bulk_will_recalc = True
+        us_state._recalc_owed = False
+        us_state._last_recalc_ms = 500.0
+        with patch.object(us_excel, "_input_is_recent", return_value=False), \
+             patch.object(us_excel, "_excel_in_edit_mode", return_value=False), \
+             patch.object(us_excel, "_active_sheet_is_chain", return_value=False):
+            elapsed = us_excel._time_recalc(True)
+        self.assertEqual(elapsed, 0.0)
+        self.assertEqual(app.calculations, 0)
+        self.assertTrue(us_state._recalc_owed)
+
+    def test_strategy_sheet_unknown_recalc_skips_and_carries(self):
+        import us_excel
+        import us_state
+
+        app = self._App()
+        us_state._app_cache = app
+        us_state._bulk_will_recalc = True
+        us_state._recalc_owed = False
+        us_state._last_recalc_ms = 0.0
+        with patch.object(us_excel, "_input_is_recent", return_value=False), \
+             patch.object(us_excel, "_excel_in_edit_mode", return_value=False), \
+             patch.object(us_excel, "_active_sheet_is_chain", return_value=False):
+            elapsed = us_excel._time_recalc(True)
+        self.assertEqual(elapsed, 0.0)
+        self.assertEqual(app.calculations, 0)
+        self.assertTrue(us_state._recalc_owed)
+
+
     def test_abort_restore_never_yanks_manual_from_the_sibling(self):
         import us_excel
         import us_state

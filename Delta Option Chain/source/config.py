@@ -20,4 +20,4 @@ def load_config():
         with open(path) as f:
             return json.load(f)
     except (OSError, ValueError):
-        return {"refresh_interval_seconds": 0.5, "input_grace_seconds": 1.5}
+        return {"refresh_interval_seconds": 0.5, "input_grace_seconds": 1.5, "strategy_recalc_max_ms": 200.0}

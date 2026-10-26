@@ -82,6 +82,13 @@ EXPIRY_REFRESH_SECONDS = float(cfg.get("expiry_refresh_seconds", 30))
 
 SPOT_POLL_SECONDS = float(cfg.get("spot_poll_seconds", 0.35))
 
+# Strategy-safe recalc (Option C): when parked on a non-chain sheet, run a live
+# Application.Calculate() only if the last measured full-workbook Calculate cost
+# was below this threshold (ms). Cheap workbooks get live P&L; heavy ones fall
+# back to the deferred (Option B) behaviour. Tunable; 0/unknown measurement
+# always skips.
+STRATEGY_RECALC_MAX_MS = float(cfg.get("strategy_recalc_max_ms", 200.0))
+
 NET_FAIL_LIMIT = 3
 
 _net = {"fails": 0, "since": None}

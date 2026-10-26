@@ -951,11 +951,11 @@ class ChainsCloseSuppressionTests(unittest.TestCase):
         self.assertFalse(delta_state._calc_notice_shown)
         self.assertTrue(delta_state._calc_manual_failed)
 
-    def test_a_stuck_refusal_earns_the_dialog_first_try(self):
+    def test_a_stuck_refusal_is_logged_not_popped(self):
         app = self._app_with_books(["btc_chain.xlsx", "eth_chain.xlsx"])
         restore, show_error = self._run_cycle(app, failed_for=90.0)
         self.assertIsNotNone(restore)
-        self.assertEqual(show_error.call_count, 1)
+        show_error.assert_not_called()
         self.assertTrue(delta_state._calc_notice_shown)
 
     def test_an_open_chain_keeps_the_window_quiet(self):
@@ -1973,6 +1973,58 @@ class DeltaTypingSafetyTests(unittest.TestCase):
         self.assertEqual(elapsed, 0.0)
         self.assertEqual(app.calculations, 0)
         self.assertTrue(delta_state._recalc_owed)
+
+    def test_strategy_sheet_fast_recalc_runs_live(self):
+        import delta_state
+        import main as delta_main
+
+        app = self._App()
+        delta_state._app_cache = app
+        delta_state._bulk_will_recalc = True
+        delta_state._recalc_owed = False
+        delta_state._last_recalc_ms = 50.0
+        with patch.object(delta_main, "_input_is_recent", return_value=False), \
+             patch.object(delta_main, "_excel_in_edit_mode", return_value=False), \
+             patch.object(delta_main, "_active_sheet_is_chain", return_value=False):
+            elapsed = delta_main._time_recalc(True)
+        self.assertGreater(elapsed, 0.0)
+        self.assertEqual(app.calculations, 1)
+        self.assertFalse(delta_state._recalc_owed)
+
+    def test_strategy_sheet_slow_recalc_skips_and_carries(self):
+        import delta_state
+        import main as delta_main
+
+        app = self._App()
+        delta_state._app_cache = app
+        delta_state._bulk_will_recalc = True
+        delta_state._recalc_owed = False
+        delta_state._last_recalc_ms = 500.0
+        with patch.object(delta_main, "_input_is_recent", return_value=False), \
+             patch.object(delta_main, "_excel_in_edit_mode", return_value=False), \
+             patch.object(delta_main, "_active_sheet_is_chain", return_value=False):
+            elapsed = delta_main._time_recalc(True)
+        self.assertEqual(elapsed, 0.0)
+        self.assertEqual(app.calculations, 0)
+        self.assertTrue(delta_state._recalc_owed)
+
+    def test_strategy_sheet_unknown_recalc_skips_and_carries(self):
+        import delta_state
+        import main as delta_main
+
+        app = self._App()
+        delta_state._app_cache = app
+        delta_state._bulk_will_recalc = True
+        delta_state._recalc_owed = False
+        delta_state._last_recalc_ms = 0.0
+        with patch.object(delta_main, "_input_is_recent", return_value=False), \
+             patch.object(delta_main, "_excel_in_edit_mode", return_value=False), \
+             patch.object(delta_main, "_active_sheet_is_chain", return_value=False):
+            elapsed = delta_main._time_recalc(True)
+        self.assertEqual(elapsed, 0.0)
+        self.assertEqual(app.calculations, 0)
+        self.assertTrue(delta_state._recalc_owed)
+
 
     def test_watchdog_does_not_touch_calc_mode_during_recent_input(self):
         import delta_state

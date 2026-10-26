@@ -18,6 +18,7 @@ def load_config():
         "poll_gap_seconds": 2,
         "round_pause_seconds": 2,
         "expiry_refresh_seconds": 60,
+        "strategy_recalc_max_ms": 200.0,
         "spx_symbol": "SPX",
         "djx_symbol": "DJX",
         "default_symbol": "AAPL",

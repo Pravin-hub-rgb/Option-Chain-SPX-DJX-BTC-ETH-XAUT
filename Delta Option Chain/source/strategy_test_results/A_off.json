@@ -1,0 +1,30 @@
+{
+  "variant": "A",
+  "condition": "off",
+  "sheet": "StratA",
+  "seconds_requested": 20,
+  "precondition_exchange_feed_live": true,
+  "exchange_feed": {
+    "frames": 83,
+    "distinct": 37,
+    "first": 80583.2,
+    "last": 80585.6
+  },
+  "excel_cpu_avg_pct": 0.6,
+  "excel_cpu_max_pct": 2.2,
+  "excel_cpu_samples": 10,
+  "not_responding": [],
+  "wall_seconds": 20.9,
+  "tick_samples": 10,
+  "chain_cell_moves": 0,
+  "strategy_cell_moves": 0,
+  "strategy_tracked_chain": false,
+  "volatile_cell_moves": 0,
+  "volatile_recalc_running": false,
+  "typing_avg_ms": 34.1,
+  "typing_median_ms": 35.6,
+  "typing_p95_ms": 39.4,
+  "typing_worst_ms": 43.2,
+  "typing_retries": 0,
+  "perf": {}
+}

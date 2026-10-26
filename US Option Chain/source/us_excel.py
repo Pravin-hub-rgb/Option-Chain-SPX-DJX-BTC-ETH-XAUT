@@ -1695,24 +1695,29 @@ def _time_recalc(wrote):
             )
         _performance_metrics.record("ALL", "excel_recalc_skip_user_input", 0.0)
         return 0.0
-    # Strategy-safe: never run a heavy full-workbook Calculate while parked on a
-    # non-Chain sheet; carry the debt until back on a Chain sheet.
+    # Strategy-safe (Option C): chain data keeps updating every cycle; the heavy
+    # part is the full-workbook Calculate. Run it live ONLY when the last
+    # measured Calculate cost is known and below STRATEGY_RECALC_MAX_MS; otherwise
+    # carry the debt (Option B behaviour). This gives live P&L on cheap workbooks
+    # while self-protecting on heavy ones.
     try:
         _on_strategy_sheet = (_active_sheet_is_chain(app) is False)
     except Exception:
         _on_strategy_sheet = False
     if _on_strategy_sheet:
-        now = time.monotonic()
-        if now - _recalc_strategy_skip_logged_at > 30.0:
-            _recalc_strategy_skip_logged_at = now
-            feed_log(
-                "excel_recalc_skipped_strategy_sheet",
-                note="active sheet is not a chain sheet; recalculation carried",
-            )
-        if owed:
+        _last_ms = us_state._last_recalc_ms
+        _threshold = us_state.STRATEGY_RECALC_MAX_MS
+        if not (_last_ms > 0.0 and _last_ms < _threshold):
+            now = time.monotonic()
+            if now - _recalc_strategy_skip_logged_at > 30.0:
+                _recalc_strategy_skip_logged_at = now
+                feed_log(
+                    "excel_recalc_skipped_strategy_sheet",
+                    note="active sheet is not a chain sheet; recalculation carried",
+                )
             us_state._recalc_owed = True
-        _performance_metrics.record("ALL", "excel_recalc_skipped_strategy_sheet", 0.0)
-        return 0.0
+            _performance_metrics.record("ALL", "excel_recalc_skipped_strategy_sheet", 0.0)
+            return 0.0
     try:
         started = time.perf_counter()
         app.api.Calculate()
@@ -2026,17 +2031,10 @@ def render_cycle():
             and now - us_state._calc_failed_since >= _CALC_NOTICE_GRACE_SECONDS
         ):
             us_state._calc_manual_notice_shown = True
-            try:
-                show_error(
-                    "Excel would not switch to manual calculation, so the "
-                    "workbook is recalculating on every update and will feel "
-                    "slow.\n\n"
-                    "Close any Excel dialog that is open, click outside the "
-                    "cell you are editing, and close any third-party Excel "
-                    "add-in. The tool will speed back up on its own."
-                )
-            except Exception:
-                pass
+            feed_log(
+                "calc_manual_unavailable_notice",
+                note="Excel refused manual calculation; running in auto-recalc (slower) until Excel accepts the switch",
+            )
 
     # Input yield: never open a write window while the customer's hands are
     # on our Excel. Their keystrokes land on a repaint-numbed frame - the

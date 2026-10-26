@@ -2580,6 +2580,7 @@ def _begin_excel_bulk_mode():
             delta_state._bulk_owning_manual = False
             delta_state._calc_manual_failed = False
             delta_state._calc_failed_since = 0.0
+            delta_state._calc_notice_shown = False
             delta_state._app_cache = app
             now = time.monotonic()
             if now - delta_state._no_book_skip_logged_at >= 60.0:
@@ -2607,6 +2608,12 @@ def _begin_excel_bulk_mode():
                 delta_state._calc_manual_failed = False
                 delta_state._calc_failed_since = 0.0
                 delta_state._calc_notice_shown = False
+        # COM could not report the open workbook names (Excel busy / tearing
+        # down on close). Never attempt the calc-mode switch in that state: it
+        # cannot succeed, and a failed attempt is what surfaces the 'Excel will
+        # not switch to manual calculation' dialog - including on workbook close.
+        if open_names is None:
+            return None
         # Deliberate no-op where the ScreenUpdating toggle used to live. The
         # screen is now left exactly as Excel itself keeps it: flipping it
         # around the write window repainted the whole sheet on every release
@@ -2712,22 +2719,19 @@ def _begin_excel_bulk_mode():
                             # switch while the chains are open - earns the
                             # dialog. Excel being gone never does: the marks it
                             # would read were just cleared.
+                            # Never pop a modal dialog for this: the tool
+                            # recovers on its own once Excel accepts the switch,
+                            # and a popup only upsets the customer. Record it in
+                            # the feed log instead so support can still see why.
                             if (
                                 not delta_state._calc_notice_shown
                                 and time.monotonic() - delta_state._calc_failed_since
                                 >= _CALC_NOTICE_GRACE_SECONDS
                             ):
                                 delta_state._calc_notice_shown = True
-                                show_error(
-                                    "Excel will not switch to manual calculation,\n"
-                                    "so the workbook recalculates on every update\n"
-                                    "and will feel slow.\n\n"
-                                    "This is usually one of three things:\n"
-                                    "  - a cell is in edit mode - press Escape\n"
-                                    "  - an Excel dialog is open - close it\n"
-                                    "  - an Excel add-in is busy - turn it off\n\n"
-                                    "The tool will speed back up on its own once\n"
-                                    "Excel accepts the mode switch again.",
+                                feed_log(
+                                    "calc_manual_unavailable_notice",
+                                    note="Excel refused manual calculation; running in auto-recalc (slower) until Excel accepts the switch",
                                 )
         except Exception as e:
             log_excel_exception("ALL", e, "switching to manual calculation")
@@ -2861,24 +2865,29 @@ def _time_recalc(wrote):
             )
         _performance_metrics.record("ALL", "excel_recalc_skip_user_input", 0.0)
         return 0.0
-    # Strategy-safe: never run a heavy full-workbook Calculate while the trader
-    # is parked on a non-chain sheet; carry the debt until back on a chain sheet.
+    # Strategy-safe (Option C): chain data keeps updating every cycle; the heavy
+    # part is the full-workbook Calculate. Run it live ONLY when the last
+    # measured Calculate cost is known and below STRATEGY_RECALC_MAX_MS; otherwise
+    # carry the debt (Option B behaviour). This gives live P&L on cheap workbooks
+    # while self-protecting on heavy ones.
     try:
         _on_strategy_sheet = (_active_sheet_is_chain(app) is False)
     except Exception:
         _on_strategy_sheet = False
     if _on_strategy_sheet:
-        now = time.monotonic()
-        if now - _recalc_strategy_skip_logged_at > 30.0:
-            _recalc_strategy_skip_logged_at = now
-            feed_log(
-                "excel_recalc_skipped_strategy_sheet",
-                note="active sheet is not a chain sheet; recalculation carried",
-            )
-        if owed:
+        _last_ms = delta_state._last_recalc_ms
+        _threshold = delta_state.STRATEGY_RECALC_MAX_MS
+        if not (_last_ms > 0.0 and _last_ms < _threshold):
+            now = time.monotonic()
+            if now - _recalc_strategy_skip_logged_at > 30.0:
+                _recalc_strategy_skip_logged_at = now
+                feed_log(
+                    "excel_recalc_skipped_strategy_sheet",
+                    note="active sheet is not a chain sheet; recalculation carried",
+                )
             delta_state._recalc_owed = True
-        _performance_metrics.record("ALL", "excel_recalc_skipped_strategy_sheet", 0.0)
-        return 0.0
+            _performance_metrics.record("ALL", "excel_recalc_skipped_strategy_sheet", 0.0)
+            return 0.0
     try:
         started = time.perf_counter()
         app.api.Calculate()
