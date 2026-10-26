@@ -195,15 +195,6 @@ def main():
     print("rewrote", SRC)
 
 
-def _scope_chain(tree):
-    """Map every function node to the chain of functions that contain it."""
-    parents = {}
-    for node in ast.walk(tree):
-        for child in ast.iter_child_nodes(node):
-            parents[child] = node
-    return parents
-
-
 def compute_rebound(tree):
     """State names that are rebound rather than mutated.
 

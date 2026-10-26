@@ -19,7 +19,7 @@ import us_state
 from us_state import (
     MANUAL_WATCHDOG_SECONDS, POLL_GAP, PRODUCT_ID, REFRESH,
     ROLE_FILES, ROLE_ORDER, _CALC_IDS, _FIRST_SIGHT_BOUND,
-    _SCREEN_BACKOFF_SECONDS, _SCREEN_FAILURE_LIMIT, _UNPROTECTED_WRITE_INTERVAL,
+    _UNPROTECTED_WRITE_INTERVAL,
     _auto_open_done, _book_sheet_cache, _calc_failed_at, _calc_manual_failed,
     _calc_notice_shown, _calc_session,
     _dropdown_sig, _excel_connection_status, _last_excel_exception,
@@ -776,23 +776,6 @@ _colour_state = {}
 def _screen_pause_active():
     """True while the screen-updating attempt is paused after failures."""
     return us_state._screen_blocked_until > time.monotonic()
-
-
-def _note_screen_ok():
-    us_state._screen_failures = 0
-    us_state._screen_blocked_until = 0.0
-
-
-def _note_screen_failed(exc):
-    us_state._screen_failures += 1
-    if us_state._screen_failures >= _SCREEN_FAILURE_LIMIT:
-        us_state._screen_blocked_until = time.monotonic() + _SCREEN_BACKOFF_SECONDS
-        feed_log(
-            "screen_updating_paused",
-            failures=us_state._screen_failures,
-            seconds=_SCREEN_BACKOFF_SECONDS,
-            error=type(exc).__name__,
-        )
 
 
 def _screen_update_watchdog_tick():

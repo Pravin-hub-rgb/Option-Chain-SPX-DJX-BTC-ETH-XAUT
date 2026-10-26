@@ -526,12 +526,6 @@ async def spot_poller():
         await asyncio.sleep(SPOT_POLL_SECONDS)
 
 
-def _refresh_stock_spot(sym):
-    """Refresh the cached Yahoo spot for a stock symbol."""
-    root = clean_symbol(sym)
-    return _yahoo_spot_fetch(root)
-
-
 async def expiry_roller():
     import us_excel as _main
     while True:

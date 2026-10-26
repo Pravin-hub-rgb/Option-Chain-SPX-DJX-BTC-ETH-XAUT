@@ -9,7 +9,6 @@ OI via REST poll (config oi_poll_seconds), spot via fast single-ticker poll
 import asyncio
 import atexit
 import bisect
-import calendar
 import json
 import math
 import os
@@ -21,7 +20,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timezone, date
+from datetime import datetime
 
 from delta_diagnostics import (
     append_app_exception,
@@ -319,22 +318,6 @@ def log_excel_exception(asset, exc, context="Excel/COM update"):
         append_app_exception(f"{context} for {asset}", exc)
     except OSError as log_error:
         print(f"Could not log {context} traceback ({asset}): {log_error}", flush=True)
-
-
-def month_end(d_year, d_month):
-    return date(d_year, d_month, calendar.monthrange(d_year, d_month)[1])
-
-
-def current_month_end(today=None):
-    today = today or date.today()
-    return month_end(today.year, today.month)
-
-
-def next_month_end(today=None):
-    today = today or date.today()
-    if today.month == 12:
-        return month_end(today.year + 1, 1)
-    return month_end(today.year, today.month + 1)
 
 
         # loop back -> dialog reopens for another attempt

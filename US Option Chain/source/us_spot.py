@@ -321,33 +321,6 @@ def tencent_spot(sym):
     return price
 
 
-def _tencent_fetch_direct(root, cands, root_scale):
-    for cand in cands:
-        try:
-            resp = requests.get(TENCENT_QUOTE.format(cand), headers=HTTP_HEADERS,
-                                timeout=10)
-            if resp.status_code != 200:
-                feed_log("spot_tencent_http", symbol=root, cand=cand,
-                         status=resp.status_code)
-                continue
-            resp.encoding = "gbk"
-            hit = _tencent_parse(resp.text).get(cand)
-            if not hit:
-                continue
-            raw, stamp = hit
-            age = _tencent_feed_age_seconds(stamp)
-            scale = TENCENT_SCALE.get(cand, 1.0) * root_scale
-            price = raw * scale
-            _store_spot(root, price, age, "tencent")
-            feed_log("spot_tencent_ok", symbol=root, cand=cand, price=price,
-                     feed_time=stamp, scale=scale)
-            return price
-        except Exception as e:
-            feed_log("spot_tencent_error", symbol=root, cand=cand,
-                     error=type(e).__name__, detail=str(e)[:150])
-    return None
-
-
 def _years_to_expiry(expiry_iso):
     """Calendar years from today to an expiry date."""
     try:
