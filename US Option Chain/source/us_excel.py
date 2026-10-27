@@ -1719,21 +1719,42 @@ def _time_recalc(wrote):
             # Still owed - Excel comes back and the debt is paid then.
             us_state._recalc_owed = True
         return 0.0
-    # Last-instant guard: only skip when Excel is in edit mode (formula bar
-    # active). Plain keystrokes no longer block the recalculation - a Calculate
-    # on an unchanged workbook is cheap and keeps dependent formulas live, which
-    # is what prevents the stale-value strikethrough the customer sees.
-    if _excel_in_edit_mode(app):
+    # Last-instant guard: skip when the customer is typing or Excel is in edit
+    # mode. Matches Delta's conservative policy; ScreenUpdating is suspended
+    # during the cycle so the skipped recalc leaves no visible strikethrough.
+    if _input_is_recent() or _excel_in_edit_mode(app):
         us_state._recalc_owed = True
         now = time.monotonic()
         if now - _recalc_input_skip_logged_at > 30.0:
             _recalc_input_skip_logged_at = now
             feed_log(
                 "excel_recalc_skipped_user_input",
-                note="Excel is in edit mode; recalculation carried",
+                note="customer's hands are on Excel; recalculation carried",
             )
         _performance_metrics.record("ALL", "excel_recalc_skip_user_input", 0.0)
         return 0.0
+    # Strategy-safe (Option B): on a strategy sheet, defer the heavy
+    # Application.Calculate unless the last measured cost is known and below
+    # STRATEGY_RECALC_MAX_MS. Matches Delta's conservative policy. ScreenUpdating
+    # is suspended during the cycle, so the deferred recalc leaves no flicker.
+    try:
+        _on_strategy_sheet = (_active_sheet_is_chain(app) is False)
+    except Exception:
+        _on_strategy_sheet = False
+    if _on_strategy_sheet:
+        _last_ms = us_state._last_recalc_ms
+        _threshold = us_state.STRATEGY_RECALC_MAX_MS
+        if not (_last_ms > 0.0 and _last_ms < _threshold):
+            now = time.monotonic()
+            if now - _recalc_strategy_skip_logged_at > 30.0:
+                _recalc_strategy_skip_logged_at = now
+                feed_log(
+                    "excel_recalc_skipped_strategy_sheet",
+                    note="active sheet is not a chain sheet; recalculation carried",
+                )
+            us_state._recalc_owed = True
+            _performance_metrics.record("ALL", "excel_recalc_skipped_strategy_sheet", 0.0)
+            return 0.0
     calc_ok = False
     elapsed = 0.0
     # Calculate per-sheet instead of one big Application.Calculate(): the
