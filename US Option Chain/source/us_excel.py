@@ -1734,15 +1734,16 @@ def _time_recalc(wrote):
         _performance_metrics.record("ALL", "excel_recalc_skip_user_input", 0.0)
         return 0.0
     # Strategy-safe (Option C): chain data keeps updating every cycle; the heavy
-    # part is the full-workbook Calculate. Run it live ONLY when the last
-    # measured Calculate cost is known and below STRATEGY_RECALC_MAX_MS; otherwise
-    # carry the debt (Option B behaviour). This gives live P&L on cheap workbooks
-    # while self-protecting on heavy ones.
+    # part is the full-workbook Calculate. When new data was written we must
+    # always recalculate — otherwise dependent formulas go stale and show
+    # Excel's stale-value strikethrough. When nothing new was written but a
+    # recalculation is owed, only defer on the strategy sheet if the last
+    # measured Calculate cost is known and above the threshold.
     try:
         _on_strategy_sheet = (_active_sheet_is_chain(app) is False)
     except Exception:
         _on_strategy_sheet = False
-    if _on_strategy_sheet:
+    if _on_strategy_sheet and not wrote:
         _last_ms = us_state._last_recalc_ms
         _threshold = us_state.STRATEGY_RECALC_MAX_MS
         if not (_last_ms > 0.0 and _last_ms < _threshold):
