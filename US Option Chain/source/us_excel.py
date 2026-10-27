@@ -1734,15 +1734,37 @@ def _time_recalc(wrote):
             )
         _performance_metrics.record("ALL", "excel_recalc_skip_user_input", 0.0)
         return 0.0
-    try:
-        started = time.perf_counter()
-        app.api.Calculate()
-        elapsed = (time.perf_counter() - started) * 1000.0
-    except Exception as e:
-        log_excel_exception("ALL", e, "forcing workbook recalculation")
+    calc_ok = False
+    # Wait for Excel to finish processing the writes before asking it to
+    # recalculate - calling Calculate while Excel is still busy is what makes
+    # the RPC server unavailable on heavy workbooks (SPX/DJX).
+    for _ in range(20):
+        try:
+            if app.api.Ready:
+                break
+        except Exception:
+            pass
+        time.sleep(0.1)
+    for _attempt in range(5):
+        try:
+            import pythoncom
+            pythoncom.PumpWaitingMessages()
+        except Exception:
+            pass
+        try:
+            started = time.perf_counter()
+            try:
+                app.calculate()
+            except Exception:
+                app.api.Calculate()
+            elapsed = (time.perf_counter() - started) * 1000.0
+            calc_ok = True
+            break
+        except Exception as e:
+            log_excel_exception("ALL", e, "forcing workbook recalculation")
+            time.sleep(0.5 * (_attempt + 1))
+    if not calc_ok:
         if owed:
-            # A busy Excel must not silently eat a recalculation the skip
-            # promised; retry on the next free cycle.
             us_state._recalc_owed = True
         return 0.0
     us_state._last_recalc_ms = elapsed
