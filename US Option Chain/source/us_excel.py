@@ -1719,44 +1719,21 @@ def _time_recalc(wrote):
             # Still owed - Excel comes back and the debt is paid then.
             us_state._recalc_owed = True
         return 0.0
-    # Last-instant guard: the trader may have started typing after the
-    # pre-window check but before this Calculate. Force-calculating now is
-    # exactly what froze the edit frame, so carry the debt instead.
-    if _input_is_recent() or _excel_in_edit_mode(app):
+    # Last-instant guard: only skip when Excel is in edit mode (formula bar
+    # active). Plain keystrokes no longer block the recalculation - a Calculate
+    # on an unchanged workbook is cheap and keeps dependent formulas live, which
+    # is what prevents the stale-value strikethrough the customer sees.
+    if _excel_in_edit_mode(app):
         us_state._recalc_owed = True
         now = time.monotonic()
         if now - _recalc_input_skip_logged_at > 30.0:
             _recalc_input_skip_logged_at = now
             feed_log(
                 "excel_recalc_skipped_user_input",
-                note="customer's hands are on Excel; recalculation carried",
+                note="Excel is in edit mode; recalculation carried",
             )
         _performance_metrics.record("ALL", "excel_recalc_skip_user_input", 0.0)
         return 0.0
-    # Strategy-safe (Option C): chain data keeps updating every cycle; the heavy
-    # part is the full-workbook Calculate. When new data was written we must
-    # always recalculate — otherwise dependent formulas go stale and show
-    # Excel's stale-value strikethrough. When nothing new was written but a
-    # recalculation is owed, only defer on the strategy sheet if the last
-    # measured Calculate cost is known and above the threshold.
-    try:
-        _on_strategy_sheet = (_active_sheet_is_chain(app) is False)
-    except Exception:
-        _on_strategy_sheet = False
-    if _on_strategy_sheet and not wrote:
-        _last_ms = us_state._last_recalc_ms
-        _threshold = us_state.STRATEGY_RECALC_MAX_MS
-        if not (_last_ms > 0.0 and _last_ms < _threshold):
-            now = time.monotonic()
-            if now - _recalc_strategy_skip_logged_at > 30.0:
-                _recalc_strategy_skip_logged_at = now
-                feed_log(
-                    "excel_recalc_skipped_strategy_sheet",
-                    note="active sheet is not a chain sheet; recalculation carried",
-                )
-            us_state._recalc_owed = True
-            _performance_metrics.record("ALL", "excel_recalc_skipped_strategy_sheet", 0.0)
-            return 0.0
     try:
         started = time.perf_counter()
         app.api.Calculate()
@@ -2024,6 +2001,7 @@ def render_cycle():
             )
         us_state._recalc_owed = True
         _performance_metrics.record("ALL", "render_cycle_skipped_user_input", 0.0)
+        _time_recalc(us_state._cycle_wrote)
         return
 
     # Detect Excel edit mode: the customer may be dragging a formula, filling
@@ -2043,6 +2021,7 @@ def render_cycle():
                 note="Excel is in edit mode; the write window stays shut",
             )
         _performance_metrics.record("ALL", "render_cycle_skipped_user_edit", 0.0)
+        _time_recalc(us_state._cycle_wrote)
         return
 
     # Final pre-window guard: the input/edit checks above take a few COM
@@ -2053,6 +2032,7 @@ def render_cycle():
         _performance_metrics.record(
             "ALL", "render_cycle_skipped_user_input_late", 0.0
         )
+        _time_recalc(us_state._cycle_wrote)
         return
 
     # Strategy-safe mode (data-freshness variant): chain data keeps updating
