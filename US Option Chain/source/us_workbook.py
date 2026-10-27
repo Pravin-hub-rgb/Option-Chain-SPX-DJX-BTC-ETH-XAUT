@@ -117,7 +117,35 @@ def safe_float(val, default=0.0):
 
 
 def excel_path(role):
-    return os.path.join(BASE_DIR, ROLE_FILES[role])
+    """Path to a role's workbook.
+
+    Long paths are Excel's enemy: Workbooks.Open silently never returns past
+    ~128 characters. Prefer the 8.3 short name when Windows still hands one
+    out, and otherwise stage the file into the temp folder (which is short
+    and writable) so the open can never hang on a long path. The staged copy
+    is refreshed whenever the packaged original is newer.
+    """
+    base = os.path.join(BASE_DIR, ROLE_FILES[role])
+    if len(base) <= 120:
+        return base
+    # (skip 8.3 short name: its .XLS extension breaks openpyxl)
+    try:
+        import tempfile
+
+        stage_dir = os.path.join(tempfile.gettempdir(), "USOptionChain")
+        os.makedirs(stage_dir, exist_ok=True)
+        staged = os.path.join(stage_dir, ROLE_FILES[role])
+        try:
+            if (not os.path.exists(staged)
+                    or os.path.getmtime(staged) < os.path.getmtime(base)):
+                shutil.copy2(base, staged)
+        except Exception:
+            pass
+        if os.path.exists(staged):
+            return staged
+    except Exception:
+        pass
+    return base
 
 
 def default_k1(role):
@@ -237,9 +265,14 @@ def _rebuild_fresh(path):
 
 
 def ensure_excel_file(role):
-    path = excel_path(role)
-    if role in _template_ready and os.path.exists(path):
-        return path
+    base = os.path.join(BASE_DIR, ROLE_FILES[role])
+    path = base
+    if role in _template_ready and os.path.exists(base):
+        try:
+            excel_path(role)
+        except Exception:
+            pass
+        return excel_path(role)
     created = False
     if not os.path.exists(path):
         from openpyxl import Workbook
@@ -286,7 +319,7 @@ def ensure_excel_file(role):
                 # last chance: leave the rebuilt sheet on disk as-is
                 print(f"Could not save labels for {role}: {e2}", flush=True)
     _template_ready.add(role)
-    return path
+    return excel_path(role)
 
 
 def short_path(path):
@@ -369,6 +402,21 @@ def _ensure_owner_app(xw):
         return None
     _sts._owner_app = app
     _sts._app_cache = app
+    # Suppress Excel prompts (update-links, read-only-recommended, protected
+    # view) that can otherwise stall a COM call on the display thread.
+    for _attr, _val in (("display_alerts", False),):
+        try:
+            setattr(app, _attr, _val)
+        except Exception:
+            pass
+    try:
+        app.api.DisplayAlerts = False
+    except Exception:
+        pass
+    try:
+        app.api.AutomationSecurity = 3  # force-disable macros/add-ins prompts
+    except Exception:
+        pass
     try:
         _sts._owner_hwnd = app.api.Hwnd
     except Exception:
@@ -463,11 +511,11 @@ def _open_excel_files(finished=None, own_instance=False):
             return
         feed_log("excel_auto_open_started", own_instance=True)
         for role in ROLE_ORDER:
-            path = excel_path(role)
             try:
-                ensure_excel_file(role)
+                path = ensure_excel_file(role)
             except Exception as e:
                 print(f"ensure_excel_file failed ({role}): {e}", flush=True)
+                path = excel_path(role)
             try:
                 if _owner_book(app, path) is not None:
                     # Already open in our instance - the customer reopened a
@@ -478,19 +526,36 @@ def _open_excel_files(finished=None, own_instance=False):
                     continue
             except Exception:
                 pass
-            target = path if len(path) <= 120 else short_path(path)
-            try:
-                app.api.Workbooks.Open(target)
+            target = path
+            if len(target) > 120:
+                try:
+                    target = excel_path(role)
+                except Exception:
+                    pass
+            opened = False
+            for _open_kwargs in (
+                {"UpdateLinks": 0, "IgnoreReadOnlyRecommended": True, "Notify": False},
+                {},
+            ):
+                try:
+                    if _open_kwargs:
+                        app.api.Workbooks.Open(target, **_open_kwargs)
+                    else:
+                        app.api.Workbooks.Open(target)
+                    opened = True
+                    break
+                except Exception as e:
+                    if not _open_kwargs:
+                        print(f"Could not open {ROLE_FILES[role]}: {e}", flush=True)
+                        feed_log("excel_auto_open_failed", role=role, error=str(e))
+                        show_error(
+                            f"Could not open {ROLE_FILES[role]}:\n\n{e}\n\n"
+                            "If the package was unzipped into a long path, move it "
+                            "to a short one - C:\\OptionChain - and run the tool again."
+                        )
+            if opened:
                 _auto_open_done[role] = True
                 feed_log("excel_auto_open_done", role=role, via="api")
-            except Exception as e:
-                print(f"Could not open {ROLE_FILES[role]}: {e}", flush=True)
-                feed_log("excel_auto_open_failed", role=role, error=str(e))
-                show_error(
-                    f"Could not open {ROLE_FILES[role]}:\n\n{e}\n\n"
-                    "If the package was unzipped into a long path, move it "
-                    "to a short one - C:\\OptionChain - and run the tool again."
-                )
         if finished is not None:
             finished.set()
     except Exception as e:

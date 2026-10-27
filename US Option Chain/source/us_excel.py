@@ -19,9 +19,8 @@ import us_state
 from us_state import (
     MANUAL_WATCHDOG_SECONDS, POLL_GAP, PRODUCT_ID, REFRESH,
     ROLE_FILES, ROLE_ORDER, _CALC_IDS, _FIRST_SIGHT_BOUND,
-    _UNPROTECTED_WRITE_INTERVAL,
     _auto_open_done, _book_sheet_cache, _calc_failed_at, _calc_manual_failed,
-    _calc_notice_shown, _calc_session,
+    _calc_session,
     _dropdown_sig, _excel_connection_status, _last_excel_exception,
     _last_rows, _net_drawn, _pending_date_loads, _performance_metrics,
     _sheet_altered, _sheet_cache, active_expiries, all_known_expiries,
@@ -674,7 +673,10 @@ def update_user_dates(sym, sheet, pre=None):
                 ae = dates[0] if dates else None
                 active_expiries[sym][i] = ae
                 user_pinned[sym][i] = False
-            rng.value = iso_to_user(ae) if ae else ""
+            text = iso_to_user(ae) if ae else ""
+            if us_state._expiry_cell_written.get((sym, i)) != text:
+                rng.value = text
+                us_state._expiry_cell_written[(sym, i)] = text
             user_pinned[sym][i] = False
             continue
         user_str = str(val).strip()
@@ -1530,57 +1532,112 @@ def _write_to_excel(role):
 def _flush_block_writes(sheet, role, pending):
     """Write the changed blocks of one sheet.
 
-    How the block is written depends on whether we own Excel's calculation
-    mode.
+    Per block, protected runs write just the changed run and unprotected runs
+    merge into one span whose unchanged rows carry their previous values.
+    When every changed block is also consecutive, the blocks go out as ONE
+    range: spacer columns become blank rows, gaps inside a block keep their
+    current values, and nothing outside the changed blocks is touched.
 
-    - When we have Excel in manual calculation, nothing recalculates until we
-      ask it to, so the cost is the COM calls. Write the whole block in one
-      call.
-    - When we could not get manual calculation - Excel was busy, or a dialog
-      was up - every cell written can trigger a recalculation of the
-      customer's own workbook. That is the case that made their sheet crawl.
-      Scattered runs are merged into one span-write whose unchanged rows
-      carry the previous values, so the dirty set stays small in Excel's
-      eyes while the number of COM calls stays at one.
+    Two rules keep the combined write safe, and both were learned the hard way
+    when the US tool tried the same thing and reverted it:
 
-    Either way each block is written on its own, into its own columns, so a
-    block that did not change is never touched.
+    - The grid carries the block's CURRENT content, never its previous content.
+      Carrying the previous content repopulates rows that had just been
+      cleared because the block shrank, and the sheet then shows stale strikes
+      below the live table.
+    - A block that did not change is never in the grid at all. Only the changed
+      blocks take part, so an unchanged block's columns are never written.
 
-    Pending entries carry the block's padded rows (values padded with blank
-    rows up to the fixed extent, never the raw DataFrame), so even a
-    whole-block write keeps the geometry the customer's literal ranges rely
-    on.
+    The combined rectangle is only used when it is not much bigger than the
+    rows it replaces. A rectangle that spans two blocks whose changed rows sit
+    far apart would dirty thousands of cells the customer never asked us to
+    touch, and every dirty cell is recalculated when Excel is put back into
+    automatic mode.
     """
     if not pending:
         return
-    started = time.perf_counter()
-    protected = _calc_session.get("owned") and not _calc_session.get("failed")
-    try:
-        for bi, block, row_block, n_rows, runs, prev in pending:
-            try:
-                if protected:
-                    if len(runs) == 1:
-                        start, end = runs[0]
-                        sheet.range((5 + start, block["start"])).value = [
-                            list(r) for r in row_block[start : end + 1]
-                        ]
-                        _performance_metrics.record(
-                            role, "excel_rows_written", 0.0, rows=end - start + 1
-                        )
-                    else:
-                        sheet.range((5, block["start"])).options(
-                            index=False, header=False
-                        ).value = [list(r) for r in row_block]
+    pending = sorted(pending, key=lambda item: item[0])
+    protected = us_state._bulk_owning_manual
+    payloads = []
+    for bi, block, row_block, n_rows, runs, prev in pending:
+        if protected and len(runs) == 1:
+            start, end = runs[0]
+            rows = [list(r) for r in row_block[start : end + 1]]
+            top = 5 + start
+        elif (not protected) and runs and len(runs) <= 8:
+            lo, hi = runs[0][0], runs[-1][1]
+            rows = []
+            for i in range(lo, hi + 1):
+                if any(s <= i <= e for s, e in runs):
+                    rows.append(list(row_block[i]))
+                elif prev is not None and i < len(prev):
+                    rows.append(list(prev[i]))
                 else:
-                    # Unprotected window: every cell can trigger a recalc of
-                    # the customer's workbook, so the write window is one
-                    # merged span instead of one call per contiguous run.
-                    if runs and len(runs) <= 8:
+                    rows.append(list(row_block[i]))
+            top = 5 + lo
+        else:
+            rows = [list(r) for r in row_block]
+            top = 5
+        payloads.append({
+            "bi": bi,
+            "start": block["start"],
+            "end": block["start"] + 8,
+            "rows": rows,
+            "top": top,
+            "values": row_block,
+        })
+    consecutive = all(
+        payloads[i]["bi"] + 1 == payloads[i + 1]["bi"]
+        for i in range(len(payloads) - 1)
+    )
+    first_c = min(p["start"] for p in payloads)
+    last_c = max(p["end"] for p in payloads)
+    min_row = min(p["top"] - 5 for p in payloads)
+    max_row = max(p["top"] - 5 + len(p["rows"]) - 1 for p in payloads)
+    individual_cells = sum(len(p["rows"]) * 9 for p in payloads)
+    merged_cells = (max_row - min_row + 1) * (last_c - first_c + 1)
+    merge = (
+        consecutive
+        and len(payloads) >= 2
+        and merged_cells <= 4 * individual_cells
+    )
+    started = time.perf_counter()
+    try:
+        if merge:
+            grid = []
+            for r in range(min_row, max_row + 1):
+                row = [None] * (last_c - first_c + 1)
+                for p in payloads:
+                    c_off = p["start"] - first_c
+                    row_top = p["top"] - 5
+                    depth = len(p["rows"])
+                    n_rows = len(p["values"])
+                    if row_top <= r < row_top + depth:
+                        row[c_off : c_off + 9] = p["rows"][r - row_top]
+                    elif r < n_rows:
+                        row[c_off : c_off + 9] = list(p["values"][r])
+                grid.append(row)
+            sheet.range((5 + min_row, first_c)).value = grid
+            us_state._cycle_wrote = True
+        else:
+            for bi, block, row_block, n_rows, runs, prev in pending:
+                try:
+                    if protected:
+                        if len(runs) == 1:
+                            start, end = runs[0]
+                            sheet.range((5 + start, block["start"])).value = [
+                                list(r) for r in row_block[start : end + 1]
+                            ]
+                        else:
+                            sheet.range((5, block["start"])).options(
+                                index=False, header=False
+                            ).value = [list(r) for r in row_block]
+                    elif runs and len(runs) <= 8:
                         lo = runs[0][0]
                         hi = runs[-1][1]
                         merged_rows = []
                         for i in range(lo, hi + 1):
-                            in_run = any(start <= i <= end for start, end in runs)
+                            in_run = any(s <= i <= e for s, e in runs)
                             if in_run:
                                 merged_rows.append(list(row_block[i]))
                             elif prev is not None and i < len(prev):
@@ -1588,22 +1645,23 @@ def _flush_block_writes(sheet, role, pending):
                             else:
                                 merged_rows.append(list(row_block[i]))
                         sheet.range((5 + lo, block["start"])).value = merged_rows
-                        _performance_metrics.record(
-                            role, "excel_rows_written", 0.0, rows=hi - lo + 1
-                        )
                     else:
                         sheet.range((5, block["start"])).options(
                             index=False, header=False
                         ).value = [list(r) for r in row_block]
-            except Exception as e:
-                log_excel_exception(role, e, f"writing chain block {bi + 1}")
+                    us_state._cycle_wrote = True
+                except Exception as e:
+                    log_excel_exception(role, e, f"writing chain block {bi + 1}")
+    except Exception as e:
+        log_excel_exception(role, e, f"flushing chain blocks {role}")
     finally:
         _performance_metrics.record(
             role,
             "excel_block_flush",
             time.perf_counter() - started,
-            rows=sum(item[3] for item in pending),
+            rows=sum(len(p["rows"]) for p in payloads),
         )
+
 
 
 def write_to_excel(role):
@@ -1944,80 +2002,13 @@ def render_cycle():
             except Exception:
                 pass
 
-    # If Excel would not switch to manual calculation, every cell we write
-    # makes it recalculate. Writing anyway at full speed is what made the
-    # sheet feel stuck, so slow down to a rate the customer's workbook can
-    # absorb, and tell them once what to clear.
-    #
-    # A workbook close is the one refusal that must never reach them: closing
-    # briefly puts Excel's save prompt up and every switch fails for those
-    # seconds. The marks are cleared the moment the chains are gone.
+    # Excel may refuse manual calculation (busy cell, add-in, dialog). When
+    # that happens we still write every cycle — signature-based skipping
+    # already prevents unnecessary recalculation, matching Delta's behaviour.
+    # Marks are cleared when the chains are gone so the flag doesn't outlive
+    # the session.
     if us_state._calc_manual_failed:
         _clear_refused_calc_if_chain_gone()
-    if us_state._calc_manual_failed:
-        # Don't show the slow-down popup when Excel is gone — the customer
-        # closed it, not a busy cell or add-in.
-        # If Excel is closing or already gone, the refusal is a teardown
-        # artifact, not a real busy cell or add-in. Clear the marks so the
-        # slow-down popup never fires on close, and skip this cycle.
-        try:
-            import ctypes
-            _hwnd = us_state._owner_hwnd
-            _closing = False
-            if _hwnd and not ctypes.windll.user32.IsWindow(int(_hwnd)):
-                _closing = True
-            if len(getattr(us_state, "_missing_since", {})) == len(us_state.ROLE_ORDER):
-                _closing = True
-            if getattr(us_state, "_all_gone_since", None) is not None:
-                _closing = True
-            try:
-                if not excel_process_running():
-                    _closing = True
-            except Exception:
-                pass
-            if _closing:
-                _clear_refused_calc_marks()
-        except Exception:
-            pass
-        if not us_state._calc_manual_failed:
-            _performance_metrics.record("ALL", "render_cycle_skipped_noexcel", 0.0)
-            return
-
-        owner_app = us_state._owner_app
-        if owner_app is None:
-            # No owner reference at all — Excel is gone.
-            _clear_refused_calc_marks()
-        else:
-            try:
-                _ = owner_app.version  # COM liveness probe
-            except Exception:
-                # COM is dead but process may still be winding down.
-                _clear_refused_calc_marks()
-            else:
-                # Owner COM is alive — check process table too.
-                try:
-                    if not excel_process_running():
-                        _clear_refused_calc_marks()
-                except Exception:
-                    pass
-        if not us_state._calc_manual_failed:
-            _performance_metrics.record("ALL", "render_cycle_skipped_noexcel", 0.0)
-            return
-        now = time.monotonic()
-        if now - us_state._last_unprotected_write < _UNPROTECTED_WRITE_INTERVAL:
-            _performance_metrics.record("ALL", "render_cycle_skipped_busy", 0.0)
-            return
-        us_state._last_unprotected_write = now
-        _performance_metrics.record("ALL", "render_cycle_unprotected", 0.0)
-        if (
-            not us_state._calc_manual_notice_shown
-            and now - us_state._calc_failed_since >= _CALC_NOTICE_GRACE_SECONDS
-        ):
-            us_state._calc_manual_notice_shown = True
-            feed_log(
-                "calc_manual_unavailable_notice",
-                note="Excel refused manual calculation; running in auto-recalc (slower) until Excel accepts the switch",
-            )
 
     # Input yield: never open a write window while the customer's hands are
     # on our Excel. Their keystrokes land on a repaint-numbed frame - the
@@ -2085,7 +2076,8 @@ def render_cycle():
 
 
     aborted = False
-    restore = _begin_excel_bulk_mode(bulk_app())
+    bulk_app_obj = bulk_app()
+    restore = _begin_excel_bulk_mode(bulk_app_obj)
     try:
         for role in ROLE_ORDER:
             if not excel_process_running():
@@ -2241,6 +2233,7 @@ def _com_dead(exc):
 def _release_dead_excel_state():
     """After Excel is gone: drop the calc session, marks and stale handles."""
     _calc_session["owned"] = False
+    us_state._bulk_owning_manual = False
     _calc_session["failed"] = False
     _calc_session["mode"] = None
     _calc_session["app"] = None
@@ -2831,7 +2824,6 @@ def _clear_refused_calc_if_chain_gone():
         return
     _clear_refused_calc_marks()
 
-_CALC_NOTICE_GRACE_SECONDS = 60.0
 _CANNOT_TELL_TIMEOUT = 15.0
 _NO_BOOK_SKIP_LOG_SECONDS = 60.0
 
@@ -2924,6 +2916,7 @@ def _begin_excel_bulk_mode(app=None):
     # marked open only when a restore callable actually comes back.
     global _session_release_input_skip_logged_at
     us_state._bulk_window_open = False
+    us_state._bulk_owning_manual = False
     state = {"app": None, "calc": None}
     try:
         if app is None:
@@ -3052,6 +3045,7 @@ def _begin_excel_bulk_mode(app=None):
                             was_failed = us_state._calc_manual_failed
                             app.calculation = "manual"
                             _calc_session["owned"] = True
+                            us_state._bulk_owning_manual = True
                             _calc_session["mode"] = state["calc"]
                             _calc_session["failed"] = False
                             _calc_session["app"] = app
@@ -3093,22 +3087,25 @@ def _begin_excel_bulk_mode(app=None):
         log_excel_exception("ALL", e, "entering bulk mode")
         return None
 
+    # Events are deliberately left exactly as Excel keeps them. Toggling
+    # EnableEvents around the write window queued and then flushed worksheet
+    # events on every restore, which showed up as intermediate flicker on
+    # screen and could freeze an in-progress edit behind a stale frame. The
+    # calculation mode below is what owns the costly half.
+    state["events"] = None
+
     def restore():
         if state.get("restored"):
             return
         state["restored"] = True
         us_state._bulk_window_open = False
+        us_state._bulk_owning_manual = False
         app = state.get("app")
         if app is None:
             return
-        # No paint action here either: the screen was never taken, so it is
-        # already exactly where Excel and the customer want it. Every release
-        # used to force a full-sheet repaint here - that was the flicker.
-        # The calculation mode is deliberately NOT restored here. We take it
-        # once for the whole session and release it on exit, so the two
-        # OptionChain tools no longer fight over it several times a second.
-        # _emergency_restore() puts it back when the tool stops.
-
+        # No event, paint or calculation restore here: the screen and events
+        # were never taken, and calculation is held for the whole session.
+        pass
     us_state._last_bulk_restore = restore
     us_state._bulk_window_open = True
     return restore

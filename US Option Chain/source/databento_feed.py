@@ -33,8 +33,8 @@ KEY_PREFIX = "db-"
 
 DATASET = "OPRA.PILLAR"
 LIVE_SCHEMA = "cbbo-1s"
-DEFINITION_LOOKBACK_DAYS = 2
-STATISTICS_LOOKBACK_DAYS = 1
+DEFINITION_LOOKBACK_DAYS = 7
+STATISTICS_LOOKBACK_DAYS = 5
 DEFAULT_BAND = 120
 # Extra strikes subscribed on each side of the displayed band, so the index
 # has to travel a long way before a new subscription request is needed.

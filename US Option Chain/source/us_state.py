@@ -219,6 +219,7 @@ _SCREEN_BACKOFF_SECONDS = 60.0
 # the product is _screen_update_watchdog_tick (force ON, never OFF). These
 # fields keep its backoff and the owed latch honest.
 _screen_restore_owed = False
+_bulk_owning_manual = False
 _bulk_window_open = False
 _screen_watchdog_logged_at = 0.0
 # A render cycle skipped because the customer's hands were on our Excel

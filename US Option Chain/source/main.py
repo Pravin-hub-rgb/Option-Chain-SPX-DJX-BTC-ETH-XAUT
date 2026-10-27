@@ -110,7 +110,11 @@ async def main_async():
         us_excel._heal_keyboard()
     for sym in active_symbols():
         ensure_sym_state(sym)
-    open_excel_files()
+    try:
+        open_excel_files()
+    except Exception as e:
+        print(f"open_excel_files failed: {type(e).__name__}: {e}", flush=True)
+        append_app_exception("opening Excel workbooks", e)
     # After opening the workbooks, not before: at process start xw.apps can be
     # empty even though Excel is already running, and recovery then gave up and
     # discarded the record while leaving Excel stuck on manual.
@@ -122,6 +126,10 @@ async def main_async():
             await init_symbol(sym)
         except Exception as e:
             errs.append(f"{sym}: {e}")
+            try:
+                append_app_exception(f"init_symbol {sym}", e)
+            except OSError:
+                pass
     if errs and len(errs) >= len(active_symbols()):
         show_error(
             "Could not reach Databento, so no option chains can be loaded.\n\n"

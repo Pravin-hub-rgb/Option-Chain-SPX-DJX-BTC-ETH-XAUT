@@ -201,14 +201,14 @@ class UnprotectedWriteTests(unittest.TestCase):
         self.assertEqual(us_state._calc_failed_since, first)
 
     def test_the_slow_path_is_reachable(self):
-        """The names the slow path reads must be bound in us_state, not as
-        locals of render_cycle."""
+        """When Excel refuses manual calculation, render_cycle still reads
+        us_state._calc_manual_failed to decide whether to clear marks — but
+        no longer throttles writes (matching Delta's behaviour)."""
         import inspect
 
         src = inspect.getsource(us_excel.render_cycle)
         self.assertIn("us_state._calc_manual_failed", src)
-        self.assertIn("us_state._last_unprotected_write", src)
-        self.assertIn("us_state._calc_manual_notice_shown", src)
+        self.assertIn("_clear_refused_calc_if_chain_gone", src)
 
 
 class ExpiryRollerImportTests(unittest.TestCase):

@@ -415,7 +415,7 @@ class PerCycleWriteGatingTests(unittest.TestCase):
         import us_excel
         src = inspect.getsource(us_excel._flush_block_writes)
         self.assertNotIn("for start, end in _contiguous_runs(changed):", src)
-        self.assertIn("len(runs) == 1", src)
+        self.assertIn("sheet.range((5, block[\"start\"]))", src)
 
     def test_blocks_are_not_batched_into_one_wide_write(self):
         """The blocks must not be written as one wide range.
@@ -497,8 +497,7 @@ class AutoOpenLatchTests(unittest.TestCase):
         import inspect
         import us_excel
         src = inspect.getsource(us_excel._flush_block_writes)
-        self.assertIn("sheet.range((5 + start, block[\"start\"])).value = [", src)
-        self.assertIn("sheet.range((5 + lo, block[\"start\"])).value = merged_rows", src)
+        self.assertIn("sheet.range((5, block[\"start\"]))", src)
         self.assertNotIn("(4 + end, block[\"start\"] + 8)", src)
         self.assertNotIn("(4 + hi, block[\"start\"] + 8)", src)
 
@@ -1074,19 +1073,13 @@ class UnprotectedMergeTests(unittest.TestCase):
         import us_excel
         self.main = us_excel
 
-    def test_scattered_runs_become_one_span_write(self):
+    def test_whole_block_written_in_one_com_call(self):
         import inspect
 
         src = inspect.getsource(self.main._flush_block_writes)
+        self.assertIn("sheet.range((5, block[\"start\"]))", src)
         self.assertIn("merged_rows", src)
-        self.assertNotIn("for start, end in runs:", src)
-        self.assertIn("excel_rows_written", src)
 
-    def test_unchanged_rows_carry_the_previous_values(self):
-        import inspect
-
-        src = inspect.getsource(self.main._flush_block_writes)
-        self.assertIn("list(prev[i])", src)
 
 
 
@@ -1707,12 +1700,14 @@ class CalcShutdownSuppressionTests(unittest.TestCase):
         self.assertNotIn("show_error", src)
 
     def test_the_notice_waits_for_the_grace_period(self):
+        """render_cycle still clears refused-calc marks when chains are gone,
+        so a held manual window is handed back on close."""
         import inspect
         import us_excel
 
         src = inspect.getsource(us_excel.render_cycle)
-        self.assertIn("_CALC_NOTICE_GRACE_SECONDS", src)
-        self.assertIn("us_state._calc_failed_since", src)
+        self.assertIn("_clear_refused_calc_if_chain_gone", src)
+        self.assertNotIn("_UNPROTECTED_WRITE_INTERVAL", src)
 
     def test_marks_are_cleared_when_the_chains_are_gone(self):
         from unittest.mock import MagicMock
