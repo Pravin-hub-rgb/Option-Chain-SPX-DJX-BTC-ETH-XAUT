@@ -2351,7 +2351,6 @@ class ScreenUpdatingSelfHealTests(unittest.TestCase):
         us_state._owner_app = app
         us_state._screen_restore_owed = True
         us_state._bulk_window_open = False
-        us_state._screen_blocked_until = 0.0
         try:
             us_excel._screen_update_watchdog_tick()
             self.assertTrue(app.screen)

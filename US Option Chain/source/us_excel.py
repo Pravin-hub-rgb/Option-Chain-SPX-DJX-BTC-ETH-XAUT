@@ -775,11 +775,6 @@ _colour_state = {}
 # what was there instead of wiping a fixed block of rows every tick.
 
 
-def _screen_pause_active():
-    """True while the screen-updating attempt is paused after failures."""
-    return us_state._screen_blocked_until > time.monotonic()
-
-
 def _screen_update_watchdog_tick():
     """Force ScreenUpdating back on if this instance is ever seen with it off.
 
@@ -795,7 +790,7 @@ def _screen_update_watchdog_tick():
     app = us_state._app_cache or us_state._owner_app
     if app is None:
         return
-    if us_state._bulk_window_open or _screen_pause_active():
+    if us_state._bulk_window_open:
         return
     try:
         busy = app.screen_updating

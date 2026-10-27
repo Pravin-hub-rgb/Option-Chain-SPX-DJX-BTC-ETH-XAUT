@@ -209,7 +209,6 @@ _calc_notice_shown = False
 # that switch fails, and four failing calls a cycle make Excel busier still.
 # After a few failures the attempt is paused for a while.
 _screen_failures = 0
-_screen_blocked_until = 0.0
 _SCREEN_FAILURE_LIMIT = 3
 _SCREEN_BACKOFF_SECONDS = 60.0
 # ScreenUpdating self-heal net. The tool no longer toggles ScreenUpdating: the
