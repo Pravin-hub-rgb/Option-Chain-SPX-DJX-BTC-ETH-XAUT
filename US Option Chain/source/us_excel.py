@@ -1707,9 +1707,11 @@ def _time_recalc(wrote):
     if not wrote and not owed:
         _performance_metrics.record("ALL", "excel_recalc_skip_nowrite", 0.0)
         return 0.0
-    if not us_state._bulk_will_recalc and not _calc_session.get("owned"):
-        _performance_metrics.record("ALL", "excel_recalc_skip_mode", 0.0)
-        return 0.0
+    # Recalculate whenever we have written data, regardless of Excel's
+    # calculation mode. If we skip Calculate while holding manual mode,
+    # dependent formulas go stale and show Excel's stale-value strikethrough.
+    # The customer can always switch to automatic if they want Excel to
+    # manage recalculation itself.
     app = us_state._app_cache
     if app is None:
         _performance_metrics.record("ALL", "excel_recalc_skip_noapp", 0.0)
