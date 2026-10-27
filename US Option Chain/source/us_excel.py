@@ -1707,13 +1707,11 @@ def _time_recalc(wrote):
     if not wrote and not owed:
         _performance_metrics.record("ALL", "excel_recalc_skip_nowrite", 0.0)
         return 0.0
-    # Respect Excel's original calculation mode: when the workbook started on
-    # manual (the customer's choice, or the sibling tool owns it) we do not
-    # force a Calculate() here - that would override their choice and add lag.
-    # Delta behaves the same way.
-    if not us_state._bulk_will_recalc:
-        _performance_metrics.record("ALL", "excel_recalc_skip_mode", 0.0)
-        return 0.0
+    # Recalculate whenever we have written data, regardless of Excel's
+    # calculation mode. If we skip Calculate while holding manual mode,
+    # dependent formulas go stale and show Excel's stale-value strikethrough.
+    # The customer can always switch to automatic if they want Excel to
+    # manage recalculation itself.
     app = us_state._app_cache
     if app is None:
         _performance_metrics.record("ALL", "excel_recalc_skip_noapp", 0.0)
@@ -1735,15 +1733,17 @@ def _time_recalc(wrote):
             )
         _performance_metrics.record("ALL", "excel_recalc_skip_user_input", 0.0)
         return 0.0
-    # Strategy-safe (Option B): on a strategy sheet, defer the heavy
-    # Application.Calculate unless the last measured cost is known and below
-    # STRATEGY_RECALC_MAX_MS. Chain-sheet writes still recalc live. Matches
-    # Delta's conservative policy.
+    # Strategy-safe (Option C): chain data keeps updating every cycle; the heavy
+    # part is the full-workbook Calculate. When new data was written we must
+    # always recalculate — otherwise dependent formulas go stale and show
+    # Excel's stale-value strikethrough. When nothing new was written but a
+    # recalculation is owed, only defer on the strategy sheet if the last
+    # measured Calculate cost is known and above the threshold.
     try:
         _on_strategy_sheet = (_active_sheet_is_chain(app) is False)
     except Exception:
         _on_strategy_sheet = False
-    if _on_strategy_sheet:
+    if _on_strategy_sheet and not wrote:
         _last_ms = us_state._last_recalc_ms
         _threshold = us_state.STRATEGY_RECALC_MAX_MS
         if not (_last_ms > 0.0 and _last_ms < _threshold):

@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 import requests
 
 REST_BASE = "https://api.delta.exchange"
-HTTP_TIMEOUT = 15.0
+HTTP_TIMEOUT = 30.0
 
 _thread_local = threading.local()
 
@@ -29,9 +29,17 @@ def _session():
 
 
 def _get_json(url, params):
-    resp = _session().get(url, params=params, timeout=HTTP_TIMEOUT)
-    resp.raise_for_status()
-    return resp.json()
+    last = None
+    for attempt in range(3):
+        try:
+            resp = _session().get(url, params=params, timeout=HTTP_TIMEOUT)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            last = e
+            print(f"[BTC] GET {url} attempt {attempt+1} failed: {e}", flush=True)
+            time.sleep(1.0)
+    raise last
 
 
 def _safe_float(val, default=0.0):
