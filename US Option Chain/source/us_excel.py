@@ -1707,7 +1707,7 @@ def _time_recalc(wrote):
     if not wrote and not owed:
         _performance_metrics.record("ALL", "excel_recalc_skip_nowrite", 0.0)
         return 0.0
-    if not us_state._bulk_will_recalc:
+    if not us_state._bulk_will_recalc and not _calc_session.get("owned"):
         _performance_metrics.record("ALL", "excel_recalc_skip_mode", 0.0)
         return 0.0
     app = us_state._app_cache
