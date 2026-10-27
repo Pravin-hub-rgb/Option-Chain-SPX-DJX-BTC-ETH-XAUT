@@ -2100,6 +2100,10 @@ def render_cycle():
     bulk_app_obj = bulk_app()
     restore = _begin_excel_bulk_mode(bulk_app_obj)
     try:
+        try:
+            bulk_app_obj.screen_updating = False
+        except Exception:
+            pass
         for role in ROLE_ORDER:
             if not excel_process_running():
                 break
@@ -2120,6 +2124,10 @@ def render_cycle():
         if not aborted:
             _time_recalc(us_state._cycle_wrote)
     finally:
+        try:
+            bulk_app_obj.screen_updating = True
+        except Exception:
+            pass
         if aborted:
             _release_manual_on_user_abort()
         if restore is not None:
