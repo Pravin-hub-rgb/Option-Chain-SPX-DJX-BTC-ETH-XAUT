@@ -77,13 +77,14 @@ ROLE_FILES = {
     "spx": "spx_option_chain.xlsx",
     "djx": "djx_option_chain.xlsx",
     "stock": "us_stock_option_chain.xlsx",
+    "btc": "btc_option_chain.xlsx",
 }
-ROLE_ORDER = ("spx", "djx", "stock")
+ROLE_ORDER = ("spx", "djx", "stock", "btc")
 # roles whose K1 is locked (not user-editable)
-LOCKED_ROLES = frozenset({"spx", "djx"})
+LOCKED_ROLES = frozenset({"spx", "djx", "btc"})
 
 # active ticker per Excel file/role (spx/djx fixed; stock from K1)
-role_symbol = {"spx": SPX_SYMBOL, "djx": DJX_SYMBOL, "stock": DEFAULT_SYMBOL}
+role_symbol = {"spx": SPX_SYMBOL, "djx": DJX_SYMBOL, "stock": DEFAULT_SYMBOL, "btc": "BTC"}
 SYMBOL_CELL = "K1"
 
 live_data = {}

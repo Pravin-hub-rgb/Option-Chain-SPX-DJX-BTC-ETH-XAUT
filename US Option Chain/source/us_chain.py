@@ -285,6 +285,15 @@ def _fetch_databento(sym):
 def fetch_symbol_payload(sym):
     """Return (spot, rows, expiries, source_name). Databento is mandatory."""
     root = clean_symbol(sym)
+    if root == "BTC":
+        from us_btc_chain import fetch_btc_payload
+        spot, rows, expiries, src = fetch_btc_payload(sym)
+        # keep the shared expiry-root bookkeeping consistent
+        try:
+            _note_expiry_roots(sym, rows)
+        except Exception:
+            pass
+        return spot, rows, expiries, src
     errors = []
     try:
         result = _fetch_databento(sym)
