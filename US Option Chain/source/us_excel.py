@@ -1735,16 +1735,12 @@ def _time_recalc(wrote):
         _performance_metrics.record("ALL", "excel_recalc_skip_user_input", 0.0)
         return 0.0
     calc_ok = False
-    # Wait for Excel to finish processing the writes before asking it to
-    # recalculate - calling Calculate while Excel is still busy is what makes
-    # the RPC server unavailable on heavy workbooks (SPX/DJX).
-    for _ in range(20):
-        try:
-            if app.api.Ready:
-                break
-        except Exception:
-            pass
-        time.sleep(0.1)
+    elapsed = 0.0
+    # Calculate per-sheet instead of one big Application.Calculate(): the
+    # monolithic call RPC-fails on heavy workbooks (SPX, ~3k contracts) because
+    # Excel's COM server is still busy finishing the writes. Per-sheet calls
+    # are smaller and far more likely to succeed, and they still refresh the
+    # strategy-sheet formulas that depend on the Chain sheet.
     for _attempt in range(5):
         try:
             import pythoncom
@@ -1753,10 +1749,28 @@ def _time_recalc(wrote):
             pass
         try:
             started = time.perf_counter()
+            sheets_calculated = 0
+            books = []
             try:
-                app.calculate()
+                books = list(app.books)
             except Exception:
+                books = []
+            if books:
+                for book in books:
+                    try:
+                        for sheet in list(book.sheets):
+                            try:
+                                sheet.api.Calculate()
+                                sheets_calculated += 1
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+            if sheets_calculated == 0:
+                # Fallback for mocks / single-book setups, or when every
+                # per-sheet call failed: monolithic Calculate.
                 app.api.Calculate()
+                sheets_calculated = 1
             elapsed = (time.perf_counter() - started) * 1000.0
             calc_ok = True
             break
