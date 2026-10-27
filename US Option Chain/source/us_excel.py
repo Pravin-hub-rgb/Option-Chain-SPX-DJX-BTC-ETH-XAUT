@@ -1758,14 +1758,21 @@ def _time_recalc(wrote):
             if books:
                 for book in books:
                     try:
-                        for sheet in list(book.sheets):
-                            try:
-                                sheet.api.Calculate()
-                                sheets_calculated += 1
-                            except Exception:
-                                pass
+                        sheets = list(book.sheets)
                     except Exception:
-                        pass
+                        sheets = []
+                    # Calculate the Chain sheet(s) first so cross-sheet
+                    # formulas (e.g. =Chain!A1 on a Strategy sheet) see fresh
+                    # values; otherwise a dependent sheet can calculate before
+                    # its precedent and stay stale -> strikethrough.
+                    chain_sheets = [s for s in sheets if "chain" in str(getattr(s, "name", "")).lower()]
+                    other_sheets = [s for s in sheets if s not in chain_sheets]
+                    for sheet in chain_sheets + other_sheets:
+                        try:
+                            sheet.api.Calculate()
+                            sheets_calculated += 1
+                        except Exception:
+                            pass
             if sheets_calculated == 0:
                 # Fallback for mocks / single-book setups, or when every
                 # per-sheet call failed: monolithic Calculate.
