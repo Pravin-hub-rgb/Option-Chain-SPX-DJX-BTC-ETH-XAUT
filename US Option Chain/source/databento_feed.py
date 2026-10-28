@@ -898,6 +898,7 @@ class DatabentoFeed:
         return end - timedelta(days=days), end
 
     def _fetch_universe(self, symbol: str) -> list[dict]:
+        total_start = time.monotonic()
         try:
             db = _db()
         except ImportError:
@@ -914,6 +915,9 @@ class DatabentoFeed:
 
         start, end = self._history_range(DEFINITION_LOOKBACK_DAYS, history)
         start = start.replace(hour=0, minute=0, second=0, microsecond=0)
+        chunks = _definition_chunks(start, end)
+        print(f"[{symbol}] Fetching contract definitions: {len(chunks)} day(s) "
+              f"({start.date()} to {end.date()})", flush=True)
         by_raw: dict[str, dict] = {}
         used_parents: list[str] = []
         parents = self._parent_candidates(symbol)
@@ -1010,6 +1014,10 @@ class DatabentoFeed:
         with self._lock:
             self._parents_by_symbol[symbol] = list(used_parents)
         self._save_cache(symbol, rows)
+        elapsed = time.monotonic() - total_start
+        print(f"[{symbol}] Databento definitions loaded: {len(rows)} contracts "
+              f"in {int(elapsed)}s ({len({row['e'] for row in rows})} expiries)",
+              flush=True)
         self._log(
             "databento_universe",
             symbol=symbol,

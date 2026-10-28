@@ -1297,7 +1297,12 @@ def _write_to_excel(role):
                 # Writing an identical string still dirties the cell and forces
                 # every dependent formula to recalculate — that cost is what
                 # makes a strategy workbook feel stuck.
-                head_text = f"{sym} Spot: --"
+                if us_state.live_data.get(sym):
+                    head_text = f"{sym} Spot: {sp:.2f} | -- strikes"
+                elif us_state._databento_feed is not None and not us_state._databento_feed.ready(sym):
+                    head_text = f"{sym} Fetching Databento definitions..."
+                else:
+                    head_text = f"{sym} Spot: --"
                 pcr_text = "PCR: --"
                 try:
                     if _header_at(header_values, col_l) != head_text:

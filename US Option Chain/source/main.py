@@ -121,7 +121,12 @@ async def main_async():
     recover_calc_mode()
     us_excel.start_excel_gone_watchdog()
     errs = []
-    for sym in active_symbols():
+    syms = list(active_symbols())
+    print(f"Loading {len(syms)} symbol(s): {', '.join(syms)}", flush=True)
+    print("First run of the day or new expiry: the initial Databento definition"
+          " fetch may take 1-3 minutes. Subsequent refreshes are instant."
+          " The sheet will populate when ready.", flush=True)
+    for sym in syms:
         try:
             await init_symbol(sym)
         except Exception as e:

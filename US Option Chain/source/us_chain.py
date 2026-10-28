@@ -433,6 +433,13 @@ def _log_timezone_fallback(exc):
 
 
 async def init_symbol(sym):
+    feed = us_state._databento_feed
+    if feed is not None and not feed.ready(sym):
+        if feed.healthy():
+            print(f"[{sym}] fetching contract definitions from Databento "
+                  f"(this can take 1-3 minutes on first run)...", flush=True)
+        else:
+            print(f"[{sym}] waiting for Databento connection...", flush=True)
     data = await load_symbol(sym)
     print(f"[{sym}] loaded {data.get('n', 0)} contracts | spot {spot_cmp[sym]}", flush=True)
     print(f"[{sym}] expiries: {', '.join(active_expiries[sym])}", flush=True)
