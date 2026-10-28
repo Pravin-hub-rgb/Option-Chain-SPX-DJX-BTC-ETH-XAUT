@@ -1,7 +1,7 @@
 import io
 
 EDITS = {
-    "source/test_delta_lag.py": [
+    "source/tests/test_delta_lag.py": [
         (
             'self.patch.object(self.delta_main, "_bulk_owning_manual", True)',
             'self.patch.object(self.delta_state, "_bulk_owning_manual", True)',
@@ -15,7 +15,7 @@ EDITS = {
             "        self.delta_main = delta_main\n        self.delta_state = delta_state\n        self.pd = pd\n",
         ),
     ],
-    "source/test_calc_mode_coexistence.py": [
+    "source/tests/test_calc_mode_coexistence.py": [
         ("delta_main._manual_since", "delta_state._manual_since"),
         ("delta_main._last_observed_calc_raw", "delta_state._last_observed_calc_raw"),
         ("delta_main._calc_churn_count", "delta_state._calc_churn_count"),

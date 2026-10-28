@@ -1,7 +1,7 @@
 """Test isolation for every pytest run, not just the full suite.
 
 Discovery sorts test files alphabetically, so test_00_isolation.py runs
-first in a whole-suite run - but a targeted run like `pytest test_delta_lag.py`
+first in a whole-suite run - but a targeted run like `pytest tests/test_delta_lag.py`
 never imports it, and without the override the product modules then write
 their test noise straight into the customer's real feed logs. conftest.py
 is imported by pytest before any test file, so the override is always set.

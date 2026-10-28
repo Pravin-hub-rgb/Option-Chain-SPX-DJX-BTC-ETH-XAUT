@@ -1,7 +1,7 @@
 """Report names that main.py imports but never uses.
 
 Purely informational: it is a leftover list from the module split, not a
-failure. The static name check in test_delta_names.py is the one that
+failure. The static name check in tests/test_delta_names.py is the one that
 actually gates the build.
 """
 

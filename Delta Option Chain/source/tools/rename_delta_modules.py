@@ -50,7 +50,7 @@ os.remove(PERF)
 print("renamed performance_metrics.py to delta_performance.py")
 
 # ---- update the imports ---------------------------------------------------
-for path in ("source/main.py", "source/delta_state.py", "source/test_performance_metrics.py"):
+for path in ("source/main.py", "source/delta_state.py", "source/tests/test_performance_metrics.py"):
     text = io.open(path, encoding="utf-8").read()
     text = text.replace(
         "from startup_diagnostics import (",

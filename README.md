@@ -51,8 +51,15 @@ This verifies Python packages, Excel connectivity, the activation key, the data 
 From each product's `source/` directory:
 
 ```powershell
-cd "US Option Chain/source"  ; python -m unittest discover -s . -p "test_*.py"
-cd "Delta Option Chain/source"; python -m unittest discover -s . -p "test_*.py"
+cd "US Option Chain/source"  ; python -m unittest discover -s tests -p "test_*.py" -t .
+cd "Delta Option Chain/source"; python -m unittest discover -s tests -p "test_*.py" -t .
+```
+
+Or with pytest:
+
+```powershell
+cd "US Option Chain/source"  ; pytest tests\
+cd "Delta Option Chain/source"; pytest tests\
 ```
 
 ## Build

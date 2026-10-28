@@ -10,7 +10,7 @@ import io
 import os
 import unittest
 
-SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
+SOURCE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 BUILTINS = set(dir(builtins)) | {"__file__", "__name__", "self"}
 

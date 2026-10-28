@@ -1,7 +1,7 @@
 import io
 
 EDITS = {
-    "source/test_00_isolation.py": [
+    "source/tests/test_00_isolation.py": [
         (
             "    def test_delta_log_dir_override_is_honoured(self):\n        import main\n        self.assertEqual(_LOG_ROOT, main.FEED_LOG_DIR)",
             "    def test_delta_log_dir_override_is_honoured(self):\n        import delta_diagnostics\n        self.assertEqual(_LOG_ROOT, delta_diagnostics.FEED_LOG_DIR)",
@@ -11,7 +11,7 @@ EDITS = {
             "    def test_delta_log_dir_is_not_the_customer_directory(self):\n        import delta_diagnostics\n        self.assertNotEqual(\n            os.path.join(os.environ.get(\"LOCALAPPDATA\", \".\"), \"DeltaOptionChain\"),\n            delta_diagnostics.FEED_LOG_DIR,\n        )",
         ),
     ],
-    "source/test_delta_startup.py": [
+    "source/tests/test_delta_startup.py": [
         ("src = inspect.getsource(main._lock_path)", "src = inspect.getsource(delta_instance._lock_path)"),
         (
             "src = inspect.getsource(main._take_over_locked_instance)",
