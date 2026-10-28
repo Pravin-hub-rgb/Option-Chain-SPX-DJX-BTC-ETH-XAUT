@@ -32,7 +32,7 @@ from us_chain import (
     cell_value_from_pre, iso_to_user, parse_user_date, print_chain,
     read_symbol_cell,
 )
-from us_spot import source_delay_note, spot_source_for
+from us_spot import _databento_spot, source_delay_note, spot_source_for
 from us_workbook import (
     BLOCKS_PER_SHEET, BLOCK_COLS, EXPIRY_CELLS, default_k1, ensure_excel_file,
     excel_path, get_column_letter, is_locked_role, open_excel_files,
@@ -1252,7 +1252,7 @@ def _write_to_excel(role):
             print(f"update_expiry_dropdowns ({sym}): {e}", flush=True)
             log_excel_exception(role, e, "updating expiry dropdowns")
 
-        sp = spot_cmp[sym] or 0
+        sp = spot_cmp[sym] or _databento_spot(sym) or 0
         MAX_A2 = 100
         if not user_provided:
             range_val = MAX_A2  # empty A2 â†’ all (API returns â‰¤100 around ATM)

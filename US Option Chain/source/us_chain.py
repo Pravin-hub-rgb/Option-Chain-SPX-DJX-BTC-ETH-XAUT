@@ -632,7 +632,7 @@ async def process_pending_dates():
 
 
 def build_option_chain(sym, expiry, range_val=50):
-    sp = spot_cmp[sym] or 0.0
+    sp = spot_cmp[sym] or _databento_spot(sym) or 0.0
     if not expiry:
         return None, 0.0
     want = base_root(sym)
@@ -645,8 +645,15 @@ def build_option_chain(sym, expiry, range_val=50):
         return None, 0.0
 
     strikes = sorted(set(e["strike"] for e in filtered))
-    atm_strike = min(strikes, key=lambda s: abs(s - sp))
-    atm_idx = strikes.index(atm_strike)
+    if sp > 0:
+        atm_strike = min(strikes, key=lambda s: abs(s - sp))
+        atm_idx = strikes.index(atm_strike)
+    else:
+        # No spot available — center on the middle of the strike list so the
+        # displayed band matches what _target_symbols subscribes to in
+        # databento_feed.py. Without this, sp=0 makes min() pick the smallest
+        # strike and the band starts from the far end, showing only stale OI.
+        atm_idx = len(strikes) // 2
     # Some index chains span a very wide strike range with a dense listing at
     # the money (DJX: ~42 strikes from 325..625 around a ~513 spot). Rendering
     # the whole span buries the liquid ATM region under far-OTM strikes whose OI
