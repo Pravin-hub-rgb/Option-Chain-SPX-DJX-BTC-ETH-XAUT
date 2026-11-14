@@ -6,8 +6,8 @@ Two Python + xlwings COM tools, each shipped as a PyInstaller **onedir** executa
 
 | Product | Source dir | Exe | Data files |
 |---|---|---|---|
-| US Option Chain | `US Option Chain/source/` | `us_option_chain.exe` | `spx_option_chain.xlsx`, `djx_option_chain.xlsx`, `us_stock_option_chain.xlsx` |
-| Delta Option Chain | `Delta Option Chain/source/` | `delta_option_chain.exe` | `btc_chain.xlsx`, `eth_chain.xlsx`, `xaut_chain.xlsx` |
+| US Option Chain | `US option chain/source/` | `us_option_chain.exe` | `spx_option_chain.xlsx`, `djx_option_chain.xlsx`, `us_stock_option_chain.xlsx` |
+| Delta Option Chain | `Deltax-option-chain/source/` | `delta_option_chain.exe` | `btc_chain.xlsx`, `eth_chain.xlsx`, `xaut_chain.xlsx` |
 
 Both read `config.json` and `optionchain.product` from their own folder. Neither ships `license.json`, `databento.key`, `.env`, or any lock/log file.
 
@@ -15,21 +15,21 @@ Both read `config.json` and `optionchain.product` from their own folder. Neither
 
 ## 0. Pre-flight
 
-- Working directory: repo root `deltax-option-chain/`, branch `simplify-lag-strategy` (or the feature branch you are shipping).
+- Working directory: repo root `Option Chain/`, branch `simplify-lag-strategy` (or the feature branch you are shipping).
 - Python 3.10, xlwings, PyInstaller installed.
 - Run the full test suites first and confirm green:
-  - `cd "US Option Chain/source" && python -m unittest discover -s . -p "test_*.py"`  (expect ~276 OK)
-  - `cd "Delta Option Chain/source" && python -m unittest discover -s . -p "test_*.py"` (expect ~180 OK)
+  - `cd "US option chain/source" && python -m unittest discover -s . -p "test_*.py"`  (expect ~276 OK)
+  - `cd "Deltax-option-chain/source" && python -m unittest discover -s . -p "test_*.py"` (expect ~180 OK)
 - Import gates:
-  - `cd "US Option Chain/source" && python -c "import main, us_excel, us_state; print('US OK')"`
-  - `cd "Delta Option Chain/source" && python -c "import main, delta_state, delta_chain, delta_spot; print('Delta OK')"`
+  - `cd "US option chain/source" && python -c "import main, us_excel, us_state; print('US OK')"`
+  - `cd "Deltax-option-chain/source" && python -c "import main, delta_state, delta_chain, delta_spot; print('Delta OK')"`
 
 ---
 
 ## 1. US Option Chain build
 
 ```
-cd "US Option Chain/source"
+cd "US option chain/source"
 cmd /c build_exe.bat
 ```
 
@@ -48,7 +48,7 @@ python -c "import hashlib,pathlib; r=pathlib.Path('.'); EX=('license.json',); fs
 Compare to `client package\build_info.txt`. They must match. If not, rebuild.
 
 **Copy to client package:**
-- The build copies the onedir output into `US Option Chain\client package\`.
+- The build copies the onedir output into `US option chain\client package\`.
 - Confirm `client package\` contains: `us_option_chain.exe`, `spx_option_chain.xlsx`, `djx_option_chain.xlsx`, `us_stock_option_chain.xlsx`, `config.json`, `HOW-TO-USE.txt`, `CHECK-INSTALL.bat`, `optionchain.product` (value `us`), `build_info.txt`.
 
 ---
@@ -56,7 +56,7 @@ Compare to `client package\build_info.txt`. They must match. If not, rebuild.
 ## 2. Delta Option Chain build
 
 ```
-cd "Delta Option Chain/source"
+cd "Deltax-option-chain/source"
 cmd /c build_final.bat
 ```
 
@@ -111,14 +111,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File package_delivery.ps1
 
 ```
 # US
-cd "US Option Chain/source"
+cd "US option chain/source"
 python -m unittest discover -s . -p "test_*.py"
 python -c "import main, us_excel, us_state; print('US import OK')"
 cmd /c build_exe.bat
 # verify build_info.txt stamp, then copy to client package
 
 # Delta
-cd "Delta Option Chain/source"
+cd "Deltax-option-chain/source"
 python -m unittest discover -s . -p "test_*.py"
 python -c "import main, delta_state, delta_chain, delta_spot; print('Delta import OK')"
 cmd /c build_final.bat

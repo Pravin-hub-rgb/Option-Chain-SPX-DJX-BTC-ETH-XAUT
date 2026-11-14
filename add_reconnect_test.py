@@ -1,9 +1,9 @@
 import os
 
-base = r'C:\Users\Pravin\Downloads\Telegram Desktop\new2-deltax-option-chain\deltax-option-chain'
+base = os.path.dirname(os.path.abspath(__file__))
 
 # --- Delta test ---
-p = os.path.join(base, 'Delta Option Chain', 'source', 'tests', 'test_calc_mode_coexistence.py')
+p = os.path.join(base, 'Deltax-option-chain', 'source', 'tests', 'test_calc_mode_coexistence.py')
 with open(p, 'r') as f:
     content = f.read()
 
@@ -28,7 +28,7 @@ with open(p, 'w') as f:
 print('Delta reconnect test added')
 
 # --- US test ---
-p2 = os.path.join(base, 'US Option Chain', 'source', 'tests', 'test_us_lag.py')
+p2 = os.path.join(base, 'US option chain', 'source', 'tests', 'test_us_lag.py')
 with open(p2, 'a') as f:
     f.write('''
 class WatchdogReconnectTests(unittest.TestCase):

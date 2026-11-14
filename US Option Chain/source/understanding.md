@@ -6,7 +6,7 @@ _Internal engineering notes - keep out of the client/DELIVERY ZIP._
 
 - Dataset `OPRA.PILLAR`, live schema `cbbo-1s` (NBBO once per second, OPRA feed).
 - Key is entered once per PC and stored in `%LOCALAPPDATA%\USOptionChain\databento.key`.
-  Development can use `DATABENTO_API_KEY` in the environment or `US Option Chain/.env`.
+  Development can use `DATABENTO_API_KEY` in the environment or `US option chain/.env`.
 - Active expiries are ±100 strikes around spot; other expiries are metadata-only so
   the standard/weekly expiry ranking still works.
 - Definition/statistics history is used to build the universe and load open interest.

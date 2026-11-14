@@ -28,7 +28,7 @@ if (-not (Test-Path -LiteralPath $delivery)) {
 $packages = @(
     @{
         Name = 'us-option-chain.zip'
-        Source = Join-Path $root 'US Option Chain\client package'
+        Source = Join-Path $root 'US option chain\client package'
         Required = @(
             'us_option_chain.exe',
             'spx_option_chain.xlsx',
@@ -46,7 +46,7 @@ $packages = @(
     },
     @{
         Name = 'delta-option-chain.zip'
-        Source = Join-Path $root 'Delta Option Chain\source\dist\delta_option_chain'
+        Source = Join-Path $root 'Deltax-option-chain\source\dist\delta_option_chain'
         Required = @(
             'delta_option_chain.exe',
             'btc_chain.xlsx',

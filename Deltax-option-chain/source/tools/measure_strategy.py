@@ -28,8 +28,8 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 import win32com.client
 import xlwings as xw
 
-SRC = (r"C:\Users\Pravin\Downloads\Telegram Desktop\new2-deltax-option-chain"
-       r"\deltax-option-chain\Delta Option Chain\source")
+SRC = (r"C:\Users\Pravin\Desktop\main\Option Chain"
+       r"\Deltax-option-chain\source")
 BOOK = SRC + r"\btc_chain.xlsx"
 DIAG = os.path.join(os.environ["LOCALAPPDATA"], "DeltaOptionChain", "startup_diag.log")
 

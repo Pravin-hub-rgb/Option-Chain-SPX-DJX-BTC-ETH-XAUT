@@ -8,7 +8,7 @@ import re
 import zipfile
 
 US = os.path.join("source", "spx_option_chain.xlsx")
-DELTA = os.path.join("..", "Delta Option Chain", "source", "btc_chain.xlsx")
+DELTA = os.path.join("..", "Deltax-option-chain", "source", "btc_chain.xlsx")
 
 WANTED = re.compile(
     r"<(dataValidation|definedName|conditionalFormatting|autoFilter|"

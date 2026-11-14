@@ -4,7 +4,7 @@ The Databento key is never embedded in the application or shipped in the
 package. It is resolved in this order:
 
 1. ``DATABENTO_API_KEY`` in the process environment (development/support).
-2. ``US Option Chain/.env`` when running from source (development only).
+2. ``US option chain/.env`` when running from source (development only).
 3. ``%LOCALAPPDATA%\\USOptionChain\\databento.key`` (production, entered once
    through the first-run dialog).
 

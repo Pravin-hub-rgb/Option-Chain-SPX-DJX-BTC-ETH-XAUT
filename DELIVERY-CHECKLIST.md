@@ -228,8 +228,8 @@ Tested with both delivered builds running at the same time in one Excel:
 ## 6. Tests
 
 ```
-cd "US Option Chain"    && python -m unittest discover -s source/tests -p "test_*.py" -t source   -> 169 tests, OK
-cd "Delta Option Chain" && python -m unittest discover -s source/tests -p "test_*.py" -t source   ->  74 tests, OK
+cd "US option chain"    && python -m unittest discover -s source/tests -p "test_*.py" -t source   -> 169 tests, OK
+cd "Deltax-option-chain" && python -m unittest discover -s source/tests -p "test_*.py" -t source   ->  74 tests, OK
 ```
 
 ---

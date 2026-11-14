@@ -13,8 +13,8 @@ import time
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 import xlwings as xw
 
-SRC = (r"C:\Users\Pravin\Downloads\Telegram Desktop\new2-deltax-option-chain"
-       r"\deltax-option-chain\Delta Option Chain\source")
+SRC = (r"C:\Users\Pravin\Desktop\main\Option Chain"
+       r"\Deltax-option-chain\source")
 TMP = os.environ["TEMP"]
 LAUNCHES = int(sys.argv[1]) if len(sys.argv) > 1 else 10
 WAIT = int(sys.argv[2]) if len(sys.argv) > 2 else 45

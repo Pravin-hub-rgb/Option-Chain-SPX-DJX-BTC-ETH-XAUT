@@ -21,8 +21,8 @@ import time
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 import win32com.client
 
-SRC = (r"C:\Users\Pravin\Downloads\Telegram Desktop\new2-deltax-option-chain"
-       r"\deltax-option-chain\Delta Option Chain\source")
+SRC = (r"C:\Users\Pravin\Desktop\main\Option Chain"
+       r"\Deltax-option-chain\source")
 DIAG = os.path.join(os.environ["LOCALAPPDATA"], "DeltaOptionChain", "startup_diag.log")
 FEEDLOG = os.path.join(os.environ["LOCALAPPDATA"], "DeltaOptionChain", "feed.log")
 

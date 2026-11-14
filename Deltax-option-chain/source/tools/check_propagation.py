@@ -13,8 +13,8 @@ import time
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 import xlwings as xw
 
-SRC = (r"C:\Users\Pravin\Downloads\Telegram Desktop\new2-deltax-option-chain"
-       r"\deltax-option-chain\Delta Option Chain\source")
+SRC = (r"C:\Users\Pravin\Desktop\main\Option Chain"
+       r"\Deltax-option-chain\source")
 
 SAMPLE_CHAIN = [f"{c}{r}" for r in range(5, 30) for c in ("A", "D", "F", "I")][:120]
 SAMPLE_STRAT = [f"{c}{r}" for r in range(7, 60) for c in ("C", "D", "G", "I", "J")][:120]

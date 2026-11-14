@@ -40,7 +40,7 @@ Baseline numbers (idle machine, this morning): render_cycle avg 191ms / max 311m
 | A7 | Extract `us_instance.py` (lock/pid/guard + calc-mode lifecycle); verify; commit | DONE (96a69ae) |
 | A8 | Slim main.py to wiring (main_async, startup, feed start/stop); print_chain to us_chain, flush to us_performance; full suite; commit | DONE (3be49ed) |
 
-Gate after every step: `python -m unittest` all suites in `US Option Chain/source` + `python -c "import main"` passes.
+Gate after every step: `python -m unittest` all suites in `US option chain/source` + `python -c "import main"` passes.
 
 ## Track B — Delta (crypto open tonight) — validate shared protocol, do NOT ship client build
 
