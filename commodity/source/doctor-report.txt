@@ -1,0 +1,37 @@
+MCX Commodity Option Chain self-test
+folder: C:\Users\Pravin\Desktop\main\new2-deltax-option-chain\commodity\source  (70 characters)
+
+--- folder ----------------------------------------------------
+[PASS] folder path is short enough for Excel - 70 characters
+
+--- software --------------------------------------------------
+[PASS] python - 3.10.11
+[PASS] package xlwings - talks to Excel
+[PASS] package requests - talks to Upstox
+[PASS] package pandas - builds the chain
+[PASS] package dotenv - loads the API token
+[PASS] package openpyxl - reads and writes the workbooks
+
+--- activation ------------------------------------------------
+[PASS] activation key saved - not entered yet - the tool asks for the activation key on the first run
+
+--- Upstox ----------------------------------------------------
+[PASS] Upstox API token present - eyJ0…u4yw
+[PASS] Upstox reachable - Pravin Kumar - exchanges: CDS, BSE, BCD, NSE, BFO, NFO, MCX
+
+--- Excel -----------------------------------------------------
+[PASS] Excel is running - 0 instance(s) visible
+[PASS] Excel is running - not started yet - the tool opens it for you
+
+--- workbooks -------------------------------------------------
+[PASS] workbook crudeoil_chain.xlsx - 5002 bytes
+[PASS] workbook gold_chain.xlsx - 5002 bytes
+[PASS] workbook silver_chain.xlsx - 5002 bytes
+
+--- logs ------------------------------------------------------
+[PASS] log feed.log - not written yet
+[PASS] log startup_diag.log - not written yet
+
+================================================================
+Everything needed is in place. The tool should work.
+================================================================
