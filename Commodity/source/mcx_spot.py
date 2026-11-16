@@ -50,51 +50,120 @@ def note_ws_recv(symbol):
     mcx_state.last_ws_recv[symbol] = time.time()
 
 
+def _mid(row):
+    bid = row.get("bid") or 0.0
+    ask = row.get("ask") or 0.0
+    if bid > 0 and ask > 0:
+        return (bid + ask) / 2.0
+    return row.get("last") or row.get("ltp") or 0.0
+
+
+def _spread_ok(row, max_spread_abs, max_spread_pct):
+    bid = row.get("bid") or 0.0
+    ask = row.get("ask") or 0.0
+    if bid <= 0 or ask <= 0 or ask < bid:
+        return False
+    mid_price = (bid + ask) / 2.0
+    if mid_price <= 0:
+        return False
+    return (ask - bid) <= max(max_spread_abs, mid_price * max_spread_pct)
+
+
 def _years_to_expiry(expiry_iso):
-    """Fractional years from now to an ISO expiry date."""
+    """Days to expiry as a year fraction, same shape as the US tool."""
+    if not expiry_iso:
+        return None
     try:
-        expiry = datetime.strptime(expiry_iso[:10], "%Y-%m-%d")
-    except (ValueError, TypeError):
-        return 0.0
-    delta = expiry - datetime.utcnow()
-    return max(0.0, delta.total_seconds() / (365.25 * 86400))
-
-
-def _parity_spot(symbol, strikes):
-    """Put-call-parity-implied spot for a symbol, or None when not enough data.
-
-    Reads live_data[symbol][strike] for CE/PE marks at the same strike and
-    backs out the reference price. Best-effort: returns None when the chain
-    has not populated yet."""
-    chain = mcx_state.live_data.get(symbol, {})
-    if not chain:
+        y, m, d = expiry_iso[:10].split("-")
+        exp = datetime(int(y), int(m), int(d))
+    except Exception:
         return None
-    prices = []
-    for strike, entry in chain.items():
-        ce = entry.get("CE") or {}
-        pe = entry.get("PE") or {}
-        ce_mark = ce.get("mark") or ce.get("last")
-        pe_mark = pe.get("mark") or pe.get("last")
-        if ce_mark is None or pe_mark is None:
-            continue
-        try:
-            strike_f = float(strike)
-        except (TypeError, ValueError):
-            continue
-        # parity: C - P = S - K*exp(-r*t)  =>  S = C - P + K*exp(-r*t)
-        t = _years_to_expiry(mcx_state.active_expiries.get(symbol, [None])[0] or "")
-        r = mcx_state.PARITY_RATE
-        discount = strike_f * math.exp(-r * t)
-        prices.append((float(ce_mark) - float(pe_mark)) + discount)
-    if not prices:
+    today = datetime.utcnow().date()
+    return max(0.0, (exp - today).days / 365.0)
+
+
+def _parity_spot(symbol, expiry_iso, spot_hint):
+    """Put-call-parity-implied spot for a symbol, full Delta parity.
+
+    Parity:  C - P = S*exp(-qT) - K*exp(-rT)
+    =>  S = K*exp(-(r-q)T) + (C-P)*exp(qT)
+
+    Takes the median of the N strikes nearest the current spot estimate,
+    rejecting crossed and wide-spread quotes. A deadband smooths the cached
+    value."""
+    if not expiry_iso:
         return None
-    return sum(prices) / len(prices)
+    ld = mcx_state.live_data.get(symbol, {})
+    if not ld:
+        return None
+    T = _years_to_expiry(expiry_iso)
+    if T is None or T <= 0:
+        return None
+    r = mcx_state.PARITY_RATE
+    q = mcx_state.PARITY_DIVIDEND_Q
+    forward_discount = math.exp(-(r - q) * T)
+    call_put_adj = math.exp(q * T)
+
+    calls = {}
+    puts = {}
+    for sym_key, data in ld.items():
+        se = mcx_state.symbol_expiry.get(symbol, {}).get(sym_key)
+        if se != expiry_iso:
+            continue
+        strike = data.get("strike")
+        if not strike or strike <= 0:
+            continue
+        if data.get("type") == "CE":
+            calls[strike] = data
+        elif data.get("type") == "PE":
+            puts[strike] = data
+
+    common = set(calls) & set(puts)
+    if not common:
+        return None
+
+    def spread_ok(row):
+        return _spread_ok(row, mcx_state.PARITY_MAX_SPREAD, mcx_state.PARITY_MAX_SPREAD_PCT)
+
+    def parity_for_strike(strike):
+        c = calls[strike]
+        p = puts[strike]
+        if not spread_ok(c) or not spread_ok(p):
+            return None
+        call_mid = _mid(c)
+        put_mid = _mid(p)
+        if call_mid <= 0 or put_mid <= 0:
+            return None
+        return strike * forward_discount + (call_mid - put_mid) * call_put_adj
+
+    hint = spot_hint if spot_hint else 0.0
+    ranked = sorted(common, key=lambda s: abs(s - hint))
+    take = ranked[:mcx_state.PARITY_USE_N_STRIKES]
+    estimates = [est for s in take if (est := parity_for_strike(s)) is not None]
+    if not estimates:
+        return None
+    estimates.sort()
+    n = len(estimates)
+    if n % 2 == 1:
+        parity_val = estimates[n // 2]
+    else:
+        parity_val = (estimates[n // 2 - 1] + estimates[n // 2]) / 2.0
+
+    cached = mcx_state._parity_spot_cache.get(symbol)
+    if cached is not None and abs(parity_val - cached) < mcx_state.PARITY_DEADBAND:
+        return cached
+    mcx_state._parity_spot_cache[symbol] = parity_val
+    return parity_val
 
 
 def parity_spot_or_none(symbol):
-    """Public accessor for the parity-implied spot."""
-    strikes = list((mcx_state.live_data.get(symbol) or {}).keys())
-    return _parity_spot(symbol, strikes)
+    """Best parity spot for the active expiry, or None."""
+    expiries = mcx_state.active_expiries.get(symbol) or []
+    expiry = expiries[0] if expiries else None
+    if not expiry:
+        return None
+    hint = mcx_state.spot_cmp.get(symbol) or 0.0
+    return _parity_spot(symbol, expiry, hint)
 
 
 def fetch_spot(symbol, token):

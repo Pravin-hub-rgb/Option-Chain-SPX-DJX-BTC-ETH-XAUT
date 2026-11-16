@@ -356,6 +356,11 @@ def build_chain(symbol, expiry_dmy, token, spot=None, range_val=9999):
     pcr = total_put_oi / total_call_oi if total_call_oi > 0 else 0.0
     fresh = any_price
 
+    # Put-intrinsic observer: note puts quoted below intrinsic (spot - strike).
+    if sp is not None:
+        _put_intrinsic_rows(symbol, sp, rows)
+
+
     # Cache last known good chain so the sheet still shows something marked
     # STALE when the market is closed and Upstox returns empty quotes.
     if fresh:
@@ -369,6 +374,42 @@ def build_chain(symbol, expiry_dmy, token, spot=None, range_val=9999):
                    strikes=len(rows), contracts=n, pcr=round(pcr, 4),
                    fresh=fresh)
     return rows, pcr, n, fresh
+
+
+def _put_intrinsic_rows(symbol, spot, rows):
+    """Observer: note puts quoted below intrinsic value (spot - strike).
+
+    The exchange occasionally publishes a put near zero while the live spot
+    sits far above its strike. The trader sees the exchange's numbers
+    faithfully - this only notes the anomaly in feed.log so support can tell
+    a data blip from a real price."""
+    now = time.time()
+    for key in [k for k in mcx_state._PUT_INTRINSIC_WARNED if k[0] == symbol]:
+        if now - mcx_state._PUT_INTRINSIC_WARNED[key] < mcx_state._PUT_INTRINSIC_WARN_INTERVAL:
+            return
+    for row in rows:
+        strike = row[4]
+        put_ltp = row[8]
+        if strike is None or put_ltp is None:
+            continue
+        try:
+            strike_f = float(strike)
+            put_f = float(put_ltp)
+        except (TypeError, ValueError):
+            continue
+        intrinsic = spot - strike_f
+        if strike_f > 0 and put_f > 0 and intrinsic > put_f:
+            mcx_state._PUT_INTRINSIC_WARNED[(symbol, str(strike))] = now
+            feed_log(
+                "put_intrinsic_warning",
+                symbol=symbol,
+                strike=f"{strike_f:g}",
+                spot=f"{float(spot):.2f}",
+                ltp=str(put_f),
+                intrinsic=f"{intrinsic:.2f}",
+                note="exchange quote looks wrong; shown as-is",
+            )
+            return
 
 
 def get_last_good_chain(symbol, expiry_dmy):

@@ -10,6 +10,7 @@ Shared cache by symbol; one process drives all books.
 
 import asyncio
 import atexit
+import bisect
 import os
 import platform
 import re
@@ -50,7 +51,7 @@ from mcx_state import (
     _excel_connection_status, _excel_liveness_cache, _last_excel_exception,
     _last_rows, _net, _net_drawn, _pending_date_loads, _performance_metrics,
     _recalc_owed, _refresh_widen, _screen_restore_owed, _sheet_altered_notice,
-    _sheet_cache, _usd_fmt_done, active_expiries, active_expiries_dmy,
+    _usd_fmt_done, active_expiries, active_expiries_dmy,
     available_dates, cfg, excel_connected, excel_fail_notice_shown,
     excel_fail_since, excel_miss_counts, expiry_symbols, feed_state,
     last_spot_change, last_ws_recv, live_data, spot_cmp, spot_source,
@@ -269,6 +270,10 @@ def _close_empty_book1(app):
 
 
 _OPEN_RETRY_GRACE_SECONDS = 45.0
+
+# A calc-mode refusal only earns a support log line once it has held this
+# long; Excel being gone never does (its marks are cleared before the check).
+_CALC_NOTICE_GRACE_SECONDS = 60.0
 
 
 def retry_open_pass_after_grace():
@@ -632,6 +637,13 @@ def find_open_book(xw, fname):
     target_long = _long_form(target).lower()
     target_name = os.path.basename(target).lower()
     symbol = target_name.split("_chain", 1)[0].upper()
+    cached = mcx_state._book_sheet_cache.get(fname)
+    if cached is not None:
+        try:
+            _ = cached.sheets
+            return cached
+        except Exception:
+            mcx_state._book_sheet_cache.pop(fname, None)
     if not excel_process_running():
         return None
     app = mcx_state._owner_app
@@ -642,6 +654,7 @@ def find_open_book(xw, fname):
     except Exception as e:
         log_excel_exception(symbol, e, "enumerating the tool's own Excel workbooks")
         mcx_state._enum_unknown[symbol] = time.monotonic()
+        mcx_state._book_sheet_cache.pop(fname, None)
         return None
     for book in books:
         try:
@@ -651,6 +664,7 @@ def find_open_book(xw, fname):
             log_excel_exception(symbol, e, "reading open workbook path")
             continue
         if base == target_name and _long_form(fullname).lower() == target_long:
+            mcx_state._book_sheet_cache[fname] = book
             return book
     return None
 
@@ -704,6 +718,21 @@ def _deep_clear_below_block(sheet, symbol, bi, c0, n_rows):
         feed_log("chain_deep_clear", symbol=symbol, block=bi + 1, from_row=deep_start)
     except Exception as e:
         log_excel_exception(symbol, e, f"deep clearing stale rows in block {bi + 1}")
+
+
+def _retire_unused_blocks(sheet, symbol):
+    """Clear blocks beyond n_blocks so stale data from a previous expiry
+    doesn't linger, and mark them hidden."""
+    n = n_blocks(symbol)
+    for bi in range(n, len(BLOCK_COLS)):
+        block = BLOCK_COLS[bi]
+        cs = get_column_letter(block["start"])
+        ce = get_column_letter(block["start"] + 8)
+        try:
+            sheet.range(f"{cs}5:{ce}300").clear()
+            mcx_state._block_hidden[(symbol, bi)] = True
+        except Exception:
+            pass
 
 
 def get_column_letter(col):
@@ -886,6 +915,522 @@ def _flush_block_writes(sheet, symbol, pending):
         log_excel_exception(symbol, e, "flushing block writes")
 
 
+def _observe_raw_calc(raw):
+    """Count a transition of Excel's calculation mode between cycles.
+
+    raw comes from the read `_begin_excel_bulk_mode` already does every
+    cycle, so this adds no COM round-trips. An unreadable value (None)
+    resets the baseline so a single glitch is not mistaken for a flip.
+    """
+    if raw is None:
+        mcx_state._last_observed_calc_raw = None
+        return
+    previous = mcx_state._last_observed_calc_raw
+    mcx_state._last_observed_calc_raw = raw
+    if previous is None or previous == raw:
+        return
+    mcx_state._calc_churn_count += 1
+    now = time.time()
+    if now >= mcx_state._calc_churn_summary_after:
+        mcx_state._calc_churn_summary_after = (
+            now + mcx_state._CALC_CHURN_SUMMARY_SECONDS
+        )
+        feed_log(
+            "calc_switch_summary",
+            churn_total=mcx_state._calc_churn_count,
+            last_from=mcx_state._CALC_ID_NAMES.get(previous, str(previous)),
+            last_to=mcx_state._CALC_ID_NAMES.get(raw, str(raw)),
+            note="cumulative calculation-mode transitions seen between cycles",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Bulk mode: suspend Excel calculation + screen update once per render cycle,
+# write all chains, then restore. Keeps the customer's own strategy workbook
+# usable while the chain streams in.
+# ---------------------------------------------------------------------------
+
+def _begin_excel_bulk_mode():
+    app = mcx_state._app_cache or mcx_state._owner_app
+    if app is None:
+        return None
+    mcx_state._bulk_will_recalc = False
+    state = {"calc": None, "calc_guarded": False}
+    try:
+        # Read raw through the raw API on purpose: xlwings' own getter does
+        # calculation_i2s[self.xl.Calculation], and when Excel is busy or
+        # showing a modal it hands back an HRESULT instead of a valid
+        # xlCalculation value, so the lookup raises KeyError.
+        try:
+            raw = int(app.api.Calculation)
+        except Exception:
+            raw = None
+        _observe_raw_calc(raw)
+        current = {
+            -4105: "automatic",  # xlCalculationAutomatic
+            2: "semiautomatic",  # xlCalculationSemiautomatic
+            -4135: "manual",     # xlCalculationManual
+        }.get(raw)
+        if current is None:
+            current = app.calculation
+    except Exception:
+        return None
+    if current == "manual":
+        # Already manual: either the customer wants that, or the other
+        # Option Chain tool set it for its own write window. Either way,
+        # leave it alone and do not record it for restore.
+        state["calc"] = None
+    else:
+        skip_switch = False
+        # Session-level calc retry cooldown: if the last attempt to switch
+        # to manual failed, skip until the cooldown expires so we do not
+        # hammer COM and make the customer's workbook crawl.
+        if mcx_state._calc_manual_failed:
+            now = time.monotonic()
+            if now - mcx_state._calc_failed_at < mcx_state.CALC_RETRY_COOLDOWN_SECONDS:
+                skip_switch = True
+            else:
+                # Cooldown expired - retry once to recover.
+                mcx_state._calc_manual_failed = False
+        # Coexistence guard: if the sibling Option Chain tool already
+        # acquired manual calculation, do not try to take it too. The guard
+        # file is a record, not a lock, so both tools can pass it at once
+        # and then fight over the actual Excel switch.
+        if calc_mode_guard.other_holder_alive(PRODUCT_ID):
+            skip_switch = True
+        if skip_switch:
+            state["calc"] = None
+        else:
+            state["calc"] = current
+            try:
+                calc_mode_guard.acquire(str(current), PRODUCT_ID)
+                state["calc_guarded"] = True
+            except Exception:
+                state["calc"] = None
+            if state["calc"]:
+                mcx_state._bulk_will_recalc = state["calc"] in (
+                    "automatic",
+                    "semiautomatic",
+                )
+                try:
+                    app.calculation = "manual"
+                    mcx_state._bulk_owning_manual = True
+                    mcx_state._calc_failed_since = 0.0
+                    mcx_state._calc_manual_failed = False
+                except Exception as exc:
+                    was_guarded = state.get("calc_guarded", False)
+                    state["calc"] = None
+                    state["calc_guarded"] = False
+                    mcx_state._bulk_will_recalc = False
+                    if was_guarded:
+                        try:
+                            calc_mode_guard.release(PRODUCT_ID)
+                        except Exception:
+                            pass
+                    if excel_process_running():
+                        # Genuine refusal (Excel alive, switch rejected):
+                        # back off instead of hammering COM every cycle.
+                        if not mcx_state._calc_failed_since:
+                            mcx_state._calc_failed_since = time.monotonic()
+                        mcx_state._calc_failed_at = time.monotonic()
+                        mcx_state._calc_manual_failed = True
+                        feed_log(
+                            "calc_manual_unavailable",
+                            error=type(exc).__name__,
+                            detail=str(exc)[:120],
+                        )
+                        if (
+                            not mcx_state._calc_notice_shown
+                            and time.monotonic() - mcx_state._calc_failed_since
+                            >= _CALC_NOTICE_GRACE_SECONDS
+                        ):
+                            mcx_state._calc_notice_shown = True
+                            feed_log(
+                                "calc_manual_unavailable_notice",
+                                note="Excel refused manual calculation; running in auto-recalc (slower) until Excel accepts the switch",
+                            )
+                    return None
+    try:
+        app.screen_updating = False
+    except Exception:
+        pass
+
+    def restore():
+        try:
+            app.screen_updating = True
+        except Exception:
+            # Hand the job to the screen watchdog: "Excel was busy" is a
+            # moment, not a state.
+            mcx_state._screen_restore_owed = True
+        if state.get("calc"):
+            want = state["calc"]
+            ok = False
+            for attempt in range(3):
+                try:
+                    app.calculation = want
+                    ok = True
+                    break
+                except Exception:
+                    time.sleep(0.5)
+            if not ok:
+                feed_log("calc_restore_FAILED", want=want)
+                # Excel refused to leave manual: anchor the strand watchdog
+                # so ensure_calculation_not_stranded() forces it back after
+                # the grace period instead of leaving formulas silently dead.
+                mcx_state._calc_failed_since = time.monotonic()
+        if state.get("calc_guarded"):
+            try:
+                calc_mode_guard.release(PRODUCT_ID)
+            except Exception:
+                pass
+        # Ownership clears only when Excel is actually out of manual: a
+        # refused restore keeps it (and the anchor) so the watchdog can
+        # still fire on a later cycle.
+        try:
+            still_manual = app.calculation == "manual"
+        except Exception:
+            still_manual = True
+        if not still_manual:
+            mcx_state._bulk_owning_manual = False
+            if state.get("calc"):
+                mcx_state._calc_failed_since = 0.0
+
+    return restore
+
+
+def _update_recalc_backoff(elapsed_ms):
+    secs = float(elapsed_ms) / 1000.0
+    if secs <= mcx_state.RECALC_BACKOFF_THRESHOLD_SECONDS:
+        return
+    alpha = mcx_state.RECALC_BACKOFF_ALPHA
+    mcx_state._recalc_backoff_seconds = (
+        alpha * secs + (1.0 - alpha) * mcx_state._recalc_backoff_seconds
+    )
+    # A recalc this heavy means the customer's workbook owes more work than
+    # the configured refresh assumed: widen the loop sleep so Excel gets
+    # idle time, and let it decay back after a quiet spell.
+    widened = min(
+        mcx_state.WIDEN_MAX, mcx_state._refresh_widen * mcx_state.WIDEN_STEP
+    )
+    if widened != mcx_state._refresh_widen:
+        mcx_state._refresh_widen = widened
+        feed_log("refresh_widened", widen=round(widened, 2))
+    mcx_state._refresh_widen_hold_until = (
+        time.monotonic() + mcx_state.WIDEN_DECAY_SECONDS
+    )
+
+
+def _time_recalc(wrote):
+    owed = mcx_state._recalc_owed
+    mcx_state._recalc_owed = False
+    if not wrote and not owed:
+        return 0.0
+    if not mcx_state._bulk_will_recalc:
+        return 0.0
+    app = mcx_state._app_cache
+    if app is None:
+        if owed:
+            mcx_state._recalc_owed = True
+        return 0.0
+    try:
+        if _input_is_recent() or _excel_in_edit_mode(app):
+            mcx_state._recalc_owed = True
+            return 0.0
+    except Exception:
+        mcx_state._recalc_owed = True
+        return 0.0
+    try:
+        started = time.perf_counter()
+        app.api.Calculate()
+        elapsed = (time.perf_counter() - started) * 1000.0
+    except Exception as e:
+        log_excel_exception("ALL", e, "forcing workbook recalculation")
+        if owed:
+            mcx_state._recalc_owed = True
+        return 0.0
+    mcx_state._last_recalc_ms = elapsed
+    _update_recalc_backoff(elapsed)
+    mcx_state._performance_metrics.record("ALL", "excel_recalc", elapsed / 1000.0)
+    return elapsed
+
+
+def ensure_calculation_not_stranded():
+    app = mcx_state._owner_app
+    if app is None:
+        return
+    try:
+        current = app.calculation
+    except Exception:
+        return
+    if current == "manual" and mcx_state._bulk_owning_manual:
+        now = time.monotonic()
+        if (
+            mcx_state._calc_failed_since
+            and now - mcx_state._calc_failed_since > mcx_state.MANUAL_WATCHDOG_SECONDS
+        ):
+            # Never rescue a mode a live sibling tool owns: it deliberately
+            # holds manual between its own sheets.
+            if calc_mode_guard.other_holder_alive(PRODUCT_ID):
+                if now - mcx_state._calc_watchdog_skip_logged_at >= 60.0:
+                    mcx_state._calc_watchdog_skip_logged_at = now
+                    feed_log(
+                        "calc_watchdog_skip_holder",
+                        note="another chain tool holds manual calculation; watchdog left it alone",
+                    )
+                return
+            try:
+                app.calculation = "automatic"
+                mcx_state._bulk_owning_manual = False
+                mcx_state._calc_failed_since = 0.0
+                mcx_state._calc_manual_failed = False
+                calc_mode_guard.release(PRODUCT_ID)
+                feed_log(
+                    "calc_watchdog_restored",
+                    note="Excel was stranded on manual calculation",
+                )
+            except Exception:
+                pass
+
+
+def _screen_update_watchdog_tick():
+    """Finish a failed screen restore once Excel starts answering again.
+
+    The restore inside the window gets one shot; when it fails the flag is
+    handed to this tick, which runs once per display cycle while the flag is
+    set and only ever touches our own private instance's paint state.
+    """
+    if not mcx_state._screen_restore_owed:
+        return
+    app = mcx_state._app_cache or mcx_state._owner_app
+    if app is None:
+        return
+    try:
+        if app.screen_updating:
+            mcx_state._screen_restore_owed = False
+            return
+        app.screen_updating = True
+    except Exception:
+        return
+    mcx_state._screen_restore_owed = False
+    now = time.monotonic()
+    if now - mcx_state._screen_watchdog_logged_at >= 60.0:
+        mcx_state._screen_watchdog_logged_at = now
+        feed_log(
+            "screen_updating_forced_on",
+            note="watchdog restored paint after a failed in-window restore",
+        )
+
+
+def _log_speed_summary(elapsed):
+    now = time.monotonic()
+    if now - mcx_state._speed_log_at < 30.0:
+        return
+    mcx_state._speed_log_at = now
+    feed_log(
+        "speed_summary",
+        render_cycle_seconds=round(elapsed, 3),
+        recalc_ms=round(mcx_state._last_recalc_ms, 2),
+        backoff_seconds=round(mcx_state._recalc_backoff_seconds, 3),
+    )
+
+
+def _clear_write_claims(symbol):
+    """Drop every "already written" claim for a workbook that was closed and
+    reopened: the fresh file is empty, so the next cycle must rewrite it."""
+    path = os.path.abspath(
+        os.path.join(BASE_DIR, f"{symbol.lower()}_chain.xlsx")
+    ).lower()
+    for store in (
+        mcx_state._block_payload,
+        mcx_state._block_values,
+        mcx_state._last_rows,
+        mcx_state._block_hidden,
+        mcx_state._colour_state,
+        mcx_state._dropdown_sig,
+        mcx_state._date_req_sig,
+    ):
+        for key in list(store):
+            owner = key[0] if isinstance(key, tuple) else key
+            if owner == symbol:
+                del store[key]
+    for key in list(mcx_state._usd_fmt_done):
+        if isinstance(key, tuple) and key[0] == path:
+            mcx_state._usd_fmt_done.discard(key)
+
+
+async def flush_performance_metrics():
+    """Persist the bounded performance snapshot every 30 seconds."""
+    now = time.monotonic()
+    if now - mcx_state._last_performance_flush < 30:
+        return
+    lines = mcx_state._performance_metrics.summary_lines(now)
+    try:
+        await asyncio.to_thread(append_performance_summary, lines)
+    except OSError as e:
+        if not mcx_state._performance_log_error_shown:
+            show_error(
+                "Could not append performance diagnostics to startup_diag.log.\n\n"
+                "Please check that your user profile has free space and is writable.\n\n"
+                f"Details: {e}"
+            )
+            mcx_state._performance_log_error_shown = True
+    else:
+        mcx_state._performance_metrics.reset(now)
+        mcx_state._last_performance_flush = now
+
+
+def _last_user_input_age():
+    import ctypes
+
+    class _LASTINPUTINFO(ctypes.Structure):
+        _fields_ = (("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_ulong))
+
+    info = _LASTINPUTINFO()
+    info.cbSize = ctypes.sizeof(info)
+    try:
+        if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+            return None
+        tick = ctypes.windll.kernel32.GetTickCount()
+        return max(0.0, (tick - int(info.dwTime)) / 1000.0)
+    except Exception:
+        return None
+
+
+def _input_is_recent():
+    age = _last_user_input_age()
+    return age is not None and age < float(mcx_state.cfg.get("input_grace_seconds", 1.5))
+
+
+def _excel_focus_is_edit_control(app):
+    if platform.system() != "Windows":
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        hwnd = int(app.api.Hwnd)
+    except Exception:
+        return False
+    if not hwnd:
+        return False
+    try:
+        user32 = ctypes.windll.user32
+        user32.GetWindowThreadProcessId.argtypes = [
+            wintypes.HWND,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        user32.GetGUIThreadInfo.argtypes = [wintypes.DWORD, ctypes.c_void_p]
+        user32.GetGUIThreadInfo.restype = wintypes.BOOL
+        user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+
+        class _GUITHREADINFO(ctypes.Structure):
+            _fields_ = (
+                ("cbSize", wintypes.DWORD),
+                ("flags", wintypes.DWORD),
+                ("hwndActive", wintypes.HWND),
+                ("hwndFocus", wintypes.HWND),
+                ("hwndCapture", wintypes.HWND),
+                ("hwndMenuOwner", wintypes.HWND),
+                ("hwndMoveSize", wintypes.HWND),
+                ("hwndCaret", wintypes.HWND),
+                ("rcCaret", wintypes.RECT),
+            )
+
+        pid = wintypes.DWORD()
+        tid = user32.GetWindowThreadProcessId(wintypes.HWND(hwnd), ctypes.byref(pid))
+        if not tid:
+            return False
+        info = _GUITHREADINFO()
+        info.cbSize = ctypes.sizeof(info)
+        if not user32.GetGUIThreadInfo(tid, ctypes.byref(info)):
+            return False
+        focus = info.hwndFocus
+        if not focus:
+            return False
+        buf = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(focus, buf, 64)
+        cls = buf.value.upper()
+        return cls.startswith("EXCEL6") or cls == "EXCEL<"
+    except Exception:
+        return False
+
+
+def _excel_in_edit_mode(app):
+    if app is None:
+        return False
+    try:
+        if app.api.CutCopyMode:
+            return True
+    except Exception:
+        return True
+    try:
+        if _excel_focus_is_edit_control(app):
+            return True
+    except Exception:
+        return True
+    try:
+        if not app.api.Ready:
+            return True
+    except Exception:
+        return True
+    return False
+
+
+def _foreground_pid():
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return None
+        pid = wintypes.DWORD(0)
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return pid.value or None
+    except Exception:
+        return None
+
+
+def _owner_window_pid():
+    import ctypes
+    from ctypes import wintypes
+
+    hwnd = mcx_state._owner_hwnd
+    try:
+        if hwnd:
+            pid = wintypes.DWORD(0)
+            ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value:
+                return pid.value
+    except Exception:
+        pass
+    app = mcx_state._owner_app
+    if app is None:
+        return None
+    try:
+        return int(app.pid)
+    except Exception:
+        return None
+
+
+def _user_is_excel_interacting():
+    if platform.system() != "Windows":
+        return False
+    try:
+        age = _last_user_input_age()
+        if age is None or age > float(mcx_state.cfg.get("input_grace_seconds", 1.5)):
+            return False
+        pid = _foreground_pid()
+        owner = _owner_window_pid()
+        if pid is None or owner is None:
+            return False
+        return pid == owner
+    except Exception:
+        return False
+
+
 def record_excel_connection(symbol, status, detail=""):
     if mcx_state._excel_connection_status.get(symbol) == status:
         return
@@ -947,6 +1492,7 @@ _CALC_IDS = {"automatic": -4105, "semiautomatic": 2, "manual": -4135}
 
 def render_cycle(symbol, book, sheet, token):
     """One render pass for a symbol: read sheet, build chain, write to Excel."""
+    started = time.perf_counter()
     try:
         pre = sheet.range((1, 1), (4, 31)).options(transpose=False).value
     except Exception:
@@ -995,7 +1541,12 @@ def render_cycle(symbol, book, sheet, token):
         expiry = expiries[bi] if bi < len(expiries) else None
         if not expiry:
             continue
+        block_prep_started = time.perf_counter()
         rows, pcr, n, fresh = build_chain(symbol, expiry, token, spot=sp, range_val=range_val)
+        mcx_state._performance_metrics.record(
+            symbol, "chain_build", time.perf_counter() - block_prep_started,
+            rows=len(rows) if rows else 0,
+        )
         stale = False
         if not fresh:
             # Market closed / feed empty: show last known good data marked STALE.
@@ -1050,15 +1601,101 @@ def render_cycle(symbol, book, sheet, token):
         except Exception as e:
             log_excel_exception(symbol, e, "writing chain header")
 
-        extent = ROW_EXTENT_DEFAULT
+        n_rows = len(rows)
+        cs = get_column_letter(block["start"])
+        ce = get_column_letter(block["start"] + 8)
+
+        # Extent tracking: never shrinks, grows to fit the largest chain seen.
+        seen = mcx_state._row_extent_seen.get((symbol, bi), 0)
+        extent = max(ROW_EXTENT_DEFAULT, seen, n_rows)
+        if extent != seen:
+            mcx_state._row_extent_seen[(symbol, bi)] = extent
+
+        # Clear stale rows below the live count when the block shrank, and
+        # sweep any leftover below the extent on first sight.
+        prev_n = mcx_state._last_rows.get((symbol, bi))
+        if prev_n is None:
+            first_sight = mcx_state._FIRST_SIGHT_BOUND
+        else:
+            first_sight = 0
+        if prev_n is None or n_rows < prev_n:
+            last_row = max(n_rows, prev_n or 0, first_sight)
+            if last_row > n_rows:
+                try:
+                    sheet.range(f"{cs}{5 + n_rows}:{ce}{4 + last_row}").clear()
+                except Exception as e:
+                    log_excel_exception(symbol, e, f"clearing stale rows block {bi + 1}")
+        mcx_state._last_rows[(symbol, bi)] = n_rows
+        _deep_clear_below_block(sheet, symbol, bi, block["start"], extent)
+
         padded = pad_block_rows(rows, extent)
-        pending.append((bi, block, padded, extent, [(0, len(rows) - 1)], None))
+        # Signature-based write: skip unchanged blocks entirely.
+        payload_sig = hash(tuple(map(tuple, padded)))
+        if payload_sig == mcx_state._block_payload.get((symbol, bi)):
+            mcx_state._performance_metrics.record(
+                symbol, "excel_range_skipped", 0.0, rows=n_rows
+            )
+        else:
+            prev = mcx_state._block_values.get((symbol, bi))
+            changed = None
+            if prev is not None and len(prev) == len(padded):
+                changed = [
+                    i
+                    for i in range(len(padded))
+                    if list(prev[i]) != list(padded[i])
+                ]
+            runs = _contiguous_runs(changed) if changed else []
+            mcx_state._block_payload[(symbol, bi)] = payload_sig
+            mcx_state._block_values[(symbol, bi)] = padded
+            pending.append((bi, block, padded, extent, runs, prev))
         net_paint(sheet, symbol, bi, col_l)
+
+        # ATM / ITM / OTM colouring — repaint only when the picture changes.
+        try:
+            sp_val = sp if sp is not None else 0.0
+            strikes = [row[4] for row in rows]
+            k = bisect.bisect_left(strikes, sp_val)
+            m = bisect.bisect_right(strikes, sp_val)
+            atm_index = (
+                min(range(len(strikes)), key=lambda i: abs(strikes[i] - sp_val))
+                if strikes else -1
+            )
+            colour_sig = (len(rows), k, m, atm_index)
+            if mcx_state._colour_state.get((symbol, bi)) != colour_sig:
+                mcx_state._colour_state[(symbol, bi)] = colour_sig
+                cs = get_column_letter(block["start"])
+                ce = get_column_letter(block["start"] + 8)
+                n_rows = len(rows)
+                sheet.range(f"{cs}5:{ce}{4 + n_rows}").color = None
+                if k > 0:
+                    sheet.range(
+                        f"{block['call_start']}5:{block['call_end']}{4 + k}"
+                    ).color = (198, 224, 180)  # green: ITM calls
+                if m < n_rows:
+                    sheet.range(
+                        f"{block['put_start']}{5 + m}:{block['put_end']}{4 + n_rows}"
+                    ).color = (255, 200, 200)  # red: ITM puts
+                if n_rows:
+                    atm_row = atm_index + 5
+                    atm_range = f"{block['atm']}{atm_row}:{block['put_end']}{atm_row}"
+                    sheet.range(atm_range).color = (255, 255, 0)  # yellow: ATM
+        except Exception as e:
+            log_excel_exception(symbol, e, "colouring chain block")
+
+        mcx_state._performance_metrics.record(
+            symbol, "excel_block_prep", time.perf_counter() - block_prep_started,
+            rows=n_rows,
+        )
+
+    _retire_unused_blocks(sheet, symbol)
 
     if pending:
         _flush_block_writes(sheet, symbol, pending)
         force_usd_block_formats(sheet, BLOCK_COLS[0], symbol, 0, ROW_EXTENT_DEFAULT)
 
+    mcx_state._performance_metrics.record(
+        "ALL", "render_cycle", time.perf_counter() - started
+    )
     return bool(pending)
 
 
@@ -1123,31 +1760,150 @@ def _run_doctor():
 
 async def display_loop(token, books):
     """Main render loop: cycle through symbols, write to Excel, sleep adaptively."""
+    import xlwings as xw
     last_spot_poll = {symbol: 0.0 for symbol in MCX_SYMBOLS}
     last_oi_poll = {symbol: 0.0 for symbol in MCX_SYMBOLS}
     while True:
         cycle_start = time.monotonic()
         wrote_anything = False
+        # Input yield: skip the write window while the customer's hands are on
+        # our Excel instance; their keystrokes land on a live frame.
+        if _user_is_excel_interacting():
+            now = time.monotonic()
+            if now - mcx_state._user_input_skip_log_at > 30.0:
+                mcx_state._user_input_skip_log_at = now
+                feed_log(
+                    "render_cycle_skipped_user_input",
+                    note="customer is typing or selecting in our Excel",
+                )
+            mcx_state._recalc_owed = True
+            await asyncio.sleep(0.2)
+            continue
+        # Edit mode: dragging a formula or editing a value. Writing at this
+        # moment deadlocks Excel's COM apartment, so the window stays shut.
+        edit_app = mcx_state._app_cache or mcx_state._owner_app
+        if edit_app is not None and _owner_alive() and _excel_in_edit_mode(edit_app):
+            now = time.monotonic()
+            if now - mcx_state._user_edit_skip_log_at > 30.0:
+                mcx_state._user_edit_skip_log_at = now
+                feed_log(
+                    "render_cycle_skipped_user_edit",
+                    note="Excel is in edit mode; the write window stays shut",
+                )
+            await asyncio.sleep(0.2)
+            continue
+        # Resolve each symbol's workbook once per cycle BEFORE opening the
+        # write window: probe cached handles, re-find closed/reopened ones,
+        # and record confirmed absences for the exit watchdog.
+        resolved = {}
+        unknown_any = False
         for symbol in MCX_SYMBOLS:
+            path = os.path.join(BASE_DIR, f"{symbol.lower()}_chain.xlsx")
             book = books.get(symbol)
+            if book is not None:
+                # Liveness probe: catches a workbook the customer closed
+                # underneath us instead of failing on the next real write.
+                try:
+                    _ = book.name
+                except Exception:
+                    books.pop(symbol, None)
+                    mcx_state._book_sheet_cache.pop(path, None)
+                    book = None
             if book is None:
+                book = find_open_book(xw, path)
+                if book is not None:
+                    books[symbol] = book
+            if book is None:
+                # Confirmed absence. If Excel did not answer the workbook
+                # list this cycle the truth is "unknown", never "missing":
+                # a busy Excel is not an error state.
+                now = time.monotonic()
+                if mcx_state._enum_unknown.get(symbol, 0.0) > now - 5.0:
+                    unknown_any = True
+                    continue
+                # The customer closed this workbook and it stays closed.
+                # No reopen, no modal - a log line and a kept hole until
+                # it is open again or the tool exits.
+                if mcx_state.excel_connected.get(symbol):
+                    mcx_state.excel_connected[symbol] = False
+                    feed_log(
+                        "workbook_closed_by_customer",
+                        asset=symbol,
+                        note="the chain workbook was closed; it stays closed",
+                    )
+                mcx_state._missing_since[symbol] = now
                 continue
-            try:
-                sheet = book.sheets[0]
-            except Exception:
-                continue
-            try:
-                if sheet_structure_ok(sheet):
-                    if render_cycle(symbol, book, sheet, token):
-                        wrote_anything = True
-                        mcx_state.excel_connected[symbol] = True
+            if mcx_state._missing_since.pop(symbol, None) is not None:
+                # Reopened workbook starts empty: drop every "already
+                # written" claim for it or the sheet would stay blank.
+                _clear_write_claims(symbol)
+            mcx_state.excel_miss_counts[symbol] = 0
+            resolved[symbol] = book
+        if not resolved:
+            # Nothing to write: every chain workbook is closed. Skip the
+            # write window entirely - but never while Excel's answer is
+            # merely unknown (busy / tearing down).
+            if not unknown_any:
+                now = time.monotonic()
+                if now - mcx_state._no_book_skip_logged_at >= 60.0:
+                    mcx_state._no_book_skip_logged_at = now
+                    feed_log(
+                        "bulk_mode_skipped_no_chain_workbook",
+                        note="no chain workbook is open; skipping the write window",
+                    )
+                mcx_state._calc_notice_shown = False
+            mcx_state._bulk_will_recalc = False
+            restore = None
+        else:
+            restore = _begin_excel_bulk_mode()
+        try:
+            for symbol, book in resolved.items():
+                try:
+                    sheet = book.sheets[0]
+                except Exception:
+                    continue
+                try:
+                    if sheet_structure_ok(sheet):
+                        if render_cycle(symbol, book, sheet, token):
+                            wrote_anything = True
+                            mcx_state.excel_connected[symbol] = True
+                            mcx_state.excel_fail_since[symbol] = None
+                            mcx_state.excel_fail_notice_shown[symbol] = False
+                        else:
+                            mcx_state.excel_miss_counts[symbol] += 1
                     else:
                         mcx_state.excel_miss_counts[symbol] += 1
-                else:
+                except Exception as e:
+                    log_excel_exception(symbol, e, "render cycle")
                     mcx_state.excel_miss_counts[symbol] += 1
-            except Exception as e:
-                log_excel_exception(symbol, e, "render cycle")
-                mcx_state.excel_miss_counts[symbol] += 1
+                    mcx_state._book_sheet_cache.pop(
+                        os.path.join(BASE_DIR, f"{symbol.lower()}_chain.xlsx"), None
+                    )
+                    now = time.monotonic()
+                    if mcx_state.excel_fail_since[symbol] is None:
+                        mcx_state.excel_fail_since[symbol] = now
+                    elif (
+                        now - mcx_state.excel_fail_since[symbol] > 30.0
+                        and not mcx_state.excel_fail_notice_shown[symbol]
+                    ):
+                        mcx_state.excel_fail_notice_shown[symbol] = True
+                        show_error(
+                            "Lost connection to Microsoft Excel.\n\n"
+                            "The tool is still running and will keep trying on its own.\n"
+                            "To resume now: close Excel, reopen the chain workbooks,\n"
+                            "and leave Excel open for a few seconds.\n\n"
+                            "Details: " + str(e)
+                        )
+            _time_recalc(wrote_anything)
+        finally:
+            if restore is not None:
+                try:
+                    restore()
+                except Exception as e:
+                    log_excel_exception("ALL", e, "leaving bulk mode")
+            ensure_calculation_not_stranded()
+        _screen_update_watchdog_tick()
+        mcx_state._cycle_wrote = False
         # Spot + OI background pollers (throttled)
         now = time.monotonic()
         for symbol in MCX_SYMBOLS:
@@ -1163,10 +1919,79 @@ async def display_loop(token, books):
                 except Exception:
                     pass
                 last_oi_poll[symbol] = now
-        mcx_state._cycle_wrote = False
-        # Adaptive sleep
+        retry_open_pass_after_grace()
+        excel_alive = _owner_alive() or mcx_state._owner_app is None
+        if mcx_state._owner_app is not None and not _owner_alive():
+            if not mcx_state._excel_gone_logged:
+                mcx_state._excel_gone_logged = True
+                feed_log(
+                    "excel_gone",
+                    note=(
+                        "Excel was closed; the tool stops on its own shortly - "
+                        "run it again when you want the chain back"
+                    ),
+                )
+                mcx_state._calc_manual_failed = False
+                mcx_state._calc_failed_since = 0.0
+                mcx_state._bulk_owning_manual = False
+                mcx_state._app_cache = None
+        elif mcx_state._excel_gone_logged:
+            # Excel is back: every cached "already written" claim may belong
+            # to workbooks that were freshly opened and are empty now.
+            mcx_state._excel_gone_logged = False
+            mcx_state._block_payload.clear()
+            mcx_state._block_values.clear()
+            mcx_state._last_rows.clear()
+            mcx_state._block_hidden.clear()
+            mcx_state._colour_state.clear()
+            mcx_state._dropdown_sig.clear()
+            mcx_state._date_req_sig.clear()
+            mcx_state._usd_fmt_done.clear()
+            feed_log(
+                "excel_reopened",
+                note="Excel is back; rewriting sheets from scratch",
+            )
+        maybe_exit_after_close_all(excel_alive=excel_alive)
+        # Adaptive sleep: stretch when Excel owed recalc work or the cycle was
+        # heavy, decay back to the configured refresh after a quiet spell.
         elapsed = time.monotonic() - cycle_start
-        sleep_for = max(0.1, 0.5 - elapsed)
+        _log_speed_summary(elapsed)
+        await flush_performance_metrics()
+        now_mono = time.monotonic()
+        # Widen decays back to 1.0 after a quiet spell so a fast workbook
+        # is never left crawling.
+        if (
+            now_mono > mcx_state._refresh_widen_hold_until
+            and mcx_state._refresh_widen > 1.0
+        ):
+            mcx_state._refresh_widen = max(1.0, mcx_state._refresh_widen / 2.0)
+            mcx_state._refresh_widen_hold_until = (
+                now_mono + mcx_state.WIDEN_DECAY_SECONDS
+            )
+            if mcx_state._refresh_widen > 1.0:
+                feed_log(
+                    "refresh_widen_decayed",
+                    widen=round(mcx_state._refresh_widen, 2),
+                )
+        # Relax the recalc-driven backoff between cycles so a workbook that
+        # went quiet shrinks back toward the configured refresh instead of
+        # staying throttled forever.
+        if mcx_state._recalc_backoff_seconds > 0.0:
+            mcx_state._recalc_backoff_seconds *= mcx_state.RECALC_BACKOFF_DECAY
+            if (
+                mcx_state._recalc_backoff_seconds
+                < mcx_state.RECALC_BACKOFF_THRESHOLD_SECONDS
+            ):
+                mcx_state._recalc_backoff_seconds = 0.0
+        sleep_for = min(
+            mcx_state.MAX_REFRESH_SECONDS,
+            max(
+                mcx_state.cfg.get("refresh_interval_seconds", 0.5)
+                * mcx_state._refresh_widen,
+                time.perf_counter() - cycle_start,
+                mcx_state.RECALC_BACKOFF_FACTOR * mcx_state._recalc_backoff_seconds,
+            ),
+        )
         await asyncio.sleep(sleep_for)
 
 

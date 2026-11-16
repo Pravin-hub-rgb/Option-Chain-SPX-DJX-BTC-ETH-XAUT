@@ -7,10 +7,10 @@ Open a command prompt in this folder and run
 
     mcx_option_chain.exe --doctor
 
-It checks everything the tool needs - the activation key, your Upstox API
-token (including whether Upstox accepts it), Excel, the three workbooks and
-the folder path - and prints a plain answer for each one. Run it first if
-anything is not working, and send the output to support.
+It checks everything the tool needs - your Upstox API token (including whether
+Upstox accepts it), Excel, the three workbooks and the folder path - and prints
+a plain answer for each one. Run it first if anything is not working, and send
+the output to support.
 
 UNZIP TO A SHORT FOLDER
 -----------------------
@@ -25,14 +25,11 @@ FIRST RUN
 ---------
 1. Unzip the package to a short folder (for example C:\OptionChain).
 2. Double click mcx_option_chain.exe.
-3. It asks for the ACTIVATION KEY. Enter the key you were given.
-   It is saved next to mcx_option_chain.exe as license.json. Do not move
-   or delete that file, or you will be asked for the key again.
-4. It asks for your UPSTOX API TOKEN. Set UPSTOX_API_TOKEN in a .env file
-   next to mcx_option_chain.exe (see .env.example), or export it before
-   running. The token is stored only on this PC, never in the app folder.
-5. Excel opens with three workbooks: crudeoil_chain, gold_chain and
+3. It opens Excel with three workbooks: crudeoil_chain, gold_chain and
    silver_chain. Leave them open.
+4. Set your UPSTOX_API_TOKEN in a .env file next to mcx_option_chain.exe
+   (see .env.example), or export it before running. The token is stored only
+   on this PC, never in the app folder.
 
 ONLY ONE COPY AT A TIME
 -----------------------
@@ -100,7 +97,7 @@ Everything the tool does is recorded in
     %LOCALAPPDATA%\MCXOptionChain\feed.log
 
 That is the file to send to support. It is a plain text file, one line per
-event, and it never contains your activation key.
+event.
 
 BUILDING STRATEGIES IN A SEPARATE WORKBOOK
 ------------------------------------------

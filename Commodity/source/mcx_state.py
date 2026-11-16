@@ -34,14 +34,12 @@ _last_recalc_ms = 0.0
 
 # ScreenUpdating self-heal net.
 _screen_restore_owed = False
-_bulk_window_open = False
 _screen_watchdog_logged_at = 0.0
 _recalc_owed = False
 
 # Rate-limit the skip receipts so support sees one line, not one per cycle.
 _user_input_skip_log_at = 0.0
 _user_edit_skip_log_at = 0.0
-_strategy_sheet_skip_log_at = 0.0
 
 _speed_log_at = 0.0
 
@@ -94,8 +92,6 @@ _pending_date_loads = []
 _date_req_sig = {}
 
 _book_sheet_cache = {}
-
-_sheet_cache = {}
 
 _app_cache = None
 
@@ -150,8 +146,6 @@ _last_excel_exception = {}
 
 MONTHS = {"JAN": "01", "FEB": "02", "MAR": "03", "APR": "04", "MAY": "05", "JUN": "06",
           "JUL": "07", "AUG": "08", "SEP": "09", "OCT": "10", "NOV": "11", "DEC": "12"}
-
-MONTHS_REV = {v: k for k, v in MONTHS.items()}
 
 BLOCK_COLS = [
     {"start": 1,  "atm": "A", "call_start": "A", "call_end": "D", "put_start": "F", "put_end": "I"},
@@ -209,12 +203,6 @@ _open_pass_retried = False
 
 _calc_state_probe = None
 
-_last_window_status = {}
-
-_SHORT_BUILD = None
-
-_manual_since = 0.0
-
 MANUAL_WATCHDOG_SECONDS = 4.0
 
 _CALC_IDS = {"automatic": -4105, "semiautomatic": 2, "manual": -4135}
@@ -236,18 +224,13 @@ PARITY_RATE = float(cfg.get("parity_rate", 0.045))
 PARITY_DIVIDEND_Q = float(cfg.get("parity_dividend_q", 0.0))
 PARITY_USE_N_STRIKES = int(cfg.get("parity_use_n_strikes", 5))
 PARITY_DEADBAND = float(cfg.get("parity_deadband", 0.05))
-PARITY_TOLERANCE_POINTS = float(cfg.get("parity_tolerance_points", 3.0))
-PARITY_TOLERANCE_PCT = float(cfg.get("parity_tolerance_pct", 0.002))
 PARITY_MAX_SPREAD = float(cfg.get("parity_max_spread", 2.0))
 PARITY_MAX_SPREAD_PCT = float(cfg.get("parity_max_spread_pct", 0.05))
-PARITY_SANITY_PCT = float(cfg.get("parity_sanity_pct", 0.05))
 
 _parity_spot_cache = {}
 
 _PUT_INTRINSIC_WARNED = {}
 _PUT_INTRINSIC_WARN_INTERVAL = 300.0
-_spot_divergence = {}
-_parity_log_at = {}
 
 _calc_failed_at = 0.0
 CALC_RETRY_COOLDOWN_SECONDS = 10.0
