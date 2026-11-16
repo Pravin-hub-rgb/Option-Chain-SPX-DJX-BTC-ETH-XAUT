@@ -46,7 +46,7 @@ from mcx_state import (
     BASE_DIR, BLOCK_COLS, EXPIRY_REFRESH_SECONDS, HTTP_TIMEOUT, MCX_SYMBOLS,
     NET_FAIL_LIMIT, OI_POLL_SECONDS, PRODUCT_EXE, PRODUCT_ID, ROW_EXTENT_DEFAULT,
     SPOT_POLL_SECONDS, STALE_AFTER_S, _auto_open_done, _block_hidden,
-    _block_payload, _block_values, _book_sheet_cache, _calc_state_probe,
+    _block_payload, _block_values, _book_sheet_cache,
     _colour_state, _cycle_wrote, _date_req_sig, _dropdown_sig,
     _excel_connection_status, _excel_liveness_cache, _last_excel_exception,
     _last_rows, _net, _net_drawn, _pending_date_loads, _performance_metrics,

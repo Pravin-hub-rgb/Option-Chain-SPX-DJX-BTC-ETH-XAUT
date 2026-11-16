@@ -576,7 +576,3 @@ def _console_warn_last(msg, exc):
 
 def _quiet_console_error(msg, exc):
     pass
-
-
-def source_delay_note():
-    return "MCX Upstox REST (market closed on weekends -> empty quotes)"

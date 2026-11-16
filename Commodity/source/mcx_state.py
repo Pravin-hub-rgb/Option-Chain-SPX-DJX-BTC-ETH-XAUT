@@ -153,8 +153,6 @@ BLOCK_COLS = [
     {"start": 23, "atm": "W", "call_start": "W", "call_end": "Z", "put_start": "AB", "put_end": "AE"},
 ]
 
-STALE_FLAG_SECONDS = 10.0
-
 feed_state = {sym: {"state": "LOADING", "detail": "", "retry_in": 0.0,
                     "last_good_ts": 0.0, "last_good_label": "never"} for sym in MCX_SYMBOLS}
 
@@ -200,8 +198,6 @@ _all_gone_since = None
 
 _open_pass_at = None
 _open_pass_retried = False
-
-_calc_state_probe = None
 
 MANUAL_WATCHDOG_SECONDS = 4.0
 
